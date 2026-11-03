@@ -295,6 +295,10 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
         ("over", "overflow", 1, 0, 1, "C"),
         ("before", "before", 3, 1, 3, ".CC"),
         ("center", "center", 14, 0, 14, "." * 14),
+        # Clipped to the viewport: the geometric center sits outside.
+        ("low", "low", 1, 0, 1, "C"),
+        ("side", "side", 1, 0, 1, "C"),
+        ("sliver", "sliver", 1, 0, 1, "."),
     )
     parts = [
         "<!doctype html><title>cover</title><style>",
@@ -380,6 +384,26 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
                 f'<div class="row" style="top:{top}px;width:1280px;display:flex;'
                 f'justify-content:center">{links}</div>'
             )
+        elif kind == "low":
+            parts.append(
+                "<button id='low0' style='position:absolute;top:720px;left:0;"
+                "width:80px;height:200px;margin:0;padding:0;border:0;"
+                "box-sizing:border-box'>Go</button>"
+                "<div class='mask' style='top:680px;left:0;width:120px;height:120px'></div>"
+            )
+        elif kind == "side":
+            parts.append(
+                "<button id='side0' style='position:absolute;left:-50px;top:640px;"
+                "width:80px;height:24px;margin:0;padding:0;border:0;"
+                "box-sizing:border-box'>Go</button>"
+                "<div class='mask' style='top:640px;left:0;width:40px;height:24px'></div>"
+            )
+        elif kind == "sliver":
+            parts.append(
+                "<button id='sliver0' style='position:absolute;left:900px;top:-16px;"
+                "width:40px;height:24px;margin:0;padding:0;border:0;"
+                "box-sizing:border-box'>Go</button>"
+            )
         else:
             raise AssertionError(kind)
     parts.append('<div id="mover"></div>')
@@ -410,6 +434,7 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
         ]
         assert "".join(flags) == expected, prefix
     _assert_solo_covers(facts_page)
+    _assert_capped_line_fails_closed(facts_page)
 
 
 def _animation_clock(page: Page) -> tuple[float, int]:
@@ -463,12 +488,14 @@ def _hit_covers(page: Page, selector: str) -> list[bool]:
     return page.evaluate(
         """(selector) => [...document.querySelectorAll(selector)].map((el) => {
           const rect = el.getBoundingClientRect();
-          const cx = rect.left + rect.width / 2;
-          const cy = rect.top + rect.height / 2;
-          const outside = rect.width <= 0 || rect.height <= 0 || cx < 0 || cy < 0
-            || cx >= innerWidth || cy >= innerHeight;
-          if (outside) return false;
-          const hit = document.elementFromPoint(cx, cy);
+          const left = Math.max(rect.left, 0);
+          const top = Math.max(rect.top, 0);
+          const right = Math.min(rect.right, innerWidth);
+          const bottom = Math.min(rect.bottom, innerHeight);
+          if (rect.width <= 0 || rect.height <= 0 || right <= left || bottom <= top) {
+            return false;
+          }
+          const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
           if (!hit) return true;
           return hit !== el && !el.contains(hit);
         })""",
@@ -559,6 +586,25 @@ def _assert_solo_covers(page: Page) -> None:
     assert measured == {"display": "block", "height": "24px"}
     assert again == measured
     assert _by_id(important, "imp0").covered is False
+
+
+def _assert_capped_line_fails_closed(page: Page) -> None:
+    # Own document. A 4000-link line makes elementFromPoint slow enough that
+    # the same page would fail closed the rows above it.
+    links = "".join(f"<a id='a{index}' href='/{index}'>x</a>" for index in range(4000))
+    facts = _collect_watched(
+        page,
+        "<!doctype html><title>cap</title><style>body{margin:0}"
+        "#line{white-space:nowrap;margin:0}"
+        "#line a{display:inline-block;width:16px;height:19px}"
+        "#mask{position:fixed;left:200px;top:0;width:40px;height:19px}"
+        f"</style><p id='line'>{links}</p><div id='mask'></div>",
+    )
+    # a13's clipped center is (216, 9.5), on #mask. a0 is clear of the mask.
+    assert _by_id(facts, "a0").covered is False
+    assert _by_id(facts, "a13").covered is True
+    if facts.truncated:
+        assert _by_id(facts, "a79").covered is True
 
 
 def test_facts_choice_group(facts_page: Page, fixture_base_url: str) -> None:
@@ -1519,7 +1565,7 @@ def test_facts_one_second_deadline_raises_when_the_reserve_takes_the_budget(
     facts_page: Page,
 ) -> None:
     facts_page.set_content("<!doctype html><title>t</title><button id='c'>Go</button>")
-    with pytest.raises(FactCollectionError, match="fact collection exceeded the deadline"):
+    with pytest.raises(ValueError, match="reserved"):
         collect_facts(facts_page, deadline_s=1.0)
 
 
@@ -1666,7 +1712,8 @@ try:
         raise SystemExit(2)
     if not covered or any(element.tag not in actionable for element in covered):
         raise SystemExit(2)
-    if facts.truncated:
+    # The inline line trips the hit-test cap. Tables and flat rows do not.
+    if facts.truncated and layout != "inline":
         sys.stderr.write("truncated elements=%s\\n" % len(facts.elements))
         raise SystemExit(6)
     print(f"{elapsed:.3f} {_DEADLINE_S:.3f} {layout} {rows} {len(facts.elements)}")
@@ -1685,7 +1732,7 @@ try:
     )
     time.sleep(0.3)
     try:
-        collect_facts(page, deadline_s=1)
+        collect_facts(page, deadline_s=2)
     except FactCollectionError:
         pass
     else:
@@ -1774,8 +1821,10 @@ try:
     except FactCollectionError as exc:
         sys.stderr.write(str(exc))
         raise SystemExit(2)
-    if not facts.truncated:
-        sys.stderr.write("elements=%s" % len(facts.elements))
+    full = count * 2 if kind == "table" else count
+    got = len(facts.elements)
+    if got <= 0 or got > full or (got < full and not facts.truncated):
+        sys.stderr.write("elements=%s truncated=%s" % (got, facts.truncated))
         raise SystemExit(3)
     if engine.dead:
         raise SystemExit(4)

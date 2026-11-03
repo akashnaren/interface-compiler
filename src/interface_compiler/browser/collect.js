@@ -731,12 +731,6 @@
     return hit !== el && !contains(el, hit);
   }
 
-  function centerOutside(rect) {
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    return cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight;
-  }
-
   function pastBudget() {
     return (
       typeof WALK_BUDGET_MS === "number" &&
@@ -745,9 +739,43 @@
     );
   }
 
-  // One elementFromPoint on a long inline line walks every fragment. Keep a
-  // short slice of the budget for that loop. A center it does not reach stays
-  // uncovered. Offscreen centers are not hit-tested. Nothing here writes the page.
+  // Read-back has to return before the hard deadline. The reserved second
+  // covers this copy and the overlay; the tail is the trip back to Python.
+  function pastReadback() {
+    if (typeof WALK_BUDGET_MS !== "number" || WALK_BUDGET_MS <= 0) {
+      return false;
+    }
+    const reserveMs = typeof WALK_RESERVE_MS === "number" ? WALK_RESERVE_MS : 1000;
+    const tailMs = 800;
+    return performance.now() - walkStarted > WALK_BUDGET_MS + reserveMs - tailMs;
+  }
+
+  function withinBudget() {
+    if (pastReadback()) {
+      truncated = true;
+      return false;
+    }
+    return !budgetSpent();
+  }
+
+  // Sample the center of the rectangle clipped to the viewport. A control
+  // whose geometric center is off-screen can still show a covered sliver.
+  function clippedPoint(rect) {
+    const left = Math.max(rect.left, 0);
+    const top = Math.max(rect.top, 0);
+    const right = Math.min(rect.right, window.innerWidth);
+    const bottom = Math.min(rect.bottom, window.innerHeight);
+    if (right <= left || bottom <= top) {
+      return null;
+    }
+    return { x: (left + right) / 2, y: (top + bottom) / 2 };
+  }
+
+  // One elementFromPoint on a long inline line walks every fragment. The cap
+  // bounds that loop. A call is counted after it returns, so one slow hit can
+  // pass the cap and still keep its real result. Every queued sample the loop
+  // does not reach is covered, and the walk is truncated. Nothing here writes
+  // the page.
   const hitCapMs = 300;
 
   function coverageOf(els, rects) {
@@ -756,22 +784,33 @@
     for (let index = 0; index < els.length; index += 1) {
       flags.push(false);
       const rect = rects[index];
-      if (!isVisible(els[index], rect) || centerOutside(rect)) {
+      if (!isVisible(els[index], rect)) {
         continue;
       }
-      viewport.push(index);
+      const point = clippedPoint(rect);
+      if (!point) {
+        continue;
+      }
+      viewport.push({ index, x: point.x, y: point.y });
     }
     const hitStarted = performance.now();
-    for (let seen = 0; seen < viewport.length; seen += 1) {
+    let seen = 0;
+    for (; seen < viewport.length; seen += 1) {
       if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
         break;
       }
-      const index = viewport[seen];
-      const rect = rects[index];
-      flags[index] = coveredBy(
-        els[index],
-        elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2),
-      );
+      const point = viewport[seen];
+      flags[point.index] = coveredBy(els[point.index], elementFromPoint(point.x, point.y));
+      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
+        seen += 1;
+        break;
+      }
+    }
+    if (seen < viewport.length) {
+      truncated = true;
+      for (; seen < viewport.length; seen += 1) {
+        flags[viewport[seen].index] = true;
+      }
     }
     return flags;
   }
@@ -859,6 +898,9 @@
   }
 
   function indexDocument() {
+    if (!withinBudget()) {
+      return;
+    }
     idCounts = new Map();
     nameCounts = new Map();
     labelsByFor = new Map();
@@ -872,29 +914,44 @@
     styleHidden = new Map();
     displayNone = new Map();
     visibilityHidden = new Map();
-    for (const node of document.querySelectorAll("[id]")) {
-      const id = elementId(node);
+    const ids = document.querySelectorAll("[id]");
+    for (let index = 0; index < ids.length; index += 1) {
+      if (!withinBudget()) {
+        return;
+      }
+      const id = elementId(ids[index]);
       if (!id) {
         continue;
       }
       idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
-    for (const node of document.querySelectorAll("[name]")) {
-      const name = getAttribute(node, "name");
+    const named = document.querySelectorAll("[name]");
+    for (let index = 0; index < named.length; index += 1) {
+      if (!withinBudget()) {
+        return;
+      }
+      const name = getAttribute(named[index], "name");
       if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) {
         continue;
       }
-      const key = `${localName(node)}\n${name}`;
+      const key = `${localName(named[index])}\n${name}`;
       nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
     }
-    for (const label of document.querySelectorAll("label[for]")) {
-      const id = getAttribute(label, "for");
+    const labels = document.querySelectorAll("label[for]");
+    for (let index = 0; index < labels.length; index += 1) {
+      if (!withinBudget()) {
+        return;
+      }
+      const id = getAttribute(labels[index], "for");
       if (id && !labelsByFor.has(id)) {
-        labelsByFor.set(id, label);
+        labelsByFor.set(id, labels[index]);
       }
     }
     const forms = document.forms;
     for (let index = 0; index < forms.length; index += 1) {
+      if (!withinBudget()) {
+        return;
+      }
       formIndexes.set(forms[index], index);
     }
     if (document.documentElement) {
@@ -910,7 +967,7 @@
   }
 
   function walkTree(el, inherited) {
-    if (budgetSpent()) {
+    if (!withinBudget()) {
       return;
     }
     const hidden = inherited.hidden || hasAttribute(el, "hidden");
@@ -941,7 +998,7 @@
     const counts = new Map();
     const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden, displayHidden };
     for (const child of children(el)) {
-      if (budgetSpent()) {
+      if (!withinBudget()) {
         return;
       }
       const seen = (counts.get(tagName(child)) || 0) + 1;
@@ -951,20 +1008,93 @@
     }
   }
 
-  if (typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS <= 0) {
-    if (document.querySelectorAll(SELECTOR).length > 0) {
-      return {
+  function elementRow(el, rect, coveredFlag) {
+    const visible = isVisible(el, rect);
+    const role = elementRole(el);
+    const binding = submitBinding(el);
+    return [
+      localName(el),
+      role,
+      fallbackName(el),
+      elementId(el) || null,
+      getAttribute(el, "name"),
+      tagName(el) === "INPUT" ? (getAttribute(el, "type") || "text").toLowerCase() : null,
+      tagName(el) === "A" && hasAttribute(el, "href") ? el.href : null,
+      formIndex(el),
+      binding.form_method,
+      binding.form_action,
+      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
+      el.readOnly === true,
+      flagAriaDisabled.get(el) === true,
+      flagInert.get(el) === true,
+      flagHidden.get(el) === true,
+      flagAriaHidden.get(el) === true,
+      controlValue(el),
+      checkedState(el),
+      tagName(el) === "OPTION" ? el.selected === true : null,
+      optionsOf(el),
+      expanded(el),
+      getAttribute(el, "aria-selected"),
+      getAttribute(el, "aria-checked"),
+      getAttribute(el, "aria-pressed"),
+      getAttribute(el, "aria-current"),
+      getAttribute(el, "aria-valuemin"),
+      getAttribute(el, "aria-valuemax"),
+      getAttribute(el, "aria-valuenow"),
+      getAttribute(el, "aria-haspopup"),
+      getAttribute(el, "aria-controls"),
+      { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      visible,
+      coveredFlag,
+      inViewport(rect),
+      willValidate(el) ? el.validationMessage : "",
+      landmarkOf(el),
+      cssOf(el),
+      skeletonOf(el),
+      labelText(el),
+      groupKey(el),
+      constraintsOf(el),
+    ];
+  }
+
+  function deadlinePayload() {
+    return {
+      meta: JSON.stringify({
         fields: [],
-        elements: [],
         forms: [],
         modals: [],
-        nodes: [],
         url: pageUrl,
         title: pageTitle,
         truncated: false,
         deadline: true,
-      };
+        chunks: 0,
+        controls: 0,
+      }),
+      chunks: [],
+      nodes: [],
+    };
+  }
+
+  if (typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS <= 0) {
+    if (document.querySelectorAll(SELECTOR).length > 0) {
+      return deadlinePayload();
     }
+  }
+
+  // Rows are chosen before the tree walk. A throttled tree can spend the
+  // whole walk budget, and the read-back still has to ship a prefix.
+  const matched = document.querySelectorAll(SELECTOR);
+  const chosen = [];
+  const rects = [];
+  for (let index = 0; index < matched.length; index += 1) {
+    if (budgetSpent()) {
+      break;
+    }
+    chosen.push(matched[index]);
+    rects.push(boundingRect(matched[index]));
+  }
+  if (chosen.length === 0 && matched.length > 0) {
+    return deadlinePayload();
   }
 
   indexDocument();
@@ -1012,97 +1142,7 @@
     "group_key",
     "constraints",
   ];
-  const elements = [];
-  const matched = document.querySelectorAll(SELECTOR);
-  const chosen = [];
-  const rects = [];
-  // Shipping one kept row takes a fraction of a millisecond, and that copy
-  // has to finish inside the reserved second. A slow walk (a throttled CPU)
-  // keeps fewer rows. The rows chosen here are emitted below even if this
-  // loop stops, so a cut still returns the elements already kept.
-  const rowCopyMs = 0.2;
-  const fastCopyMs = 0.07;
-  const reserveMs = typeof WALK_RESERVE_MS === "number" ? WALK_RESERVE_MS : 1000;
-  const selectStarted = performance.now();
-  for (let index = 0; index < matched.length; index += 1) {
-    if (budgetSpent()) {
-      break;
-    }
-    const taken = chosen.length;
-    if (taken >= 200) {
-      const perRow = (performance.now() - selectStarted) / taken;
-      let copyMs = fastCopyMs;
-      if (perRow >= 0.003) {
-        copyMs = fastCopyMs * (perRow / 0.001);
-      }
-      if (taken * copyMs > reserveMs) {
-        truncated = true;
-        break;
-      }
-    }
-    if (
-      typeof WALK_BUDGET_MS === "number" &&
-      performance.now() - walkStarted + taken * rowCopyMs > WALK_BUDGET_MS
-    ) {
-      truncated = true;
-      break;
-    }
-    chosen.push(matched[index]);
-    rects.push(boundingRect(matched[index]));
-  }
   const covered = coverageOf(chosen, rects);
-  for (let index = 0; index < chosen.length; index += 1) {
-    const el = chosen[index];
-    nodes.push(el);
-    const rect = rects[index];
-    const visible = isVisible(el, rect);
-    const role = elementRole(el);
-    const binding = submitBinding(el);
-    elements.push([
-      localName(el),
-      role,
-      fallbackName(el),
-      elementId(el) || null,
-      getAttribute(el, "name"),
-      tagName(el) === "INPUT" ? (getAttribute(el, "type") || "text").toLowerCase() : null,
-      tagName(el) === "A" && hasAttribute(el, "href") ? el.href : null,
-      formIndex(el),
-      binding.form_method,
-      binding.form_action,
-      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
-      el.readOnly === true,
-      flagAriaDisabled.get(el) === true,
-      flagInert.get(el) === true,
-      flagHidden.get(el) === true,
-      flagAriaHidden.get(el) === true,
-      controlValue(el),
-      checkedState(el),
-      tagName(el) === "OPTION" ? el.selected === true : null,
-      optionsOf(el),
-      expanded(el),
-      getAttribute(el, "aria-selected"),
-      getAttribute(el, "aria-checked"),
-      getAttribute(el, "aria-pressed"),
-      getAttribute(el, "aria-current"),
-      getAttribute(el, "aria-valuemin"),
-      getAttribute(el, "aria-valuemax"),
-      getAttribute(el, "aria-valuenow"),
-      getAttribute(el, "aria-haspopup"),
-      getAttribute(el, "aria-controls"),
-      { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      visible,
-      covered[index],
-      inViewport(rect),
-      willValidate(el) ? el.validationMessage : "",
-      landmarkOf(el),
-      cssOf(el),
-      skeletonOf(el),
-      labelText(el),
-      groupKey(el),
-      constraintsOf(el),
-    ]);
-  }
-
   const forms = Array.from(document.forms).map((form, index) => ({
     index,
     method: (getAttribute(form, "method") || "get").toLowerCase(),
@@ -1138,14 +1178,51 @@
     pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
   }
 
+  // Stringify in slices so a late clock keeps the rows already copied.
+  // budgetSpent is sticky once truncated, and must not drop those rows.
+  // Each piece is one JSON array. Python reads them one at a time and stops
+  // when the next read would cross the deadline, so the copy stays interruptible.
+  const chunks = [];
+  let batch = [];
+  const chunkRows = 1000;
+  // Object ids are read in one CDP call. Cap the list so that call cannot
+  // outlast the deadline on a table of tens of thousands of rows. The head
+  // of the document is what the overlay visits first.
+  const nodeCap = 2000;
+  for (let index = 0; index < chosen.length; index += 1) {
+    if (index > 0 && pastReadback()) {
+      truncated = true;
+      break;
+    }
+    if (nodes.length < nodeCap) {
+      nodes.push(chosen[index]);
+    }
+    batch.push(elementRow(chosen[index], rects[index], covered[index]));
+    if (batch.length === chunkRows) {
+      chunks.push(JSON.stringify(batch));
+      batch = [];
+    }
+  }
+  if (batch.length > 0) {
+    chunks.push(JSON.stringify(batch));
+  }
+  if (chunks.length === 0 && matched.length > 0) {
+    return deadlinePayload();
+  }
+
   return {
-    fields,
-    elements,
-    forms,
-    modals,
+    meta: JSON.stringify({
+      fields,
+      forms,
+      modals,
+      url: pageUrl,
+      title: pageTitle,
+      truncated,
+      deadline: false,
+      chunks: chunks.length,
+      controls: matched.length,
+    }),
+    chunks,
     nodes,
-    url: pageUrl,
-    title: pageTitle,
-    truncated,
   };
 })()

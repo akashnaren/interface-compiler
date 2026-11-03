@@ -12,6 +12,7 @@ import os
 import signal
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -59,11 +60,17 @@ _DEADLINE_S = 5.0
 # page may spend on accessible names.
 _OVERLAY_MARGIN_S = 1.0
 _OVERLAY_BUDGET_CAP_S = 2.5
-_READ_PAYLOAD = (
-    "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
-    "forms:this.forms,modals:this.modals,url:this.url,title:this.title,"
-    "truncated:this.truncated,deadline:this.deadline});}"
-)
+# A cold getPartialAXTree builds Chromium's accessibility tree. On a
+# 20000-row table at 4x CPU throttle that call measured 1.25s to 1.57s and
+# cannot be interrupted. Do not start it unless the whole call fits.
+_AX_COLD_CALL_S = 1.8
+_AX_WARM_CALL_S = 0.25
+# One returned chunk is a couple of thousand rows. Do not start the next
+# read unless it can finish before the hard deadline.
+_CHUNK_READ_S = 0.3
+# Absolute perf_counter deadline for the collection in progress. Unset when
+# overlay tests call the helper on their own.
+_ax_deadline: ContextVar[float | None] = ContextVar("ax_deadline", default=None)
 
 
 class FactCollectionError(RuntimeError):
@@ -198,16 +205,18 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     of the deadline after the walk, minus one second, and at most 2.5s. When
     it runs out, the remaining controls keep the HTML name and ``name_source``
     is ``html``. The walk itself keeps that same second in reserve for the
-    read-back and the overlay. Coverage hit-tests in-viewport centers only,
-    stops when its time is gone, and does not write the page. A center it does
-    not reach stays uncovered. A new document loader or a stale node raises
-    instead of mixing two documents. The URL and title are the ones read at
-    the start of the walk, so a later ``pushState`` cannot relabel those
-    facts. When the deadline cuts the walk it returns the elements collected
-    so far with ``truncated`` set. A walk that is given no time, on a page
-    that has controls, raises instead of returning no elements. Collection
-    also raises when the browser driver cannot be found, so the deadline is
-    never skipped.
+    read-back and the overlay. Coverage samples the center of each visible
+    box clipped to the viewport, stops when its time is gone, and does not
+    write the page. A sample the hit loop does not reach is covered, and the
+    facts are truncated. A deadline at or below that reserved second is
+    rejected before the browser is touched. A new document loader or a stale
+    node raises instead of mixing two documents. The URL and title are the
+    ones read at the start of the walk, so a later ``pushState`` cannot
+    relabel those facts. When the deadline cuts the walk it returns the
+    elements collected so far with ``truncated`` set. A walk that is given no
+    time, or that ships no rows from a page that has controls, raises instead
+    of returning an empty document. Collection also raises when the browser
+    driver cannot be found, so the deadline is never skipped.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -215,6 +224,11 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     """
     if deadline_s <= 0:
         raise ValueError("deadline must be positive")
+    if deadline_s <= _OVERLAY_MARGIN_S:
+        raise ValueError(
+            "deadline must exceed the "
+            f"{_OVERLAY_MARGIN_S:g}s reserved for read-back and the overlay"
+        )
     pid = _driver_pid(page)
     if not isinstance(pid, int):
         raise FactCollectionError("fact collection cannot find the browser driver")
@@ -290,8 +304,17 @@ def _overlay_budget(deadline_s: float, elapsed_s: float) -> float:
     return min(_OVERLAY_BUDGET_CAP_S, remaining)
 
 
+def _ax_call_fits(needed_s: float) -> bool:
+    """True when one more accessibility call can finish before the deadline."""
+    deadline = _ax_deadline.get()
+    if deadline is None:
+        return True
+    return time.perf_counter() + needed_s < deadline
+
+
 def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
     session = page.context.new_cdp_session(page)
+    token = _ax_deadline.set(started + deadline_s)
     try:
         context_id = _isolated_context(session)
         started_loader = _require_frame_stamp(session)[1]
@@ -306,26 +329,16 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             },
         )
         root_id = _object_id(evaluated)
-        raw_payload = _evaluation_value(
-            session.send(
-                "Runtime.callFunctionOn",
-                {
-                    "objectId": root_id,
-                    "functionDeclaration": _READ_PAYLOAD,
-                    "returnByValue": True,
-                },
-            )
-        )
-        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else None
+        payload = _collected_payload(session, root_id)
         if isinstance(payload, dict) and payload.get("deadline") is True:
             raise FactCollectionError("fact collection exceeded the deadline")
-        # Read-back and the overlay share the reserved second. Past that, keep
-        # the HTML names rather than starting work the deadline cannot finish.
-        if time.perf_counter() - started >= deadline_s - _OVERLAY_MARGIN_S:
-            object_ids = []
-            overlay = {}
-        else:
+        # Node ids exist only to feed the overlay. A cold partial tree is one
+        # uninterruptible call, so skip both unless that call fits.
+        object_ids: list[str] = []
+        overlay: dict[str, _AxHit] = {}
+        if _ax_call_fits(_AX_COLD_CALL_S):
             object_ids = _node_object_ids(session, root_id)
+        if object_ids and _ax_call_fits(_AX_COLD_CALL_S):
             overlay = _accessibility_overlay(
                 session,
                 object_ids,
@@ -347,12 +360,66 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             raise FactCollectionError("fact collection exceeded the deadline") from exc
         raise
     finally:
+        _ax_deadline.reset(token)
         _release_nodes(session)
         try:
             session.detach()
         except PlaywrightError:
             pass
     return _page_facts(page_url, title, payload, overlay, truncated)
+
+
+def _function_value(session: CDPSession, object_id: str, declaration: str) -> Any:
+    return _evaluation_value(
+        session.send(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": declaration,
+                "returnByValue": True,
+            },
+        )
+    )
+
+
+def _collected_payload(session: CDPSession, root_id: str) -> dict[str, Any]:
+    """Meta plus element rows, read a chunk at a time.
+
+    The walk already copied rows into JSON strings. Pulling them one chunk at
+    a time lets the deadline stop the transfer without dropping the prefix.
+    """
+    meta_raw = _function_value(session, root_id, "function(){return this.meta;}")
+    if not isinstance(meta_raw, str):
+        raise TypeError("fact collector returned no payload")
+    meta = json.loads(meta_raw)
+    if not isinstance(meta, dict):
+        raise TypeError("fact collector returned no payload")
+    count = meta.get("chunks")
+    if not isinstance(count, int) or count < 0:
+        raise TypeError("fact collector returned no payload")
+    if meta.get("deadline") is True:
+        return meta
+    rows: list[object] = []
+    for index in range(count):
+        # The first chunk is the prefix we already paid to copy. Later chunks
+        # wait until a read fits before the deadline.
+        if index > 0 and not _ax_call_fits(_CHUNK_READ_S):
+            meta["truncated"] = True
+            break
+        piece = _function_value(
+            session,
+            root_id,
+            "function(){return this.chunks[" + str(index) + "];}",
+        )
+        parsed = json.loads(piece) if isinstance(piece, str) else None
+        if not isinstance(parsed, list):
+            raise TypeError("fact collector returned no payload")
+        rows.extend(parsed)
+    controls = meta.get("controls")
+    if not rows and isinstance(controls, int) and controls > 0:
+        meta["deadline"] = True
+    meta["elements"] = rows
+    return meta
 
 
 def _isolated_context(session: CDPSession) -> int:
@@ -475,16 +542,21 @@ def _accessibility_overlay(
     """
     if budget_s <= 0 or not object_ids or not order:
         return {}
+    if not _ax_call_fits(_AX_COLD_CALL_S):
+        return {}
     session.send("Accessibility.enable")
     started = time.perf_counter()
     # The title read and the loader check still run after this loop.
     limit = max(0.0, budget_s - 0.1)
     resolved: dict[str, _AxHit] = {}
+    needed = _AX_COLD_CALL_S
     for index in order:
         if time.perf_counter() - started >= limit:
             break
         if index < 0 or index >= len(object_ids):
             continue
+        if not _ax_call_fits(needed):
+            break
         try:
             tree = session.send(
                 "Accessibility.getPartialAXTree",
@@ -497,6 +569,7 @@ def _accessibility_overlay(
         hit = _hit_from_partial(tree)
         if hit is not None:
             resolved[str(index)] = hit
+        needed = _AX_WARM_CALL_S
     return resolved
 
 
