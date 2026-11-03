@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:interface-compiler:schema:view-doc:1",
+  "title": "Compiled view document, v1",
+  "type": "object",
+  "required": ["view", "state", "entities", "affordances"],
+  "additionalProperties": false,
+  "properties": {
+    "view": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+    "state": {
+      "type": "object",
+      "additionalProperties": {"type": ["string", "number", "integer", "boolean", "null"]}
+    },
+    "entities": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {"$ref": "#/$defs/record"},
+          {"type": "array", "items": {"$ref": "#/$defs/record"}}
+        ]
+      }
+    },
+    "affordances": {"type": "array", "items": {"$ref": "#/$defs/affordance"}},
+    "x": {"$ref": "#/$defs/doc_x"}
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null", "array"],
+        "items": {"type": ["string", "number", "integer", "boolean", "null"]}
+      }
+    },
+    "affordance": {
+      "type": "object",
+      "required": ["id", "enabled", "input"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "enabled": {"type": "boolean"},
+        "input": {"$ref": "#/$defs/input"},
+        "x": {"$ref": "#/$defs/affordance_x"}
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["type", "properties"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"const": "object"},
+        "properties": {"type": "object", "additionalProperties": {"$ref": "#/$defs/prop"}},
+        "required": {"type": "array", "items": {"type": "string"}, "uniqueItems": true, "minItems": 1}
+      }
+    },
+    "prop": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"enum": ["string", "number", "integer", "boolean", "array"]},
+        "enum": {"type": "array", "minItems": 1},
+        "format": {"enum": ["email", "uri", "date", "time", "date-time", "tel"]},
+        "pattern": {"type": "string"},
+        "minLength": {"type": "integer", "minimum": 0},
+        "maxLength": {"type": "integer", "minimum": 0},
+        "minimum": {"type": "number"},
+        "maximum": {"type": "number"},
+        "multipleOf": {"type": "number", "exclusiveMinimum": 0},
+        "items": {"$ref": "#/$defs/prop"}
+      }
+    },
+    "affordance_x": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {"type": "string"},
+        "tag": {"enum": ["safe", "mutating"]},
+        "label": {"type": "string"},
+        "locator": {"$ref": "#/$defs/locator"},
+        "signature": {"type": "string"},
+        "grain": {"enum": ["single", "field", "form", "collapsed", "declared"]},
+        "source": {"enum": ["compiled", "owner"]},
+        "verified": {"enum": ["unverified", "probed_ok", "probed_failed", "stopped_before_commit"]},
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "locator": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["ax", "form", "group", "repeat", "jsonld", "webmcp", "registry"]},
+        "role": {"type": "string"},
+        "name": {"type": "string"},
+        "landmark": {"type": "string"},
+        "nth": {"type": "integer", "minimum": 0},
+        "css": {"type": "string"},
+        "fields": {"type": "object", "additionalProperties": {"type": "string"}},
+        "options": {"type": "object", "additionalProperties": {"type": "string"}},
+        "repeat": {"type": "string"},
+        "item_key": {"type": "string"},
+        "url_template": {"type": "string"},
+        "method": {"type": "string"},
+        "tool": {"type": "string"},
+        "named_by": {"enum": ["rule", "embed", "llm", "declared"]}
+      }
+    },
+    "doc_x": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {"const": "1"},
+        "source": {"enum": ["compiled", "owner"]},
+        "url": {"type": "string"},
+        "title": {"type": "string"},
+        "signature": {
+          "type": "object",
+          "properties": {"route": {"type": "string"}, "skeleton_hash": {"type": "string"}, "template": {"type": "string"}}
+        },
+        "page": {"type": "object"},
+        "state_from": {"type": "object"},
+        "entities_from": {"type": "object"},
+        "precheck": {"type": "object"},
+        "registry": {"type": "object"},
+        "blocked": {"type": ["object", "null"]}
+      }
+    }
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:interface-compiler:schema:effect:1",
+  "title": "Act response, v1",
+  "type": "object",
+  "required": ["status", "doc_rev", "doc", "counters"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "enum": [
+        "ok",
+        "stale",
+        "disabled",
+        "invalid_args",
+        "needs_confirmation",
+        "blocked",
+        "error"
+      ]
+    },
+    "doc_rev": {"type": "integer"},
+    "doc": {"$ref": "urn:interface-compiler:schema:view-doc:1"},
+    "effect": {"$ref": "#/$defs/effect"},
+    "preview": {"$ref": "#/$defs/preview"},
+    "confirm_token": {"type": "string"},
+    "error": {"$ref": "#/$defs/error"},
+    "counters": {"$ref": "#/$defs/counters"}
+  },
+  "$defs": {
+    "effect": {
+      "type": "object",
+      "required": ["predicted", "observed", "match", "blocked_requests", "demoted"],
+      "additionalProperties": false,
+      "properties": {
+        "predicted": {"$ref": "#/$defs/predicted"},
+        "observed": {"$ref": "#/$defs/observed"},
+        "match": {"type": ["boolean", "null"]},
+        "blocked_requests": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/blocked_request"}
+        },
+        "demoted": {"type": "array", "items": {"$ref": "#/$defs/demoted"}}
+      }
+    },
+    "predicted": {
+      "type": "object",
+      "required": ["kind", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "navigate",
+            "state_change",
+            "aria_change",
+            "entities_change",
+            "dialog",
+            "none",
+            "unknown"
+          ]
+        },
+        "detail": {"type": "object"}
+      }
+    },
+    "observed": {
+      "type": "object",
+      "required": [
+        "url_before",
+        "url_after",
+        "view_before",
+        "view_after",
+        "state_diff",
+        "entities_diff",
+        "main_status",
+        "dialogs",
+        "console_errors"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "url_before": {"type": "string"},
+        "url_after": {"type": "string"},
+        "view_before": {"type": "string"},
+        "view_after": {"type": "string"},
+        "state_diff": {"type": "object"},
+        "entities_diff": {"type": "object"},
+        "main_status": {"type": ["integer", "null"]},
+        "dialogs": {"type": "array", "items": {"type": "string"}},
+        "console_errors": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "blocked_request": {
+      "type": "object",
+      "required": ["method", "url", "fields", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "method": {"type": "string"},
+        "url": {"type": "string"},
+        "fields": {"type": "object", "additionalProperties": {"type": "string"}},
+        "reason": {"type": "string"}
+      }
+    },
+    "demoted": {
+      "type": "object",
+      "required": ["affordance_id", "reason", "expires_at", "expires_after_looks"],
+      "additionalProperties": false,
+      "properties": {
+        "affordance_id": {"type": "string"},
+        "reason": {"type": "string"},
+        "expires_at": {"type": "string"},
+        "expires_after_looks": {"type": "integer"}
+      }
+    },
+    "preview": {
+      "type": "object",
+      "required": ["method", "url", "fields", "client_validation"],
+      "additionalProperties": false,
+      "properties": {
+        "method": {"type": "string"},
+        "url": {"type": "string"},
+        "fields": {"type": "object"},
+        "client_validation": {"$ref": "#/$defs/client_validation"}
+      }
+    },
+    "client_validation": {
+      "type": "object",
+      "required": ["valid", "messages"],
+      "additionalProperties": false,
+      "properties": {
+        "valid": {"type": "boolean"},
+        "messages": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "details": {"type": "object"}
+      }
+    },
+    "counters": {
+      "type": "object",
+      "required": ["illegal", "malformed", "ignored", "stale", "blocked", "acts"],
+      "additionalProperties": false,
+      "properties": {
+        "illegal": {"type": "integer"},
+        "malformed": {"type": "integer"},
+        "ignored": {"type": "integer"},
+        "stale": {"type": "integer"},
+        "blocked": {"type": "integer"},
+        "acts": {"type": "integer"}
+      }
+    }
+  }
+}
