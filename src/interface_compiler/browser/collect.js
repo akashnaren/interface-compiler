@@ -31,16 +31,108 @@
     "[aria-labelledby]",
   ].join(",");
 
-  // Form controls are exposed as named properties and hide these.
+  // Form controls are exposed as named properties and hide these on the form.
   const readId = Object.getOwnPropertyDescriptor(Element.prototype, "id").get;
+  const readTagName = Object.getOwnPropertyDescriptor(Element.prototype, "tagName").get;
+  const readLocalName = Object.getOwnPropertyDescriptor(Element.prototype, "localName").get;
+  const readChildren = Object.getOwnPropertyDescriptor(Element.prototype, "children").get;
+  const readParentElement = Object.getOwnPropertyDescriptor(Node.prototype, "parentElement").get;
+  const readChildNodes = Object.getOwnPropertyDescriptor(Node.prototype, "childNodes").get;
+  const readNodeType = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
+  const readTextContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").get;
   const readFormAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action").get;
+  const readGetAttribute = Element.prototype.getAttribute;
+  const readHasAttribute = Element.prototype.hasAttribute;
+  const readClosest = Element.prototype.closest;
+  const readMatches = Element.prototype.matches;
+  const readContains = Node.prototype.contains;
+  const readRect = Element.prototype.getBoundingClientRect;
+  const readQuery = Element.prototype.querySelector;
+  const readQueryAll = Element.prototype.querySelectorAll;
+  const readElementFromPoint = Document.prototype.elementFromPoint;
+  // A control named willValidate hides the IDL getter on its form. Each
+  // element type has its own getter; calling the wrong one throws.
+  const readWillValidate = {
+    INPUT: Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "willValidate").get,
+    BUTTON: Object.getOwnPropertyDescriptor(HTMLButtonElement.prototype, "willValidate").get,
+    SELECT: Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "willValidate").get,
+    TEXTAREA: Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "willValidate").get,
+  };
 
   function elementId(el) {
     return readId.call(el) || "";
   }
 
+  function tagName(el) {
+    return readTagName.call(el);
+  }
+
+  function localName(el) {
+    return readLocalName.call(el);
+  }
+
+  function children(el) {
+    return readChildren.call(el);
+  }
+
+  function parentElement(el) {
+    return readParentElement.call(el);
+  }
+
+  function childNodes(el) {
+    return readChildNodes.call(el);
+  }
+
+  function nodeType(node) {
+    return readNodeType.call(node);
+  }
+
+  function textContent(node) {
+    return readTextContent.call(node);
+  }
+
+  function getAttribute(el, name) {
+    return readGetAttribute.call(el, name);
+  }
+
+  function hasAttribute(el, name) {
+    return readHasAttribute.call(el, name);
+  }
+
+  function closest(el, selector) {
+    return readClosest.call(el, selector);
+  }
+
   function elementMatches(el, selector) {
-    return Element.prototype.matches.call(el, selector);
+    return readMatches.call(el, selector);
+  }
+
+  function contains(el, node) {
+    return readContains.call(el, node);
+  }
+
+  function boundingRect(el) {
+    return readRect.call(el);
+  }
+
+  function query(el, selector) {
+    return readQuery.call(el, selector);
+  }
+
+  function queryAll(el, selector) {
+    return readQueryAll.call(el, selector);
+  }
+
+  function elementFromPoint(x, y) {
+    return readElementFromPoint.call(document, x, y);
+  }
+
+  function willValidate(el) {
+    const read = readWillValidate[tagName(el)];
+    if (!read) {
+      return false;
+    }
+    return read.call(el) === true;
   }
 
   function clean(value) {
@@ -48,23 +140,31 @@
   }
 
   function hidesText(el) {
-    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") {
+    if (hasAttribute(el, "hidden") || getAttribute(el, "aria-hidden") === "true") {
       return true;
     }
-    const known = displayNone.get(el);
-    if (known !== undefined) {
-      return known === true;
+    // Inherited visibility:hidden and display:none from the walk, including
+    // text inside a heading. A child that sets visibility:visible stays hidden
+    // when an ancestor was already hidden.
+    if (styleHidden.get(el) === true) {
+      return true;
     }
-    return getComputedStyle(el).display === "none";
+    const display = displayNone.get(el);
+    const visibility = visibilityHidden.get(el);
+    if (display !== undefined || visibility !== undefined) {
+      return display === true || visibility === true;
+    }
+    const style = getComputedStyle(el);
+    return style.display === "none" || style.visibility === "hidden";
   }
 
   function ownText(el) {
     let text = "";
-    for (const node of el.childNodes) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        text += ` ${node.textContent}`;
-      } else if (node.nodeType === Node.ELEMENT_NODE) {
-        const tag = node.tagName;
+    for (const node of childNodes(el)) {
+      if (nodeType(node) === Node.TEXT_NODE) {
+        text += ` ${textContent(node)}`;
+      } else if (nodeType(node) === Node.ELEMENT_NODE) {
+        const tag = tagName(node);
         if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") {
           continue;
         }
@@ -72,7 +172,7 @@
           continue;
         }
         if (tag === "IMG") {
-          text += ` ${node.getAttribute("alt") || ""}`;
+          text += ` ${getAttribute(node, "alt") || ""}`;
           continue;
         }
         text += ` ${ownText(node)}`;
@@ -82,11 +182,11 @@
   }
 
   function accName(el) {
-    const labelled = clean(el.getAttribute("aria-label"));
+    const labelled = clean(getAttribute(el, "aria-label"));
     if (labelled) {
       return labelled;
     }
-    const labelledBy = el.getAttribute("aria-labelledby");
+    const labelledBy = getAttribute(el, "aria-labelledby");
     if (labelledBy) {
       const parts = [];
       for (const id of labelledBy.split(/\s+/)) {
@@ -95,7 +195,7 @@
         }
         const target = document.getElementById(id);
         if (target) {
-          parts.push(ownText(target) || clean(target.textContent));
+          parts.push(ownText(target) || clean(textContent(target)));
         }
       }
       const joined = clean(parts.join(" "));
@@ -103,7 +203,7 @@
         return joined;
       }
     }
-    return clean(el.getAttribute("title"));
+    return clean(getAttribute(el, "title"));
   }
 
   // Filled once per collection. The element walk must not rescan the document.
@@ -119,6 +219,7 @@
   let flagAriaDisabled = new Map();
   let styleHidden = new Map();
   let displayNone = new Map();
+  let visibilityHidden = new Map();
 
   function labelFor(el) {
     const id = elementId(el);
@@ -136,20 +237,20 @@
         return text;
       }
     }
-    const wrapping = el.closest("label");
+    const wrapping = closest(el, "label");
     if (wrapping && wrapping !== el) {
       const text = ownText(wrapping);
       if (text) {
         return text;
       }
     }
-    const labelledBy = el.getAttribute("aria-labelledby");
+    const labelledBy = getAttribute(el, "aria-labelledby");
     if (labelledBy) {
       const parts = [];
       for (const id of labelledBy.split(/\s+/)) {
         const target = id ? document.getElementById(id) : null;
         if (target) {
-          parts.push(ownText(target) || clean(target.textContent));
+          parts.push(ownText(target) || clean(textContent(target)));
         }
       }
       const joined = clean(parts.join(" "));
@@ -157,13 +258,13 @@
         return joined;
       }
     }
-    const placeholder = clean(el.getAttribute("placeholder"));
+    const placeholder = clean(getAttribute(el, "placeholder"));
     if (placeholder) {
       return placeholder;
     }
     // A submit value is its name. The fieldset legend must not replace it.
-    if (el.tagName === "INPUT") {
-      const type = (el.getAttribute("type") || "").toLowerCase();
+    if (tagName(el) === "INPUT") {
+      const type = (getAttribute(el, "type") || "").toLowerCase();
       if (type === "submit" || type === "reset" || type === "button") {
         const value = clean(el.value);
         if (value) {
@@ -171,13 +272,13 @@
         }
       }
       if (type === "image") {
-        const alt = clean(el.getAttribute("alt"));
+        const alt = clean(getAttribute(el, "alt"));
         if (alt) {
           return alt;
         }
       }
     }
-    const fieldset = el.closest("fieldset");
+    const fieldset = closest(el, "fieldset");
     if (fieldset) {
       const text = legendText.get(fieldset) || "";
       if (text) {
@@ -188,12 +289,12 @@
   }
 
   function elementRole(el) {
-    const explicit = clean(el.getAttribute("role")).split(" ")[0];
+    const explicit = clean(getAttribute(el, "role")).split(" ")[0];
     if (explicit) {
       return explicit;
     }
-    const tag = el.tagName.toLowerCase();
-    if (tag === "a" && el.hasAttribute("href")) {
+    const tag = localName(el);
+    if (tag === "a" && hasAttribute(el, "href")) {
       return "link";
     }
     if (tag === "button" || tag === "summary") {
@@ -239,7 +340,7 @@
       return accName(el) ? "region" : "generic";
     }
     if (tag === "input") {
-      const type = (el.getAttribute("type") || "text").toLowerCase();
+      const type = (getAttribute(el, "type") || "text").toLowerCase();
       if (type === "checkbox") {
         return "checkbox";
       }
@@ -271,9 +372,9 @@
   }
 
   function landmarkRole(el) {
-    const explicit = clean(el.getAttribute("role")).split(" ")[0];
-    const tag = el.tagName;
-    if ((tag === "HEADER" || tag === "FOOTER") && !explicit && el.parentElement !== document.body) {
+    const explicit = clean(getAttribute(el, "role")).split(" ")[0];
+    const tag = tagName(el);
+    if ((tag === "HEADER" || tag === "FOOTER") && !explicit && parentElement(el) !== document.body) {
       return null;
     }
     const role = elementRole(el);
@@ -294,24 +395,98 @@
   }
 
   function landmarkOf(el) {
-    let node = el.parentElement;
+    let node = parentElement(el);
     while (node && node !== document.documentElement) {
       const role = landmarkRole(node);
       if (role) {
         const name = accName(node);
         return name ? `${role} ${name}` : role;
       }
-      node = node.parentElement;
+      node = parentElement(node);
     }
     return "";
   }
 
+  function labelledByText(el) {
+    const labelledBy = getAttribute(el, "aria-labelledby");
+    if (!labelledBy) {
+      return "";
+    }
+    const parts = [];
+    for (const id of String(labelledBy).split(/\s+/)) {
+      if (!id) {
+        continue;
+      }
+      const target = document.getElementById(id);
+      if (target) {
+        parts.push(ownText(target) || clean(textContent(target)));
+      }
+    }
+    return clean(parts.join(" "));
+  }
+
+  // Submit value beats title. Title is only the last resort, after the
+  // browser's default Submit or Reset label.
+  function controlName(el) {
+    if (localName(el) !== "input") {
+      return null;
+    }
+    const type = (getAttribute(el, "type") || "").toLowerCase();
+    if (
+      type !== "submit" &&
+      type !== "reset" &&
+      type !== "button" &&
+      type !== "image" &&
+      type !== "file"
+    ) {
+      return null;
+    }
+    const by = labelledByText(el);
+    if (by) {
+      return by;
+    }
+    const aria = clean(getAttribute(el, "aria-label"));
+    if (aria) {
+      return aria;
+    }
+    if (type === "file") {
+      return "Choose File";
+    }
+    if (type === "image") {
+      const alt = clean(getAttribute(el, "alt"));
+      if (alt) {
+        return alt;
+      }
+      // Empty alt is the default Submit label. Title and the legend come after.
+      return "Submit";
+    }
+    const value = clean(el.value);
+    if (value) {
+      return value;
+    }
+    if (type === "submit") {
+      return "Submit";
+    }
+    if (type === "reset") {
+      return "Reset";
+    }
+    return clean(getAttribute(el, "title"));
+  }
+
   function fallbackName(el) {
+    const control = controlName(el);
+    if (control !== null) {
+      return control;
+    }
+    // Chromium leaves an unlabelled form unnamed. Child text is not its name.
+    if (tagName(el) === "FORM") {
+      return accName(el);
+    }
     const named = accName(el);
     if (named) {
       return named;
     }
-    const tag = el.tagName;
+    const tag = tagName(el);
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") {
       return labelText(el);
     }
@@ -319,29 +494,29 @@
   }
 
   function groupKey(el) {
-    const type = (el.getAttribute("type") || "").toLowerCase();
-    if (el.tagName === "INPUT" && type === "radio") {
-      const name = el.getAttribute("name");
+    const type = (getAttribute(el, "type") || "").toLowerCase();
+    if (tagName(el) === "INPUT" && type === "radio") {
+      const name = getAttribute(el, "name");
       if (name) {
         return name;
       }
     }
-    const radioGroup = el.closest("[role='radiogroup']");
+    const radioGroup = closest(el, "[role='radiogroup']");
     if (radioGroup) {
       const name = accName(radioGroup) || elementId(radioGroup);
       if (name) {
         return name;
       }
     }
-    const fieldset = el.closest("fieldset");
+    const fieldset = closest(el, "fieldset");
     if (fieldset) {
       const text = legendText.get(fieldset) || "";
       if (text) {
         return text;
       }
     }
-    if (el.hasAttribute("aria-pressed")) {
-      const toolbar = el.closest("[role='toolbar']");
+    if (hasAttribute(el, "aria-pressed")) {
+      const toolbar = closest(el, "[role='toolbar']");
       if (toolbar) {
         return accName(toolbar) || elementId(toolbar) || null;
       }
@@ -354,23 +529,23 @@
     if (id && idCounts.get(id) === 1) {
       return `#${CSS.escape(id)}`;
     }
-    const name = el.getAttribute("name");
+    const name = getAttribute(el, "name");
     if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
-      const key = `${el.tagName.toLowerCase()}\n${name}`;
+      const key = `${localName(el)}\n${name}`;
       if (nameCounts.get(key) === 1) {
-        return `${el.tagName.toLowerCase()}[name="${name}"]`;
+        return `${localName(el)}[name="${name}"]`;
       }
     }
     const parts = [];
     let node = el;
-    while (node && node.nodeType === 1 && node.tagName !== "HTML") {
-      if (node.tagName === "BODY") {
+    while (node && nodeType(node) === 1 && tagName(node) !== "HTML") {
+      if (tagName(node) === "BODY") {
         parts.unshift("body");
         break;
       }
       const nth = nthOfType.get(node) || 1;
-      parts.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${nth})`);
-      node = node.parentElement;
+      parts.unshift(`${localName(node)}:nth-of-type(${nth})`);
+      node = parentElement(node);
     }
     return parts.join(" > ");
   }
@@ -378,56 +553,56 @@
   function skeletonOf(el) {
     const chain = [];
     let node = el;
-    while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
+    while (node && nodeType(node) === 1 && node !== document.body && node !== document.documentElement) {
       chain.unshift(node);
-      node = node.parentElement;
+      node = parentElement(node);
     }
     const parts = [];
     if (document.body) {
       parts.push(`body|${elementRole(document.body)}`);
     }
     for (const item of chain) {
-      parts.push(`${item.tagName.toLowerCase()}|${elementRole(item)}`);
+      parts.push(`${localName(item)}|${elementRole(item)}`);
     }
     return parts.join(" > ");
   }
 
   function expanded(el) {
-    const value = el.getAttribute("aria-expanded");
+    const value = getAttribute(el, "aria-expanded");
     if (value !== null) {
       return value;
     }
-    if (el.tagName === "DETAILS") {
+    if (tagName(el) === "DETAILS") {
       return el.open ? "true" : "false";
     }
-    if (el.tagName === "SUMMARY" && el.parentElement && el.parentElement.tagName === "DETAILS") {
-      return el.parentElement.open ? "true" : "false";
+    if (tagName(el) === "SUMMARY" && parentElement(el) && tagName(parentElement(el)) === "DETAILS") {
+      return parentElement(el).open ? "true" : "false";
     }
     return null;
   }
 
   function optionsOf(el) {
-    if (el.tagName === "SELECT") {
+    if (tagName(el) === "SELECT") {
       return Array.from(el.options, (opt) => ({
         value: opt.value,
         label: clean(opt.label),
         disabled: optionDisabled(opt),
       }));
     }
-    let box = el.getAttribute("role") === "listbox" ? el : null;
+    let box = getAttribute(el, "role") === "listbox" ? el : null;
     if (!box) {
-      const controls = el.getAttribute("aria-controls");
+      const controls = getAttribute(el, "aria-controls");
       const id = controls ? controls.split(/\s+/).find(Boolean) : "";
       const target = id ? document.getElementById(id) : null;
-      if (target && (target.getAttribute("role") === "listbox" || target.querySelector("[role='option']"))) {
+      if (target && (getAttribute(target, "role") === "listbox" || query(target, "[role='option']"))) {
         box = target;
       }
     }
     if (!box) {
       return [];
     }
-    return Array.from(box.querySelectorAll("[role='option']"), (opt) => ({
-      value: opt.getAttribute("data-value") || ownText(opt),
+    return Array.from(queryAll(box, "[role='option']"), (opt) => ({
+      value: getAttribute(opt, "data-value") || ownText(opt),
       label: ownText(opt),
       disabled: optionDisabled(opt),
     }));
@@ -440,8 +615,17 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  // Off-screen centres are not a hit test. A viewport centre is covered when
-  // the top element is neither this node nor something inside it.
+  // One sample per line box. Hit-testing every inline link walks that line's
+  // fragments again, which is quadratic on a single line of links.
+  const lineCovered = new Map();
+
+  function coveredBy(el, hit) {
+    if (!hit) {
+      return true;
+    }
+    return hit !== el && !contains(el, hit);
+  }
+
   function isCovered(el, rect, visible) {
     if (!visible) {
       return false;
@@ -451,11 +635,37 @@
     if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) {
       return false;
     }
-    const hit = document.elementFromPoint(cx, cy);
-    if (!hit) {
-      return true;
+    const top = Math.round(rect.top);
+    const height = Math.round(rect.height);
+    const key = `${top}:${height}`;
+    let sample = lineCovered.get(key);
+    if (sample === undefined) {
+      const hit = elementFromPoint(cx, cy);
+      sample = { hit, hitRect: hit ? boundingRect(hit) : null, cx, cy };
+      lineCovered.set(key, sample);
     }
-    return hit !== el && !el.contains(hit);
+    // The element we sampled is decided from that hit, including an overlay
+    // with the same box. Other fragments on the line reuse it only when the
+    // hit is a same-line sibling that does not paint this center.
+    if (Math.abs(cx - sample.cx) < 0.5 && Math.abs(cy - sample.cy) < 0.5) {
+      return coveredBy(el, sample.hit);
+    }
+    const hitRect = sample.hitRect;
+    const paintsHere =
+      hitRect &&
+      cx >= hitRect.left &&
+      cx < hitRect.right &&
+      cy >= hitRect.top &&
+      cy < hitRect.bottom;
+    const sameLine =
+      hitRect && Math.round(hitRect.top) === top && Math.round(hitRect.height) === height;
+    if (sample.hit && (sample.hit === el || contains(el, sample.hit))) {
+      return false;
+    }
+    if (!paintsHere && sameLine) {
+      return false;
+    }
+    return coveredBy(el, elementFromPoint(cx, cy));
   }
 
   function inViewport(rect) {
@@ -481,10 +691,10 @@
   function constraintsOf(el) {
     return {
       required: el.required === true,
-      pattern: el.getAttribute("pattern"),
-      min: el.getAttribute("min"),
-      max: el.getAttribute("max"),
-      step: el.getAttribute("step"),
+      pattern: getAttribute(el, "pattern"),
+      min: getAttribute(el, "min"),
+      max: getAttribute(el, "max"),
+      step: getAttribute(el, "step"),
       minlength: reflectedLength(el.minLength),
       maxlength: reflectedLength(el.maxLength),
     };
@@ -503,8 +713,8 @@
   }
 
   function submitBinding(el) {
-    const tag = el.tagName;
-    const type = (el.getAttribute("type") || "").toLowerCase();
+    const tag = tagName(el);
+    const type = (getAttribute(el, "type") || "").toLowerCase();
     const submit =
       (tag === "BUTTON" && (type === "" || type === "submit")) ||
       (tag === "INPUT" && (type === "submit" || type === "image"));
@@ -513,18 +723,18 @@
     }
     const method = el.formMethod ? String(el.formMethod).toLowerCase() : null;
     // formAction is the resolved URL. A document without a base leaves it blank.
-    const action = el.hasAttribute("formaction")
-      ? String(el.formAction || el.getAttribute("formaction") || "") || null
+    const action = hasAttribute(el, "formaction")
+      ? String(el.formAction || getAttribute(el, "formaction") || "") || null
       : null;
     return { form_method: method, form_action: action };
   }
 
   function controlValue(el) {
     if (
-      el.tagName === "INPUT" ||
-      el.tagName === "TEXTAREA" ||
-      el.tagName === "SELECT" ||
-      el.tagName === "OPTION"
+      tagName(el) === "INPUT" ||
+      tagName(el) === "TEXTAREA" ||
+      tagName(el) === "SELECT" ||
+      tagName(el) === "OPTION"
     ) {
       return el.value;
     }
@@ -532,9 +742,9 @@
   }
 
   function checkedState(el) {
-    const type = (el.getAttribute("type") || "").toLowerCase();
-    const role = (el.getAttribute("role") || "").toLowerCase();
-    if (el.tagName === "INPUT" && (type === "checkbox" || type === "radio" || role === "switch")) {
+    const type = (getAttribute(el, "type") || "").toLowerCase();
+    const role = (getAttribute(el, "role") || "").toLowerCase();
+    if (tagName(el) === "INPUT" && (type === "checkbox" || type === "radio" || role === "switch")) {
       return el.checked === true;
     }
     return null;
@@ -553,6 +763,7 @@
     flagAriaDisabled = new Map();
     styleHidden = new Map();
     displayNone = new Map();
+    visibilityHidden = new Map();
     for (const node of document.querySelectorAll("[id]")) {
       const id = elementId(node);
       if (!id) {
@@ -561,15 +772,15 @@
       idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
     for (const node of document.querySelectorAll("[name]")) {
-      const name = node.getAttribute("name");
+      const name = getAttribute(node, "name");
       if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) {
         continue;
       }
-      const key = `${node.tagName.toLowerCase()}\n${name}`;
+      const key = `${localName(node)}\n${name}`;
       nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
     }
     for (const label of document.querySelectorAll("label[for]")) {
-      const id = label.getAttribute("for");
+      const id = getAttribute(label, "for");
       if (id && !labelsByFor.has(id)) {
         labelsByFor.set(id, label);
       }
@@ -590,10 +801,10 @@
   }
 
   function walkTree(el, inherited) {
-    const hidden = inherited.hidden || el.hasAttribute("hidden");
-    const ariaHidden = inherited.ariaHidden || el.getAttribute("aria-hidden") === "true";
-    const inert = inherited.inert || el.inert === true || el.hasAttribute("inert");
-    const ariaDisabled = inherited.ariaDisabled || el.getAttribute("aria-disabled") === "true";
+    const hidden = inherited.hidden || hasAttribute(el, "hidden");
+    const ariaHidden = inherited.ariaHidden || getAttribute(el, "aria-hidden") === "true";
+    const inert = inherited.inert || el.inert === true || hasAttribute(el, "inert");
+    const ariaDisabled = inherited.ariaDisabled || getAttribute(el, "aria-disabled") === "true";
     const style = getComputedStyle(el);
     const visuallyHidden =
       inherited.visuallyHidden || style.display === "none" || style.visibility === "hidden";
@@ -603,10 +814,11 @@
     flagAriaDisabled.set(el, ariaDisabled);
     styleHidden.set(el, visuallyHidden);
     displayNone.set(el, style.display === "none");
-    if (el.tagName === "FIELDSET") {
+    visibilityHidden.set(el, style.visibility === "hidden");
+    if (tagName(el) === "FIELDSET") {
       let text = "";
-      for (const child of el.children) {
-        if (child.tagName === "LEGEND") {
+      for (const child of children(el)) {
+        if (tagName(child) === "LEGEND") {
           text = ownText(child);
           break;
         }
@@ -615,9 +827,9 @@
     }
     const counts = new Map();
     const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden };
-    for (const child of el.children) {
-      const seen = (counts.get(child.tagName) || 0) + 1;
-      counts.set(child.tagName, seen);
+    for (const child of children(el)) {
+      const seen = (counts.get(tagName(child)) || 0) + 1;
+      counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
       walkTree(child, next);
     }
@@ -670,18 +882,18 @@
   ];
   const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el) => {
     nodes.push(el);
-    const rect = el.getBoundingClientRect();
+    const rect = boundingRect(el);
     const visible = isVisible(el, rect);
     const role = elementRole(el);
     const binding = submitBinding(el);
     return [
-      el.tagName.toLowerCase(),
+      localName(el),
       role,
       fallbackName(el),
       elementId(el) || null,
-      el.getAttribute("name"),
-      el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
-      el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
+      getAttribute(el, "name"),
+      tagName(el) === "INPUT" ? (getAttribute(el, "type") || "text").toLowerCase() : null,
+      tagName(el) === "A" && hasAttribute(el, "href") ? el.href : null,
       formIndex(el),
       binding.form_method,
       binding.form_action,
@@ -693,23 +905,23 @@
       flagAriaHidden.get(el) === true,
       controlValue(el),
       checkedState(el),
-      el.tagName === "OPTION" ? el.selected === true : null,
+      tagName(el) === "OPTION" ? el.selected === true : null,
       optionsOf(el),
       expanded(el),
-      el.getAttribute("aria-selected"),
-      el.getAttribute("aria-checked"),
-      el.getAttribute("aria-pressed"),
-      el.getAttribute("aria-current"),
-      el.getAttribute("aria-valuemin"),
-      el.getAttribute("aria-valuemax"),
-      el.getAttribute("aria-valuenow"),
-      el.getAttribute("aria-haspopup"),
-      el.getAttribute("aria-controls"),
+      getAttribute(el, "aria-selected"),
+      getAttribute(el, "aria-checked"),
+      getAttribute(el, "aria-pressed"),
+      getAttribute(el, "aria-current"),
+      getAttribute(el, "aria-valuemin"),
+      getAttribute(el, "aria-valuemax"),
+      getAttribute(el, "aria-valuenow"),
+      getAttribute(el, "aria-haspopup"),
+      getAttribute(el, "aria-controls"),
       { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       visible,
       isCovered(el, rect, visible),
       inViewport(rect),
-      el.willValidate ? el.validationMessage : "",
+      willValidate(el) ? el.validationMessage : "",
       landmarkOf(el),
       cssOf(el),
       skeletonOf(el),
@@ -721,7 +933,7 @@
 
   const forms = Array.from(document.forms).map((form, index) => ({
     index,
-    method: (form.getAttribute("method") || "get").toLowerCase(),
+    method: (getAttribute(form, "method") || "get").toLowerCase(),
     action: readFormAction.call(form),
     // :invalid does not fire invalid listeners. form.checkValidity is skipped
     // because a control named checkValidity replaces the method.
@@ -732,7 +944,7 @@
   const modals = [];
   const seen = new Set();
   function pushModal(el, role) {
-    if (seen.has(el) || !isVisible(el, el.getBoundingClientRect())) {
+    if (seen.has(el) || !isVisible(el, boundingRect(el))) {
       return;
     }
     seen.add(el);
@@ -751,7 +963,7 @@
   for (const dialog of document.querySelectorAll(
     "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
   )) {
-    pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
+    pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
   }
 
   return { fields, elements, forms, modals, nodes };

@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
 from interface_compiler.browser.engine import USER_AGENT_SUFFIX, Engine
@@ -15,7 +16,10 @@ from interface_compiler.browser.facts import (
     ElementFact,
     FactCollectionError,
     PageFacts,
+    _accessibility_overlay,
     _non_negative_int,
+    _overlay_budget,
+    _overlay_order,
     _page_facts,
     collect_facts,
 )
@@ -925,6 +929,48 @@ def test_facts_named_form_controls_do_not_shadow_getters(
 
 
 @pytest.mark.parametrize(
+    "accessor",
+    [
+        "getAttribute",
+        "hasAttribute",
+        "children",
+        "tagName",
+        "parentElement",
+        "localName",
+        "closest",
+        "matches",
+        "getBoundingClientRect",
+        "willValidate",
+    ],
+)
+def test_facts_form_controls_do_not_shadow_dom_accessors(
+    accessor: str,
+    facts_page: Page,
+    fixture_base_url: str,
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+    facts_page.evaluate(
+        "(html) => { document.open(); document.write(html); document.close(); }",
+        (
+            "<!doctype html><title>form</title>"
+            "<form id='f' action='/go' method='post'>"
+            f"<input name='{accessor}' value='nope'>"
+            "<button id='go' type='submit'>Go</button>"
+            "</form>"
+        ),
+    )
+    facts = collect_facts(facts_page)
+    form = facts.forms[0]
+    assert form.html_id == "f"
+    assert form.method == "post"
+    assert form.action.endswith("/go")
+    assert "nope" not in form.action
+    assert _by_id(facts, "f").tag == "form"
+    assert _by_id(facts, "f").name == ""
+    assert _by_id(facts, "go").name == "Go"
+
+
+@pytest.mark.parametrize(
     ("control_type", "role"),
     [
         ("image", "button"),
@@ -987,7 +1033,161 @@ def test_facts_html_fallback_names_skip_legend_and_hidden_text(
     assert element.name_source == "html"
 
 
-@pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table")])
+@pytest.mark.parametrize(
+    ("html", "name"),
+    [
+        (
+            "<input id='c' type='submit' title='Search' value='Delete account'>",
+            "Delete account",
+        ),
+        (
+            (
+                "<span id='by'>Remove</span>"
+                "<input id='c' type='submit' aria-labelledby='by' value='Delete account' title='Search'>"
+            ),
+            "Remove",
+        ),
+        (
+            "<input id='c' type='submit' aria-label='Remove' value='Delete account' title='Search'>",
+            "Remove",
+        ),
+        ("<input id='c' type='submit' title='Search'>", "Submit"),
+        ("<input id='c' type='reset' title='Search'>", "Reset"),
+        ("<input id='c' type='reset' value='Undo' title='Search'>", "Undo"),
+        ("<input id='c' type='image' alt='Delete account' title='Search'>", "Delete account"),
+        ("<input id='c' type='file' title='Search'>", "Choose File"),
+        (
+            "<button id='c'><span style='visibility:hidden'>Search</span>Pay now</button>",
+            "Pay now",
+        ),
+        ("<form id='c'><button type='submit'>Go</button></form>", ""),
+        (
+            (
+                "<fieldset><legend>Search options</legend>"
+                "<input id='c' type='image' alt='' title='Search'></fieldset>"
+            ),
+            "Submit",
+        ),
+        ("<h1 id='c'>Hello <span style='visibility:hidden'>Secret</span></h1>", "Hello"),
+        (
+            "<h1 id='c' style='visibility:hidden'><span style='visibility:visible'>Secret</span></h1>",
+            "",
+        ),
+    ],
+)
+def test_facts_control_names_prefer_value_over_title(
+    html: str,
+    name: str,
+    facts_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("interface_compiler.browser.facts._OVERLAY_BUDGET_CAP_S", 0.0)
+    facts_page.set_content(f"<!doctype html><title>names</title>{html}")
+    element = _by_id(collect_facts(facts_page), "c")
+    assert element.name == name
+    assert element.name_source == "html"
+
+
+@pytest.mark.parametrize("change", ["replace", "navigate"])
+def test_facts_loader_id_is_the_document(
+    change: str,
+    facts_page: Page,
+    fixture_base_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+
+    def during_overlay(
+        session: object,
+        object_ids: list[str],
+        budget_s: float,
+        order: list[int],
+    ) -> dict[str, object]:
+        found = _accessibility_overlay(session, object_ids, budget_s, order)
+        if change == "replace":
+            facts_page.evaluate("() => history.replaceState(null, '', '/shifted?x=1#section')")
+        elif change == "navigate":
+            facts_page.goto(f"{fixture_base_url}/button.html", wait_until="domcontentloaded")
+        else:
+            unexpected: str = change
+            raise AssertionError(unexpected)
+        return found
+
+    monkeypatch.setattr(
+        "interface_compiler.browser.facts._accessibility_overlay",
+        during_overlay,
+    )
+    if change == "navigate":
+        with pytest.raises(FactCollectionError, match="fact collection lost the document"):
+            collect_facts(facts_page)
+        return
+    facts = collect_facts(facts_page)
+    assert facts.url.endswith("/shifted?x=1#section")
+    assert facts.title == "Links"
+    assert any(element.html_id == "cart" for element in facts.elements)
+
+
+def test_facts_title_navigation_error_loses_the_document(
+    facts_page: Page,
+    fixture_base_url: str,
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+
+    def lost() -> str:
+        raise PlaywrightError(
+            "Execution context was destroyed, most likely because of a navigation"
+        )
+
+    facts_page.title = lost
+    with pytest.raises(FactCollectionError, match="fact collection lost the document"):
+        collect_facts(facts_page)
+
+
+@pytest.mark.parametrize(
+    ("deadline", "elapsed", "expected"),
+    [(5.0, 0.2, 2.5), (5.0, 3.0, 1.0), (5.0, 4.0, 0.0), (5.0, 4.5, 0.0)],
+)
+def test_facts_overlay_budget_leaves_a_margin(
+    deadline: float, elapsed: float, expected: float
+) -> None:
+    assert _overlay_budget(deadline, elapsed) == expected
+
+
+@pytest.mark.parametrize(
+    ("rows", "order"),
+    [
+        (
+            [
+                ["a", "link", True, False],
+                ["button", "button", True, True],
+                ["h1", "heading", True, True],
+            ],
+            [1, 0],
+        ),
+        (
+            [
+                ["button", "button", False, False],
+                ["input", "textbox", True, True],
+                ["button", "button", True, False],
+            ],
+            [1, 0, 2],
+        ),
+        (
+            [
+                ["a", "link", False, False],
+                ["a", "link", True, False],
+                ["button", "button", True, True],
+            ],
+            [2, 1, 0],
+        ),
+    ],
+)
+def test_facts_overlay_prefers_visible_widgets(rows: list[list[object]], order: list[int]) -> None:
+    payload = {"fields": ["tag", "role", "visible", "in_viewport"], "elements": rows}
+    assert _overlay_order(payload, len(rows)) == order
+
+
+@pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table"), (4000, "inline")])
 def test_facts_row_count_finishes_under_the_deadline(rows: int, layout: str) -> None:
     # Own browser: a deadline kill must not take down the session engine.
     script = """
@@ -1005,12 +1205,16 @@ try:
     parts = ["<!doctype html><title>rows</title>", "<h1>Section</h1>" * 8]
     parts.append("<span id='axlab' aria-label='From AX'></span>")
     parts.append("<button id='go' aria-labelledby='axlab'>ignored</button>")
-    if layout == "table":
+    if layout == "inline":
+        parts.append('<p style="white-space:nowrap">')
+        for index in range(rows):
+            parts.append(f'<a id="r{index}" href="/r{index}">Row {index}</a>')
+        parts.append("</p>")
+        for index in range(400):
+            parts.append(f'<button type="button"><img alt="Icon {index}"></button>')
+    elif layout == "table":
         parts.append("<table><tbody>")
-    else:
-        parts.append("<main>")
-    for index in range(rows):
-        if layout == "table":
+        for index in range(rows):
             parts.append(
                 "<tr>"
                 f'<td><label for="f{index}">Field {index}</label>'
@@ -1019,30 +1223,38 @@ try:
                 f'<td><a id="r{index}" href="/r{index}">Row {index}</a></td>'
                 "</tr>"
             )
-        else:
+        parts.append("</tbody></table>")
+    else:
+        parts.append("<main>")
+        for index in range(rows):
             parts.append(
                 f'<label for="f{index}">Field {index}</label>'
                 f'<input id="f{index}" name="f{index}">'
                 f'<a id="r{index}" href="/r{index}">Row {index}</a>'
             )
-    parts.append("</tbody></table>" if layout == "table" else "</main>")
+        parts.append("</main>")
     page.set_content("".join(parts), wait_until="domcontentloaded")
     started = time.perf_counter()
     facts = collect_facts(page)
     elapsed = time.perf_counter() - started
     inputs = sum(element.tag == "input" for element in facts.elements)
     links = sum(element.tag == "a" for element in facts.elements)
-    field = next(element for element in facts.elements if element.html_id == "f0")
-    last = next(element for element in facts.elements if element.html_id == f"f{rows - 1}")
+    buttons = sum(element.tag == "button" for element in facts.elements)
     row = next(element for element in facts.elements if element.html_id == "r0")
     go = next(element for element in facts.elements if element.html_id == "go")
     headings = [element for element in facts.elements if element.tag == "h1"]
     covered = [element for element in facts.elements if element.name_source == "ax"]
     actionable = {"a", "button", "input", "select", "textarea", "summary", "option"}
-    if not (inputs == rows and links == rows and field.name == "Field 0" and row.name == "Row 0"):
-        raise SystemExit(2)
-    if last.disabled or last.role != "textbox":
-        raise SystemExit(2)
+    if layout == "inline":
+        if links != rows or buttons < 401 or row.name != "Row 0":
+            raise SystemExit(2)
+    else:
+        field = next(element for element in facts.elements if element.html_id == "f0")
+        last = next(element for element in facts.elements if element.html_id == f"f{rows - 1}")
+        if not (inputs == rows and links == rows and field.name == "Field 0" and row.name == "Row 0"):
+            raise SystemExit(2)
+        if last.disabled or last.role != "textbox":
+            raise SystemExit(2)
     # Headings come first in the document and are not overlaid. The button is.
     if go.role != "button" or go.name != "From AX" or go.name_source != "ax":
         raise SystemExit(2)

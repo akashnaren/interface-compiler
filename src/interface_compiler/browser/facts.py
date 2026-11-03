@@ -55,9 +55,9 @@ _ISOLATED_WORLD = "interface-compiler"
 _NODE_GROUP = "interface-compiler-nodes"
 _EVAL_TIMEOUT_MS = 5_000
 _DEADLINE_S = 5.0
-# The DOM walk uses about the first two seconds. The rest of the deadline is
-# for accessible names on widgets, then links.
-_OVERLAY_BUDGET_FRACTION = 0.5
+# Leave a second for the walk's tail and for returning facts. The cap is how
+# long a fast page may spend on accessible names.
+_OVERLAY_MARGIN_S = 1.0
 _OVERLAY_BUDGET_CAP_S = 2.5
 _READ_PAYLOAD = (
     "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
@@ -188,13 +188,16 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     The DOM walk in `collect.js` is the source of the element list. It runs in
     an isolated world, so a page that replaces ``querySelectorAll`` or
     ``Array.from`` cannot change the walk. Chromium's accessibility tree
-    overlays role and name for widgets, then links. Each element is joined by
-    the object id returned from that world, not by an attribute the page can
-    see. Shadow controls (a date input's spinbuttons, for example) are not
-    separate facts. Headings keep the HTML
-    name. When the overlay budget runs out, the remaining controls keep the
-    HTML name and ``name_source`` is ``html``. A navigation or a stale node
-    raises instead of mixing two documents.
+    overlays role and name for on-screen widgets, then other widgets, then
+    visible links, then the remaining links. Each element is joined by the
+    object id returned from that world, not by an attribute the page can see.
+    Shadow controls (a date input's spinbuttons, for example) are not separate
+    facts. Headings keep the HTML name. The overlay budget is whatever remains
+    of the deadline after the walk, minus one second, and at most 2.5s. When
+    it runs out, the remaining controls keep the HTML name and ``name_source``
+    is ``html``. A new document loader or a stale node raises instead of mixing
+    two documents. ``history.replaceState`` keeps the loader, and the facts URL
+    is ``page.url``, including its fragment.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -212,9 +215,10 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
         daemon=True,
     )
     watcher.start()
+    started = time.perf_counter()
     result: PageFacts | None = None
     try:
-        result = _collect_within(page, deadline_s)
+        result = _collect_within(page, deadline_s, started)
     except FactCollectionError:
         _note_if_killed(killed, pid)
         raise
@@ -267,16 +271,18 @@ def _driver_pid(page: Page) -> int | None:
     return _playwright_driver_pid(page.context.browser)
 
 
-def _overlay_budget(deadline_s: float) -> float:
-    return min(_OVERLAY_BUDGET_CAP_S, deadline_s * _OVERLAY_BUDGET_FRACTION)
+def _overlay_budget(deadline_s: float, elapsed_s: float) -> float:
+    remaining = deadline_s - elapsed_s - _OVERLAY_MARGIN_S
+    if remaining <= 0:
+        return 0.0
+    return min(_OVERLAY_BUDGET_CAP_S, remaining)
 
 
-def _collect_within(page: Page, deadline_s: float) -> PageFacts:
+def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
     session = page.context.new_cdp_session(page)
     try:
         context_id = _isolated_context(session)
-        started_frame = _require_frame_stamp(session)
-        started_url = started_frame[0]
+        started_loader = _require_frame_stamp(session)[1]
         evaluated = session.send(
             "Runtime.evaluate",
             {
@@ -303,11 +309,15 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
         overlay = _accessibility_overlay(
             session,
             object_ids,
-            _overlay_budget(deadline_s),
+            _overlay_budget(deadline_s, time.perf_counter() - started),
             _overlay_order(payload, len(object_ids)),
         )
-        if _require_frame_stamp(session) != started_frame:
+        # Title before the second stamp: a navigation here is a lost document,
+        # not a deadline failure. replaceState changes the URL and not the loader.
+        title = _page_title(page)
+        if _require_frame_stamp(session)[1] != started_loader:
             raise FactCollectionError("fact collection lost the document")
+        page_url = page.url
     except Exception as exc:
         if _is_collection_abort(exc):
             raise FactCollectionError("fact collection exceeded the deadline") from exc
@@ -320,9 +330,9 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
             pass
     if not isinstance(payload, dict):
         raise TypeError("fact collector must return an object")
-    # The URL is the one recorded before the walk. A navigation after the
-    # stamp check cannot relabel these facts with the next document.
-    return _page_facts(started_url, page.title(), payload, overlay)
+    # page.url is read only after the loader id matches, so a fragment from
+    # replaceState is kept and a later document cannot relabel these facts.
+    return _page_facts(page_url, title, payload, overlay)
 
 
 def _isolated_context(session: CDPSession) -> int:
@@ -389,8 +399,15 @@ def _release_nodes(session: CDPSession) -> None:
         pass
 
 
+def _row_flag(row: object, fields: list[str], name: str) -> bool:
+    if name not in fields or not isinstance(row, list):
+        return False
+    at = fields.index(name)
+    return at < len(row) and row[at] is True
+
+
 def _overlay_order(payload: object, count: int) -> list[int]:
-    """Widget indexes, then links. Everything else is left on the HTML name."""
+    """On-screen widgets, then other widgets, then visible links, then other links."""
     if count <= 0:
         return []
     rows = payload.get("elements") if isinstance(payload, dict) else None
@@ -401,18 +418,27 @@ def _overlay_order(payload: object, count: int) -> list[int]:
     role_at = fields.index("role") if "role" in fields else None
     if not isinstance(tag_at, int) or not isinstance(role_at, int):
         return []
+    on_screen: list[int] = []
     widgets: list[int] = []
-    links: list[int] = []
+    visible_links: list[int] = []
+    other_links: list[int] = []
+    names = [name for name in fields if isinstance(name, str)]
     for index in range(min(count, len(rows))):
         row = rows[index]
         tag = row[tag_at] if isinstance(row, list) and tag_at < len(row) else None
         role = row[role_at] if isinstance(row, list) and role_at < len(row) else None
         if tag in _WIDGET_TAGS or role in _WIDGET_ROLES:
-            widgets.append(index)
+            if _row_flag(row, names, "visible") and _row_flag(row, names, "in_viewport"):
+                on_screen.append(index)
+            else:
+                widgets.append(index)
             continue
         if tag == "a" or role == "link":
-            links.append(index)
-    return widgets + links
+            if _row_flag(row, names, "visible"):
+                visible_links.append(index)
+            else:
+                other_links.append(index)
+    return on_screen + widgets + visible_links + other_links
 
 
 def _accessibility_overlay(
@@ -497,6 +523,16 @@ def _require_frame_stamp(session: CDPSession) -> tuple[str, str]:
     """The current document, or an error if the page navigated away."""
     try:
         return _frame_stamp(session)
+    except PlaywrightError as exc:
+        if _is_document_lost(exc):
+            raise FactCollectionError("fact collection lost the document") from exc
+        raise
+
+
+def _page_title(page: Page) -> str:
+    """The document title, or a lost-document error if the page navigated."""
+    try:
+        return page.title()
     except PlaywrightError as exc:
         if _is_document_lost(exc):
             raise FactCollectionError("fact collection lost the document") from exc

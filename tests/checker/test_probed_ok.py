@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pydantic_core
 import pytest
 from pydantic import ValidationError
 
@@ -297,7 +298,10 @@ def _public_probe_bypassing_the_url_guard() -> ViewDoc:
     return doc
 
 
-@pytest.mark.parametrize("path", ["setter", "model_dump", "act_dump"])
+@pytest.mark.parametrize(
+    "path",
+    ["setter", "model_dump", "model_dump_json", "act_dump", "replace_x"],
+)
 def test_checker_serialized_probe_matches_the_document_url(path: str) -> None:
     if path == "setter":
         legal = ViewDoc.model_validate(
@@ -318,10 +322,29 @@ def test_checker_serialized_probe_matches_the_document_url(path: str) -> None:
         assert "mutating affordance cannot be probed_ok" in str(exc.value)
         assert row.verified == "unverified"
         return
+    if path == "replace_x":
+        owned = ViewDoc.model_validate(
+            _with_probe("https://example.com/p", tag="mutating", verified="unverified")
+        )
+        row = owned.affordances[2]
+        row.x = AffordanceX(tag="mutating")
+        replaced = row.x
+        assert replaced is not None
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            replaced.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+        assert replaced.verified is None
+        extra = json.loads(owned.model_dump_json())["affordances"][2]["x"]
+        assert extra.get("verified") != "probed_ok"
+        return
     doc = _public_probe_bypassing_the_url_guard()
     if path == "model_dump":
         with pytest.raises(ContractError) as exc:
             doc.model_dump()
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        return
+    if path == "model_dump_json":
+        with pytest.raises(ContractError) as exc:
+            doc.model_dump_json()
         assert "mutating affordance cannot be probed_ok" in str(exc.value)
         return
     if path == "act_dump":
@@ -348,6 +371,44 @@ def test_checker_serialized_probe_matches_the_document_url(path: str) -> None:
             result.model_dump()
         return
     raise AssertionError(path)
+
+
+def _dump_probe(model: ViewDoc | ActResult, dump: str) -> None:
+    if dump == "model_dump":
+        model.model_dump()
+        return
+    if dump == "model_dump_json":
+        model.model_dump_json()
+        return
+    if dump == "to_json":
+        pydantic_core.to_json(model)
+        return
+    raise AssertionError(dump)
+
+
+@pytest.mark.parametrize("dump", ["model_dump", "model_dump_json", "to_json"])
+def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
+    doc = _public_probe_bypassing_the_url_guard()
+    with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+        _dump_probe(doc, dump)
+    result = ActResult.model_validate(
+        {
+            "status": "ok",
+            "doc_rev": 1,
+            "doc": _with_probe("http://127.0.0.1/x", tag="mutating"),
+            "counters": {
+                "illegal": 0,
+                "malformed": 0,
+                "ignored": 0,
+                "stale": 0,
+                "blocked": 0,
+                "acts": 1,
+            },
+        }
+    )
+    result.doc = doc
+    with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+        _dump_probe(result, dump)
 
 
 def test_checker_setter_allows_loopback_and_safe() -> None:
