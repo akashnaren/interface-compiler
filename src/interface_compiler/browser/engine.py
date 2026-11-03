@@ -78,8 +78,9 @@ class Engine:
             if browser is not None:
                 browser.close()
         except PlaywrightError:
-            if playwright is not None:
-                playwright.stop()
-            raise
+            pass
         if playwright is not None:
-            playwright.stop()
+            try:
+                playwright.stop()
+            except PlaywrightError:
+                pass

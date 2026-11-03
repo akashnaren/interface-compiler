@@ -32,7 +32,9 @@ jobs:
       - name: Sync the frozen lockfile
         run: uv sync --frozen --extra dev
 
-      # Browser tests get their Playwright Chromium install step when they land.
+      - name: Install Playwright Chromium
+        run: uv run playwright install --with-deps chromium
+
       - name: Test
         run: uv run pytest -q
 

@@ -84,13 +84,51 @@ def validate_command(
     try:
         validate_doc(data)
     except ContractError as exc:
-        for line in exc.errors:
-            typer.echo(line, err=True)
+        _echo_contract_errors(exc.errors)
         raise typer.Exit(1) from exc
     except RecursionError as exc:
         typer.echo(nesting_too_deep("document"), err=True)
         raise typer.Exit(1) from exc
     typer.echo("valid")
+
+
+_MAX_CLI_ERRORS = 20
+_MAX_CLI_ERROR_CHARS = 4000
+
+
+def _echo_contract_errors(errors: list[str]) -> None:
+    """Print contract errors, stopping after a bounded number and size."""
+    shown = 0
+    used = 0
+    for line in errors:
+        if shown >= _MAX_CLI_ERRORS or used + len(line) > _MAX_CLI_ERROR_CHARS:
+            break
+        typer.echo(line, err=True)
+        shown += 1
+        used += len(line) + 1
+    remaining = len(errors) - shown
+    if remaining:
+        typer.echo(f"{remaining} more errors omitted", err=True)
+
+
+def _raw_url_allowed(url: str, *, local_fixture: bool) -> bool:
+    """http and https only, plus file when the local-fixture flag is set."""
+    if url == "" or _forbidden_raw_char(url):
+        return False
+    scheme, separator, _rest = url.partition("://")
+    if separator != "://":
+        return False
+    lowered = scheme.lower()
+    if lowered in {"http", "https"}:
+        return True
+    return local_fixture and lowered == "file"
+
+
+def _forbidden_raw_char(url: str) -> bool:
+    for char in url:
+        if char == "\\" or char.isspace() or ord(char) < 32 or ord(char) == 127:
+            return True
+    return False
 
 
 def _short_playwright_error(exc: PlaywrightError) -> str:
@@ -103,12 +141,26 @@ def _short_playwright_error(exc: PlaywrightError) -> str:
 @app.command("raw")
 def raw_command(
     url: Annotated[str, typer.Argument(help="Page to snapshot.")],
+    local_fixture: Annotated[
+        bool,
+        typer.Option(
+            "--local-fixture",
+            help="Allow a file URL for a local fixture page.",
+        ),
+    ] = False,
 ) -> None:
     """Print the Playwright aria snapshot for a URL.
 
     The browser is closed before this process exits. Leaving Chromium running
-    would keep the command from finishing.
+    would keep the command from finishing. Only http and https URLs are
+    fetched. ``--local-fixture`` also allows a file URL.
     """
+    if not _raw_url_allowed(url, local_fixture=local_fixture):
+        if local_fixture:
+            typer.echo("raw accepts only an http, https, or file URL", err=True)
+        else:
+            typer.echo("raw accepts only an http or https URL", err=True)
+        raise typer.Exit(2)
     engine = Engine()
     page = None
     try:

@@ -7,11 +7,15 @@ Fact collection does not validate arguments.
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import CDPSession, Page
+from playwright.sync_api import Error as PlaywrightError
 
 _COLLECT_SOURCE = Path(__file__).with_name("collect.js").read_text(encoding="utf-8")
 _CLEAR_MARKERS = (
@@ -21,6 +25,15 @@ _CLEAR_MARKERS = (
 # Chromium reports these on text runs and on nodes it has dropped. They are not
 # the host control's role, so the HTML role from collect.js stands.
 _SKIP_AX_ROLES = frozenset({"none", "InlineTextBox", "StaticText", "ignored"})
+# Chromium's internal names for controls whose ARIA role is the one below.
+_AX_ROLE_ALIASES = {"Date": "textbox", "DisclosureTriangle": "button"}
+_ISOLATED_WORLD = "interface-compiler"
+_EVAL_TIMEOUT_MS = 5_000
+_DEADLINE_S = 5.0
+
+
+class FactCollectionError(RuntimeError):
+    """The page did not yield facts before the deadline."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,28 +137,182 @@ class _AxHit:
     name: str | None
 
 
-def collect_facts(page: Page) -> PageFacts:
+def normalized_page_url(page: Page) -> str:
+    """Return the URL Playwright is actually on.
+
+    That value is already normalized. Probe checks use it instead of the URL
+    string from before navigation.
+    """
+    return page.url
+
+
+def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     """Collect element, form, and open-modal facts for the current document.
 
-    The DOM walk in `collect.js` is the source of the element list. Chromium's
-    accessibility tree only overlays role and name, and only for a host node
-    that the walk marked. Shadow controls (a date input's spinbuttons, for
-    example) are not separate facts. An open modal drops the rest of the page
-    from that tree; those controls keep the HTML role.
+    The DOM walk in `collect.js` is the source of the element list. It runs in
+    an isolated world, so a page that replaces ``querySelectorAll`` or
+    ``Array.from`` cannot change the walk. Chromium's accessibility tree only
+    overlays role and name, and only for a host node that the walk marked.
+    Shadow controls (a date input's spinbuttons, for example) are not separate
+    facts. An open modal drops the rest of the page from that tree; those
+    controls keep the HTML role.
+
+    A renderer that is already spinning does not honor a CDP timeout. The
+    deadline stops that browser's driver so the blocked call returns.
     """
-    payload = page.evaluate(_COLLECT_SOURCE)
-    overlay: dict[str, _AxHit] = {}
+    if deadline_s <= 0:
+        raise ValueError("deadline must be positive")
+    stop = threading.Event()
+    watcher = threading.Thread(
+        target=_abort_browser_after,
+        args=(_driver_pid(page), deadline_s, stop),
+        name="fact-deadline",
+        daemon=True,
+    )
+    watcher.start()
     try:
-        session = page.context.new_cdp_session(page)
+        payload = _evaluate_isolated(page, _COLLECT_SOURCE)
+        overlay: dict[str, _AxHit] = {}
+        session: CDPSession | None = None
         try:
+            session = page.context.new_cdp_session(page)
             overlay = _accessibility_overlay(session)
         finally:
-            session.detach()
+            if session is not None:
+                try:
+                    session.detach()
+                except PlaywrightError:
+                    pass
+            _evaluate_isolated(page, _CLEAR_MARKERS)
+    except FactCollectionError:
+        raise
+    except Exception as exc:
+        if _is_collection_abort(exc):
+            raise FactCollectionError("fact collection exceeded the deadline") from exc
+        raise
     finally:
-        page.evaluate(_CLEAR_MARKERS)
+        stop.set()
     if not isinstance(payload, dict):
         raise TypeError("fact collector must return an object")
-    return _page_facts(page.url, page.title(), payload, overlay)
+    return _page_facts(normalized_page_url(page), page.title(), payload, overlay)
+
+
+def _abort_browser_after(pid: int | None, deadline_s: float, stop: threading.Event) -> None:
+    if pid is None or stop.wait(deadline_s):
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return
+
+
+def _driver_pid(page: Page) -> int | None:
+    """PID of the Playwright driver for this page's browser.
+
+    Stopping Chromium alone leaves a CDP call blocked in the driver. The
+    lookup stays on the calling thread. The deadline thread only signals
+    this pid; it does not call Playwright.
+    """
+    browser = page.context.browser
+    if browser is None:
+        return None
+    connection = getattr(getattr(browser, "_impl_obj", None), "_connection", None)
+    transport = getattr(connection, "_transport", None)
+    proc = getattr(transport, "_proc", None)
+    pid = getattr(proc, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+def _evaluate_isolated(page: Page, expression: str) -> Any:
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send("Page.enable")
+        tree = session.send("Page.getFrameTree")
+        frame_id = _frame_id(tree)
+        world = session.send(
+            "Page.createIsolatedWorld",
+            {
+                "frameId": frame_id,
+                "worldName": _ISOLATED_WORLD,
+                "grantUniveralAccess": True,
+            },
+        )
+        context_id = world.get("executionContextId") if isinstance(world, dict) else None
+        if not isinstance(context_id, int):
+            raise TypeError("isolated world has no execution context")
+        result = session.send(
+            "Runtime.evaluate",
+            {
+                "expression": expression,
+                "contextId": context_id,
+                "returnByValue": True,
+                "timeout": _EVAL_TIMEOUT_MS,
+            },
+        )
+    except Exception as exc:
+        if _is_collection_abort(exc):
+            raise FactCollectionError("fact collection exceeded the deadline") from exc
+        raise
+    finally:
+        try:
+            session.detach()
+        except PlaywrightError:
+            pass
+    return _evaluation_value(result)
+
+
+def _frame_id(tree: object) -> str:
+    if not isinstance(tree, dict):
+        raise TypeError("page has no frame")
+    frame_tree = tree.get("frameTree")
+    frame = frame_tree.get("frame") if isinstance(frame_tree, dict) else None
+    frame_id = frame.get("id") if isinstance(frame, dict) else None
+    if not isinstance(frame_id, str) or not frame_id:
+        raise TypeError("page has no frame")
+    return frame_id
+
+
+def _evaluation_value(result: object) -> Any:
+    if not isinstance(result, dict):
+        raise TypeError("fact collector returned no result")
+    details = result.get("exceptionDetails")
+    if isinstance(details, dict):
+        text = _cdp_exception_text(details)
+        lowered = text.lower()
+        if "terminated" in lowered or "timed out" in lowered:
+            raise FactCollectionError("fact collection exceeded the deadline")
+        raise FactCollectionError("fact collector failed")
+    remote = result.get("result")
+    if not isinstance(remote, dict):
+        raise TypeError("fact collector returned no result")
+    if remote.get("type") == "undefined":
+        return None
+    if "value" not in remote:
+        raise TypeError("fact collector returned no value")
+    return remote.get("value")
+
+
+def _cdp_exception_text(details: dict[str, Any]) -> str:
+    exception = details.get("exception")
+    if isinstance(exception, dict):
+        description = exception.get("description")
+        if isinstance(description, str) and description:
+            return description.splitlines()[0]
+    text = details.get("text")
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def _is_collection_abort(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "has been closed" in text
+        or "connection closed" in text
+        or "terminated" in text
+        or "timed out" in text
+        or "timeout" in text
+    )
 
 
 def _accessibility_overlay(session: CDPSession) -> dict[str, _AxHit]:
@@ -227,7 +394,7 @@ def _ax_role(node: dict[str, Any]) -> str | None:
         return None
     value = raw.get("value")
     if isinstance(value, str) and value:
-        return value
+        return _AX_ROLE_ALIASES.get(value, value)
     return None
 
 

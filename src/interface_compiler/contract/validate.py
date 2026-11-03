@@ -13,11 +13,12 @@ from typing import Any, NamedTuple
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.validators import extend
 from pydantic import BaseModel
 from referencing import Registry, Resource
 
 from interface_compiler.checker.verified import verified_errors
-from interface_compiler.contract.patterns import backtracking_risk
+from interface_compiler.contract.patterns import PatternError, ensure_pattern, pattern_matches
 
 _SCHEMA_FILES = {
     "view-doc": "view-doc.v1.json",
@@ -108,7 +109,7 @@ def validate_args(affordance: object, args: object) -> None:
         _check_json_shape(affordance)
     _ensure_input_schema(schema, "input")
     try:
-        validator = Draft202012Validator(schema, format_checker=_format_checker())
+        validator = _Validator(schema, format_checker=_format_checker())
         _raise_if_invalid(validator, args)
     except ContractError:
         raise
@@ -272,22 +273,29 @@ def _input_object_errors(schema: object, where: str) -> list[str]:
                 errors.append(f"{where}/required/{index}: {_echo_value(name)} is not a property")
     if isinstance(properties, Mapping):
         for key, prop in properties.items():
-            errors.extend(_prop_errors(prop, f"{where}/properties/{key}"))
+            errors.extend(_prop_errors(prop, _property_path(where, key)))
     return errors
 
 
 def _compile_pattern(pattern: str) -> ContractError | None:
     """Return a contract error when ``pattern`` cannot be compiled or matched safely."""
     try:
-        re.compile(pattern)
-    except _PATTERN_COMPILE_ERRORS as exc:
-        message = f"{_echo_pattern(pattern)} is not a valid regular expression ({exc})"
-        return ContractError(message, errors=[message])
-    reason = backtracking_risk(pattern)
-    if reason is not None:
-        message = f"{_echo_pattern(pattern)} is rejected ({reason})"
+        ensure_pattern(pattern)
+    except PatternError as exc:
+        message = _pattern_error_message(pattern, exc)
         return ContractError(message, errors=[message])
     return None
+
+
+def _pattern_error_message(pattern: str, exc: PatternError) -> str:
+    shown = _echo_pattern(pattern)
+    if exc.invalid:
+        return f"{shown} is not a valid regular expression ({exc.detail})"
+    return f"{shown} is rejected ({exc.detail})"
+
+
+def _property_path(where: str, key: object) -> str:
+    return f"{where}/properties/{_cap_text(str(key), _SEGMENT_LIMIT)}"
 
 
 def _cap_text(text: str, limit: int) -> str:
@@ -555,8 +563,9 @@ def _reject_json_type(value: object, path: tuple[str, ...]) -> None:
 
 
 def _json_shape_error(path: tuple[str, ...], detail: str) -> None:
-    where = "/".join(path) if path else "<root>"
-    message = f"{where}: {detail}"
+    parts = [_cap_text(part, _SEGMENT_LIMIT) for part in path]
+    where = "/".join(parts) if parts else "<root>"
+    message = _cap_text(f"{where}: {detail}", _MESSAGE_LIMIT)
     raise ContractError(message, errors=[message])
 
 
@@ -589,7 +598,7 @@ def _schema_nesting_errors(
     properties = node.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
-            child_where = f"{where}/properties/{key}"
+            child_where = _property_path(where, key)
             errors.extend(_schema_nesting_errors(child, child_where, depth=depth + 1, seen=seen))
     items = node.get("items")
     if isinstance(items, Mapping):
@@ -605,7 +614,7 @@ def _input_nesting_errors(schema: object, where: str) -> list[str]:
     properties = schema.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
-            child_where = f"{where}/properties/{key}"
+            child_where = _property_path(where, key)
             errors.extend(_schema_nesting_errors(child, child_where, depth=0, seen=seen))
     return errors
 
@@ -657,11 +666,12 @@ def _prefix_contract_error(exc: ContractError, where: str) -> ContractError:
     for message in exc.errors:
         location, separator, detail = message.partition(": ")
         if separator and location == "<root>":
-            errors.append(f"{where}: {detail}")
+            rewritten = f"{where}: {detail}"
         elif separator:
-            errors.append(f"{where}/{location}: {detail}")
+            rewritten = f"{where}/{location}: {detail}"
         else:
-            errors.append(f"{where}: {message}")
+            rewritten = f"{where}: {message}"
+        errors.append(_cap_text(rewritten, _MESSAGE_LIMIT))
     return ContractError(errors[0], errors=errors)
 
 
@@ -669,7 +679,7 @@ def _prefix_contract_error(exc: ContractError, where: str) -> ContractError:
 def _input_schema_validator() -> Draft202012Validator:
     full = load_schema("view-doc")
     schema = {"$defs": full["$defs"], "$ref": "#/$defs/input"}
-    return Draft202012Validator(schema, format_checker=_format_checker())
+    return _Validator(schema, format_checker=_format_checker())
 
 
 def _prop_errors(
@@ -693,16 +703,41 @@ def _prop_errors(
     if isinstance(pattern, str):
         failure = _compile_pattern(pattern)
         if failure is not None:
-            errors.append(f"{where}/pattern: {failure}")
+            errors.append(_cap_text(f"{where}/pattern: {failure}", _MESSAGE_LIMIT))
     items = prop.get("items")
     if isinstance(items, Mapping):
         errors.extend(_prop_errors(items, f"{where}/items", depth + 1, seen))
     return errors
 
 
+def _pattern_keyword(
+    validator: Draft202012Validator,
+    patrn: object,
+    instance: object,
+    _schema: object,
+) -> Any:
+    """JSON Schema ``pattern``, matched with RE2 instead of the stdlib engine."""
+    if not validator.is_type(instance, "string") or not isinstance(patrn, str):
+        return None
+    try:
+        matched = pattern_matches(patrn, instance)
+    except PatternError as exc:
+        if exc.detail == "string is too long to match":
+            yield ValidationError("string is too long to match")
+            return
+        yield ValidationError(_pattern_error_message(patrn, exc))
+        return
+    if not matched:
+        yield ValidationError(f"{instance!r} does not match {patrn!r}")
+    return None
+
+
+_Validator = extend(Draft202012Validator, validators={"pattern": _pattern_keyword})
+
+
 @lru_cache(maxsize=len(_SCHEMA_FILES))
 def _validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(
+    return _Validator(
         load_schema(name),
         registry=_registry(),
         format_checker=_format_checker(),

@@ -9,9 +9,9 @@ tag is treated as mutating. This module reads ``x.url``, ``x.tag``, and
 from __future__ import annotations
 
 from collections.abc import Mapping
-from urllib.parse import urlsplit
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_HTTP_SCHEMES = frozenset({"http", "https"})
 _BAN = "mutating affordance cannot be probed_ok"
 
 
@@ -63,12 +63,69 @@ def _page_url(instance: Mapping[object, object]) -> object:
 
 
 def _is_loopback(url: object) -> bool:
+    """True only for an http(s) URL whose host is exactly a loopback name.
+
+    The host is taken from the authority, not from ``urlsplit``. A userinfo
+    trick such as ``http://evil.com\\@127.0.0.1/`` must not count: Chromium
+    navigates to the name before the backslash. Backslashes, whitespace,
+    control characters, userinfo, and any scheme other than http or https
+    fail closed. An explicit port must be an integer from 1 to 65535.
+    """
     if not isinstance(url, str) or url == "":
         return False
-    try:
-        host = urlsplit(url).hostname
-    except (ValueError, UnicodeError):
+    if _forbidden_url_char(url):
         return False
-    if not isinstance(host, str):
+    scheme, separator, rest = url.partition("://")
+    if separator != "://" or scheme.lower() not in _HTTP_SCHEMES:
         return False
-    return host.lower() in _LOOPBACK_HOSTS
+    authority = _authority(rest)
+    if authority == "" or "@" in authority:
+        return False
+    host, port = _host_and_port(authority)
+    if host is None or host.lower() not in _LOOPBACK_HOSTS:
+        return False
+    if port is None:
+        return True
+    if not port.isdigit():
+        return False
+    number = int(port)
+    return 1 <= number <= 65535
+
+
+def _forbidden_url_char(url: str) -> bool:
+    for char in url:
+        if char == "\\" or char.isspace() or ord(char) < 32 or ord(char) == 127:
+            return True
+    return False
+
+
+def _authority(rest: str) -> str:
+    authority = rest
+    for marker in "/?#":
+        index = authority.find(marker)
+        if index != -1:
+            authority = authority[:index]
+    return authority
+
+
+def _host_and_port(authority: str) -> tuple[str | None, str | None]:
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 2:
+            return None, None
+        host = authority[1:end]
+        # Bracketed hosts are IPv6. Only the exact loopback address counts.
+        if host.lower() != "::1":
+            return None, None
+        tail = authority[end + 1 :]
+        if tail == "":
+            return host, None
+        if len(tail) < 2 or not tail.startswith(":"):
+            return None, None
+        return host, tail[1:]
+    if ":" not in authority:
+        return authority, None
+    host, port = authority.rsplit(":", 1)
+    if host == "" or port == "" or ":" in host:
+        return None, None
+    return host, port

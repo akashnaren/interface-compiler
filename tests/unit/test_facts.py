@@ -357,7 +357,7 @@ def test_facts_text_inputs(facts_page: Page, fixture_base_url: str) -> None:
     _expect(qty, role="spinbutton", name="Qty", input_type="number")
     assert qty.constraints == Constraints(False, None, "1", "9", "1", None, None)
     when = _by_id(facts, "when")
-    _expect(when, role="Date", name="When", input_type="date", landmark="main Product")
+    _expect(when, role="textbox", name="When", input_type="date", landmark="main Product")
     assert "input|textbox" in when.skeleton_path
     assert not any(el.name in {"Month", "Day", "Year", "Show date picker"} for el in facts.elements)
     _expect(_by_id(facts, "tel"), role="textbox", name="Phone", input_type="tel")
@@ -461,7 +461,7 @@ def test_facts_disclosure(facts_page: Page, fixture_base_url: str) -> None:
     fabric = _by_id(facts, "fabric")
     _expect(
         fabric,
-        role="DisclosureTriangle",
+        role="button",
         name="Fabric",
         aria_expanded="false",
         visible=True,
@@ -657,3 +657,100 @@ def test_facts_menu_options(facts_page: Page, fixture_base_url: str) -> None:
     native = _by_id(facts, "native")
     _expect(native, role="combobox", name="Size", visible=True, covered=False)
     assert _options(native) == [("new", "Newest", False), ("price", "Price", False)]
+
+
+def test_facts_isolated_world_ignores_page_overrides(
+    facts_page: Page, fixture_base_url: str
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+    facts_page.evaluate(
+        """() => {
+            document.querySelectorAll = () => [];
+            Array.from = () => { throw new Error("overridden"); };
+        }"""
+    )
+    facts = collect_facts(facts_page)
+    assert any(el.html_id == "cart" for el in facts.elements)
+    left = facts_page.evaluate("() => document.querySelector('[data-ic-fact]')")
+    assert left is None
+
+
+def test_facts_busy_renderer_returns_before_the_deadline() -> None:
+    # A second sync Playwright in this process fights the session browser, and
+    # killing the busy renderer would take that browser down with it. The
+    # child process has its own Chromium.
+    script = """
+import time
+from interface_compiler.browser.engine import Engine
+from interface_compiler.browser.facts import FactCollectionError, collect_facts
+
+engine = Engine()
+engine.start()
+page = engine.new_page()
+try:
+    page.set_content(
+        "<!doctype html><title>busy</title>"
+        "<script>setTimeout(function () { while (true) {} }, 0);</script>",
+        wait_until="domcontentloaded",
+        timeout=5000,
+    )
+    time.sleep(0.3)
+    started = time.perf_counter()
+    try:
+        collect_facts(page, deadline_s=2)
+    except FactCollectionError as exc:
+        elapsed = time.perf_counter() - started
+        if elapsed >= 8 or "deadline" not in str(exc):
+            raise SystemExit(1)
+    else:
+        raise SystemExit(2)
+finally:
+    engine.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_facts_raw_cli_refuses_file_urls_unless_local_fixture(tmp_path: Path) -> None:
+    marker = "IC-LOCAL-FIXTURE-MARKER"
+    page = tmp_path / "local.html"
+    page.write_text(
+        f'<!doctype html><title>local</title><a href="/x">{marker}</a>\n',
+        encoding="utf-8",
+    )
+    binary = Path(sys.executable).with_name("interface-compiler")
+    url = page.resolve().as_uri()
+    blocked = subprocess.run(
+        [str(binary), "raw", url],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert blocked.returncode == 2
+    assert marker not in blocked.stdout
+    assert "http or https" in blocked.stderr
+    scripted = subprocess.run(
+        [str(binary), "raw", "--local-fixture", "javascript:alert(1)"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert scripted.returncode == 2
+    assert marker not in scripted.stdout
+    allowed = subprocess.run(
+        [str(binary), "raw", "--local-fixture", url],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert allowed.returncode == 0, allowed.stderr
+    assert marker in allowed.stdout

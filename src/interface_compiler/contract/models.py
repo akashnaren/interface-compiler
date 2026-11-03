@@ -9,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictInt,
     field_validator,
@@ -193,13 +194,29 @@ class AffordanceX(BaseModel):
         | None
     ) = None
     verified_at: str | None = None
+    # Direct assignment has no page URL, so probed_ok is refused unless the
+    # tag is safe. set_verified unlocks around its own page-URL check.
+    _verified_locked: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def _lock_verified(self) -> Self:
+        self._verified_locked = True
+        return self
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "verified" and getattr(self, "_verified_locked", False):
+            self._assign_verified(value)
+            return
+        super().__setattr__(name, value)
 
     def set_verified(self, status: str, *, page_url: str | None) -> None:
         """Record a probe outcome for this affordance.
 
         ``probed_ok`` is refused when the tag is missing or ``mutating`` and
         ``page_url`` is not a loopback fixture host. The field is left unchanged
-        when the outcome is refused.
+        when the outcome is refused. Assigning ``verified`` directly has the
+        same refusal, with no page URL, so a loopback outcome has to go through
+        this method.
         """
         if status not in _VERIFIED_STATES:
             message = f"verified {_echo_value(status)} is not a probe outcome"
@@ -207,7 +224,21 @@ class AffordanceX(BaseModel):
         message = probed_ok_refusal(self.tag, status, page_url=page_url)
         if message is not None:
             raise ContractError(message, errors=[message])
-        self.verified = status
+        self._assign_verified(status, checked=True)
+
+    def _assign_verified(self, value: object, *, checked: bool = False) -> None:
+        if not checked:
+            if value is not None and value not in _VERIFIED_STATES:
+                message = f"verified {_echo_value(value)} is not a probe outcome"
+                raise ContractError(message, errors=[message])
+            refusal = probed_ok_refusal(self.tag, value, page_url=None)
+            if refusal is not None:
+                raise ContractError(refusal, errors=[refusal])
+        self._verified_locked = False
+        try:
+            super().__setattr__("verified", value)
+        finally:
+            self._verified_locked = True
 
 
 class Affordance(BaseModel):

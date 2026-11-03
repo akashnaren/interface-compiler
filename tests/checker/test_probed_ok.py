@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from interface_compiler.browser.facts import normalized_page_url
 from interface_compiler.contract import ContractError, ViewDoc, validate_doc, validate_effect
 from interface_compiler.contract.models import AffordanceX
 
@@ -73,6 +74,10 @@ def test_checker_missing_url_is_not_a_fixture_host() -> None:
         "http://127.0.0.1:9/minishop/product.html",
         "http://localhost/fixture",
         "http://[::1]/fixture",
+        "https://127.0.0.1/fixture",
+        "http://127.0.0.1:80/fixture",
+        "HTTP://LocalHost/fixture",
+        "http://[::1]:443/fixture",
     ],
 )
 def test_checker_loopback_mutating_may_be_probed_ok(url: str) -> None:
@@ -133,6 +138,82 @@ def test_checker_setter_refuses_probed_ok_for_mutating_real_site() -> None:
         page_url="https://example.com/p",
     )
     assert affordance_x.verified == "stopped_before_commit"
+
+
+_NOT_LOOPBACK = (
+    "http://evil.com\\@127.0.0.1/",
+    "http://user@127.0.0.1/",
+    "javascript://127.0.0.1/",
+    "ws://127.0.0.1/",
+    "file://localhost/tmp/x",
+    "//127.0.0.1/",
+    "http://127.0.0.1:99999/",
+    "http://127.0.0.1:0/x",
+    "http://127.0.0.1:/x",
+    "http://127.0.0.1 /x",
+    "http://127.0.0.1/\n",
+    "http://127.0.0.1/\x00x",
+    "http://127.0.0.1/\x7fx",
+)
+
+
+@pytest.mark.parametrize("url", _NOT_LOOPBACK)
+def test_checker_spoofed_loopback_cannot_be_probed_ok(url: str) -> None:
+    doc = _with_probe(url, tag="mutating")
+    with pytest.raises(ContractError) as doc_error:
+        validate_doc(doc)
+    assert "mutating affordance cannot be probed_ok" in str(doc_error.value)
+    with pytest.raises(ValidationError) as model_error:
+        ViewDoc.model_validate(doc)
+    assert "mutating affordance cannot be probed_ok" in str(model_error.value)
+    with pytest.raises(ValidationError) as json_error:
+        ViewDoc.model_validate_json(json.dumps(doc))
+    assert "mutating affordance cannot be probed_ok" in str(json_error.value)
+    row = AffordanceX(tag="mutating", verified="unverified")
+    with pytest.raises(ContractError) as setter_error:
+        row.set_verified("probed_ok", page_url=url)
+    assert "mutating affordance cannot be probed_ok" in str(setter_error.value)
+    assert row.verified == "unverified"
+
+
+def test_checker_direct_assignment_refuses_probed_ok_without_a_page_url() -> None:
+    row = AffordanceX(tag="mutating", verified="unverified")
+    with pytest.raises(ContractError) as exc:
+        row.verified = "probed_ok"
+    assert "mutating affordance cannot be probed_ok" in str(exc.value)
+    assert row.verified == "unverified"
+    row.verified = "probed_failed"
+    assert row.verified == "probed_failed"
+    missing = AffordanceX(verified="unverified")
+    with pytest.raises(ContractError):
+        missing.verified = "probed_ok"
+    assert missing.verified == "unverified"
+    safe = AffordanceX(tag="safe", verified="unverified")
+    safe.verified = "probed_ok"
+    assert safe.verified == "probed_ok"
+    with pytest.raises(ContractError) as unknown:
+        row.verified = "nope"
+    assert "not a probe outcome" in str(unknown.value)
+    assert row.verified == "probed_failed"
+
+
+def test_checker_normalized_page_url_allows_a_loopback_probe(
+    facts_page,
+    fixture_base_url: str,
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+    url = normalized_page_url(facts_page)
+    assert url.startswith("http://127.0.0.1:")
+    doc = _with_probe(url, tag="mutating")
+    validate_doc(doc)
+    assert ViewDoc.model_validate(doc).affordances[2].x is not None
+    assert ViewDoc.model_validate_json(json.dumps(doc)).affordances[2].x is not None
+    row = AffordanceX(tag="mutating", verified="unverified")
+    row.set_verified("probed_ok", page_url=url)
+    assert row.verified == "probed_ok"
+    spoof = "http://evil.com\\@127.0.0.1/"
+    with pytest.raises(ContractError):
+        row.set_verified("probed_ok", page_url=spoof)
 
 
 def test_checker_setter_allows_loopback_and_safe() -> None:
