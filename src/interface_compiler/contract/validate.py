@@ -356,7 +356,7 @@ def _truncate_repr(rendered: str) -> str:
 
 def nesting_too_deep(where: str) -> str:
     """Contract message for an items or properties chain past the nesting limit."""
-    return f"{where}: nesting exceeds max {_MAX_SCHEMA_DEPTH}"
+    return _cap_text(f"{where}: nesting exceeds max {_MAX_SCHEMA_DEPTH}", _MESSAGE_LIMIT)
 
 
 def _guard_json_document(instance: object) -> None:

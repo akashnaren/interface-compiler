@@ -7,7 +7,14 @@ import pytest
 from pydantic import ValidationError
 
 from interface_compiler.browser.facts import normalized_page_url
-from interface_compiler.contract import ContractError, ViewDoc, validate_doc, validate_effect
+from interface_compiler.contract import (
+    ContractError,
+    DocX,
+    ViewDoc,
+    dump_view_doc,
+    validate_doc,
+    validate_effect,
+)
 from interface_compiler.contract.models import AffordanceX
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -243,6 +250,38 @@ def test_checker_mutating_probed_ok_cannot_be_built(path: str) -> None:
             row.model_copy(update={"verified": "probed_ok"})
         assert "mutating affordance cannot be probed_ok" in str(exc.value)
         assert row.verified == "unverified"
+        return
+    raise AssertionError(path)
+
+
+@pytest.mark.parametrize("path", ["setter", "assign", "copy"])
+def test_checker_document_probe_follows_the_document_url(path: str) -> None:
+    if path == "setter":
+        doc = ViewDoc.model_validate(
+            _with_probe("https://example.com/p", tag="mutating", verified="unverified")
+        )
+        row = doc.affordances[2].x
+        assert row is not None
+        row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+        with pytest.raises(ContractError) as exc:
+            dump_view_doc(doc)
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        return
+    doc = ViewDoc.model_validate(_with_probe("http://127.0.0.1/x", tag="mutating"))
+    assert doc.x is not None
+    if path == "assign":
+        with pytest.raises(ContractError) as exc:
+            doc.x.url = "https://example.com/other"
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert doc.x.url == "http://127.0.0.1/x"
+        dump_view_doc(doc)
+        return
+    if path == "copy":
+        with pytest.raises(ContractError) as exc:
+            doc.model_copy(update={"x": DocX(url="https://example.com/other")})
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert doc.x.url == "http://127.0.0.1/x"
+        dump_view_doc(doc)
         return
     raise AssertionError(path)
 

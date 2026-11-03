@@ -647,6 +647,15 @@ def test_contract_items_nesting_limit(tmp_path: Path) -> None:
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
     assert "nesting exceeds max 32" in result.stderr
+    wide = _paper()
+    key = "k" * 80
+    node: dict = {"type": "string"}
+    for _ in range(40):
+        node = {"type": "object", "properties": {key: node}}
+    wide["affordances"][1]["input"]["properties"]["size"] = node
+    with pytest.raises(ContractError) as wide_error:
+        validate_doc(wide)
+    assert len(str(wide_error.value)) <= 400
 
 
 def test_contract_items_nesting_boundary() -> None:

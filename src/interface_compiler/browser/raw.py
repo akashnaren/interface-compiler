@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from playwright.sync_api import Page
 
+from interface_compiler.browser.facts import _DEADLINE_S
+
 
 def raw_snapshot(page: Page) -> str:
     """Return the YAML aria snapshot of the page body."""
-    return page.locator("body").aria_snapshot()
+    return page.locator("body").aria_snapshot(timeout=_DEADLINE_S * 1000)

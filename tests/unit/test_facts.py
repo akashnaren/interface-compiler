@@ -720,26 +720,94 @@ def test_engine_launch_passes_chromium_sandbox(monkeypatch: pytest.MonkeyPatch) 
     assert launched.get("chromium_sandbox") is True
 
 
+def test_engine_refuses_root_before_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("interface_compiler.browser.engine.os.geteuid", lambda: 0)
+    engine = Engine()
+    with pytest.raises(RuntimeError, match="Do not run the browser as root"):
+        engine.start()
+
+
 @pytest.mark.parametrize(
-    ("html", "html_id", "role", "name"),
+    ("html", "method", "valid"),
+    [
+        (
+            (
+                "<form id='f' method='get' action='/search'>"
+                "<input name='checkValidity' required>"
+                "<button id='go' type='submit' formmethod='post' formaction='/save'>Save</button>"
+                "</form>"
+            ),
+            "post",
+            False,
+        ),
+    ],
+)
+def test_facts_submit_override_and_form_validity(
+    html: str, method: str, valid: bool, facts_page: Page
+) -> None:
+    facts_page.set_content(f"<!doctype html><title>form</title>{html}")
+    facts = collect_facts(facts_page)
+    button = _by_id(facts, "go")
+    assert button.form_method == method
+    assert button.form_action is not None and button.form_action.endswith("/save")
+    assert facts.forms[0].method == "get"
+    assert facts.forms[0].valid is valid
+
+
+_MOVE_MARKER = (
+    '<img id="decoy" alt="Search"><button id="go" type="button">Delete account</button>'
+    "<script>new MutationObserver(function(records){var img=document.getElementById('decoy');"
+    "records.forEach(function(record){var name=record.attributeName;"
+    "if(!name||name.indexOf('data-ic-')!==0)return;var from=record.target;"
+    "if(!from||from===img)return;var value=from.getAttribute(name);if(value===null)return;"
+    "from.removeAttribute(name);img.setAttribute(name,value);});}).observe("
+    "document.documentElement,{subtree:true,attributes:true,attributeOldValue:true});</script>"
+)
+_SWAP_MARKER = (
+    '<button id="decoy" type="button">Search</button>'
+    '<button id="go" type="button">Delete account</button>'
+    "<script>new MutationObserver(function(records){var names=[];"
+    "records.forEach(function(record){var name=record.attributeName;"
+    "if(name&&name.indexOf('data-ic-')===0&&names.indexOf(name)<0)names.push(name);});"
+    "var a=document.getElementById('go'),b=document.getElementById('decoy');"
+    "names.forEach(function(name){var av=a.getAttribute(name),bv=b.getAttribute(name);"
+    "if(av===null&&bv===null)return;if(bv===null){a.removeAttribute(name);"
+    "b.setAttribute(name,av);return;}if(av===null){b.removeAttribute(name);"
+    "a.setAttribute(name,bv);return;}a.setAttribute(name,bv);b.setAttribute(name,av);});"
+    "}).observe(document.documentElement,{subtree:true,attributes:true,"
+    "attributeOldValue:true});</script>"
+)
+
+
+@pytest.mark.parametrize(
+    ("html", "html_id", "role", "name", "banned"),
     [
         (
             '<img alt="Search" data-ic-fact="0"><button id="go">Delete account</button>',
             "go",
             "button",
             "Delete account",
+            "Search",
         ),
+        (_MOVE_MARKER, "go", "button", "Delete account", "Search"),
+        (_SWAP_MARKER, "go", "button", "Delete account", None),
     ],
 )
 def test_facts_preseeded_marker_cannot_relabel(
-    html: str, html_id: str, role: str, name: str, facts_page: Page
+    html: str,
+    html_id: str,
+    role: str,
+    name: str,
+    banned: str | None,
+    facts_page: Page,
 ) -> None:
     facts_page.set_content(f"<!doctype html><title>marker</title>{html}")
     facts = collect_facts(facts_page)
     element = _by_id(facts, html_id)
     assert element.role == role
     assert element.name == name
-    assert all(item.name != "Search" for item in facts.elements)
+    if banned is not None:
+        assert all(item.name != banned for item in facts.elements)
 
 
 @pytest.mark.parametrize(
@@ -751,24 +819,29 @@ def test_facts_preseeded_marker_cannot_relabel(
             "<select id='s'><optgroup disabled><option id='sold' value='1'>One</option></optgroup></select>",
             "sold",
         ),
+        (
+            "<div role='listbox'><div id='sold' role='option' aria-disabled='true'>Sold</div></div>",
+            "sold",
+        ),
     ],
 )
 def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: Page) -> None:
     facts_page.set_content(f"<!doctype html><title>disabled</title>{html}")
     facts = collect_facts(facts_page)
     assert _by_id(facts, html_id).disabled is True
-    select = next((el for el in facts.elements if el.tag == "select"), None)
-    if select is not None:
-        assert select.options[0].disabled is True
+    for host in facts.elements:
+        if host.options:
+            assert host.options[0].disabled is True
 
 
 @pytest.mark.parametrize(
     ("minlength", "maxlength", "expect_min", "expect_max"),
     [
-        ("1.5", "2.5", None, None),
+        ("1.5", "2.5", 1, 2),
         ("-1", "", None, None),
         ("3", "8", 3, 8),
         ("08", "0", 8, 0),
+        (" 3 ", " 4 ", 3, 4),
     ],
 )
 def test_facts_length_attributes_are_non_negative_integers(
@@ -789,28 +862,43 @@ def test_facts_length_attributes_are_non_negative_integers(
     assert _non_negative_int({"maxlength": True}, "maxlength") is None
 
 
-@pytest.mark.parametrize("rows", [3000])
-def test_facts_row_count_finishes_under_the_deadline(rows: int) -> None:
+@pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table")])
+def test_facts_row_count_finishes_under_the_deadline(rows: int, layout: str) -> None:
     # Own browser: a deadline kill must not take down the session engine.
     script = """
 import sys
 import time
 from interface_compiler.browser.engine import Engine
-from interface_compiler.browser.facts import FactCollectionError, collect_facts
+from interface_compiler.browser.facts import FactCollectionError, _DEADLINE_S, collect_facts
 
 rows = int(sys.argv[1])
+layout = sys.argv[2]
 engine = Engine()
 engine.start()
 page = engine.new_page()
 try:
-    parts = ["<!doctype html><title>rows</title><main>"]
+    parts = ["<!doctype html><title>rows</title>"]
+    if layout == "table":
+        parts.append("<table><tbody>")
+    else:
+        parts.append("<main>")
     for index in range(rows):
-        parts.append(
-            f'<label for="f{index}">Field {index}</label>'
-            f'<input id="f{index}" name="f{index}">'
-            f'<a id="r{index}" href="/r{index}">Row {index}</a>'
-        )
-    parts.append("</main>")
+        if layout == "table":
+            parts.append(
+                "<tr>"
+                f'<td><label for="f{index}">Field {index}</label>'
+                f'<input id="f{index}" name="f{index}"></td>'
+                f'<td><button type="button">Go {index}</button></td>'
+                f'<td><a id="r{index}" href="/r{index}">Row {index}</a></td>'
+                "</tr>"
+            )
+        else:
+            parts.append(
+                f'<label for="f{index}">Field {index}</label>'
+                f'<input id="f{index}" name="f{index}">'
+                f'<a id="r{index}" href="/r{index}">Row {index}</a>'
+            )
+    parts.append("</tbody></table>" if layout == "table" else "</main>")
     page.set_content("".join(parts), wait_until="domcontentloaded")
     started = time.perf_counter()
     facts = collect_facts(page)
@@ -824,7 +912,7 @@ try:
         raise SystemExit(2)
     if last.disabled:
         raise SystemExit(2)
-    print(f"{elapsed:.3f}")
+    print(f"{elapsed:.3f} { _DEADLINE_S:.3f}")
 finally:
     engine.close()
 
@@ -858,15 +946,17 @@ finally:
     engine.close()
 """
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(rows)],
+        [sys.executable, "-c", script, str(rows), layout],
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=45,
     )
     assert completed.returncode == 0, completed.stderr
-    elapsed = float(completed.stdout.strip())
-    assert elapsed < 5, f"{rows} rows took {elapsed:.2f}s"
+    elapsed_text, deadline_text = completed.stdout.split()
+    elapsed = float(elapsed_text)
+    deadline = float(deadline_text)
+    assert elapsed < deadline * 0.5, f"{rows} {layout} rows took {elapsed:.2f}s"
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

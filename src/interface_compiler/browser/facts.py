@@ -7,9 +7,11 @@ Fact collection does not validate arguments.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,16 +22,19 @@ from playwright.sync_api import Error as PlaywrightError
 from interface_compiler.browser.engine import _note_driver_dead, _playwright_driver_pid
 
 _COLLECT_SOURCE = Path(__file__).with_name("collect.js").read_text(encoding="utf-8")
-_MARKER_PREFIX = "data-ic-"
-_MARKER_HEX = 32
 # Chromium reports these on text runs and on nodes it has dropped. They are not
 # the host control's role, so the HTML role from collect.js stands.
 _SKIP_AX_ROLES = frozenset({"none", "InlineTextBox", "StaticText", "ignored"})
 # Chromium's internal names for controls whose ARIA role is the one below.
 _AX_ROLE_ALIASES = {"Date": "textbox", "DisclosureTriangle": "button"}
 _ISOLATED_WORLD = "interface-compiler"
+_NODE_GROUP = "interface-compiler-nodes"
 _EVAL_TIMEOUT_MS = 5_000
 _DEADLINE_S = 5.0
+# Stop overlaying once this much of the deadline is gone and keep HTML roles.
+_OVERLAY_BUDGET_FRACTION = 0.25
+_OVERLAY_BUDGET_CAP_S = 0.75
+_READ_PAYLOAD = "function(){return JSON.stringify({elements:this.elements,forms:this.forms,modals:this.modals});}"
 
 
 class FactCollectionError(RuntimeError):
@@ -72,6 +77,8 @@ class ElementFact:
     input_type: str | None
     href: str | None
     form_index: int | None
+    form_method: str | None
+    form_action: str | None
     disabled: bool
     readonly: bool
     aria_disabled: bool
@@ -151,14 +158,15 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
 
     The DOM walk in `collect.js` is the source of the element list. It runs in
     an isolated world, so a page that replaces ``querySelectorAll`` or
-    ``Array.from`` cannot change the walk. Chromium's accessibility tree only
-    overlays role and name, and only for a host node that the walk marked.
-    Shadow controls (a date input's spinbuttons, for example) are not separate
-    facts. An open modal drops the rest of the page from that tree; those
-    controls keep the HTML role.
+    ``Array.from`` cannot change the walk. Chromium's accessibility tree
+    overlays role and name. Each element is joined by the object id returned
+    from that world, not by an attribute the page can see. Shadow controls (a
+    date input's spinbuttons, for example) are not separate facts. When the
+    overlay budget runs out, the remaining controls keep the HTML role.
 
     A renderer that is already spinning does not honor a CDP timeout. The
-    deadline stops that browser's driver so the blocked call returns.
+    deadline stops that browser's driver so the blocked call returns. A slow
+    overlay does not. It keeps the HTML role for whatever is left.
     """
     if deadline_s <= 0:
         raise ValueError("deadline must be positive")
@@ -172,21 +180,9 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
         daemon=True,
     )
     watcher.start()
+    result: PageFacts | None = None
     try:
-        payload = _evaluate_isolated(page, _COLLECT_SOURCE)
-        attribute = _marker_attribute(payload)
-        overlay: dict[str, _AxHit] = {}
-        session: CDPSession | None = None
-        try:
-            session = page.context.new_cdp_session(page)
-            overlay = _accessibility_overlay(session, attribute)
-        finally:
-            if session is not None:
-                try:
-                    session.detach()
-                except PlaywrightError:
-                    pass
-            _evaluate_isolated(page, _clear_markers(attribute))
+        result = _collect_within(page, deadline_s)
     except FactCollectionError:
         _note_if_killed(killed, pid)
         raise
@@ -197,9 +193,12 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
         raise
     finally:
         stop.set()
-    if not isinstance(payload, dict):
-        raise TypeError("fact collector must return an object")
-    return _page_facts(normalized_page_url(page), page.title(), payload, overlay)
+        watcher.join()
+        if killed.is_set():
+            _note_if_killed(killed, pid)
+    if killed.is_set() or result is None:
+        raise FactCollectionError("fact collection exceeded the deadline")
+    return result
 
 
 def _abort_browser_after(
@@ -234,41 +233,160 @@ def _driver_pid(page: Page) -> int | None:
     return _playwright_driver_pid(page.context.browser)
 
 
-def _evaluate_isolated(page: Page, expression: str) -> Any:
+def _overlay_budget(deadline_s: float) -> float:
+    return min(_OVERLAY_BUDGET_CAP_S, deadline_s * _OVERLAY_BUDGET_FRACTION)
+
+
+def _collect_within(page: Page, deadline_s: float) -> PageFacts:
     session = page.context.new_cdp_session(page)
     try:
-        session.send("Page.enable")
-        tree = session.send("Page.getFrameTree")
-        frame_id = _frame_id(tree)
-        world = session.send(
-            "Page.createIsolatedWorld",
-            {
-                "frameId": frame_id,
-                "worldName": _ISOLATED_WORLD,
-            },
-        )
-        context_id = world.get("executionContextId") if isinstance(world, dict) else None
-        if not isinstance(context_id, int):
-            raise TypeError("isolated world has no execution context")
-        result = session.send(
+        context_id = _isolated_context(session)
+        evaluated = session.send(
             "Runtime.evaluate",
             {
-                "expression": expression,
+                "expression": _COLLECT_SOURCE,
                 "contextId": context_id,
-                "returnByValue": True,
+                "returnByValue": False,
                 "timeout": _EVAL_TIMEOUT_MS,
+                "objectGroup": _NODE_GROUP,
             },
         )
+        root_id = _object_id(evaluated)
+        raw_payload = _evaluation_value(
+            session.send(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": root_id,
+                    "functionDeclaration": _READ_PAYLOAD,
+                    "returnByValue": True,
+                },
+            )
+        )
+        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else None
+        object_ids = _node_object_ids(session, root_id)
+        overlay = _accessibility_overlay(session, object_ids, _overlay_budget(deadline_s))
     except Exception as exc:
         if _is_collection_abort(exc):
             raise FactCollectionError("fact collection exceeded the deadline") from exc
         raise
     finally:
+        _release_nodes(session)
         try:
             session.detach()
         except PlaywrightError:
             pass
-    return _evaluation_value(result)
+    if not isinstance(payload, dict):
+        raise TypeError("fact collector must return an object")
+    return _page_facts(normalized_page_url(page), page.title(), payload, overlay)
+
+
+def _isolated_context(session: CDPSession) -> int:
+    session.send("Page.enable")
+    world = session.send(
+        "Page.createIsolatedWorld",
+        {"frameId": _frame_id(session.send("Page.getFrameTree")), "worldName": _ISOLATED_WORLD},
+    )
+    context_id = world.get("executionContextId") if isinstance(world, dict) else None
+    if not isinstance(context_id, int):
+        raise TypeError("isolated world has no execution context")
+    return context_id
+
+
+def _object_id(result: object) -> str:
+    remote = _remote_object(result)
+    object_id = remote.get("objectId")
+    if isinstance(object_id, str) and object_id:
+        return object_id
+    raise TypeError("fact collector returned no object")
+
+
+def _node_object_ids(session: CDPSession, root_id: str) -> list[str]:
+    root_props = session.send("Runtime.getProperties", {"objectId": root_id, "ownProperties": True})
+    nodes_id = _property_object_id(root_props, "nodes")
+    if nodes_id is None:
+        return []
+    listed = session.send("Runtime.getProperties", {"objectId": nodes_id, "ownProperties": True})
+    entries = listed.get("result") if isinstance(listed, dict) else None
+    pairs: list[tuple[int, str]] = []
+    if isinstance(entries, list):
+        for prop in entries:
+            if not isinstance(prop, dict):
+                continue
+            name = prop.get("name")
+            value = prop.get("value")
+            if not isinstance(name, str) or not name.isdigit() or not isinstance(value, dict):
+                continue
+            object_id = value.get("objectId")
+            if isinstance(object_id, str):
+                pairs.append((int(name), object_id))
+    pairs.sort()
+    return [object_id for _, object_id in pairs]
+
+
+def _property_object_id(payload: object, name: str) -> str | None:
+    entries = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return None
+    for prop in entries:
+        if not isinstance(prop, dict) or prop.get("name") != name:
+            continue
+        value = prop.get("value")
+        object_id = value.get("objectId") if isinstance(value, dict) else None
+        if isinstance(object_id, str):
+            return object_id
+    return None
+
+
+def _release_nodes(session: CDPSession) -> None:
+    try:
+        session.send("Runtime.releaseObjectGroup", {"objectGroup": _NODE_GROUP})
+    except PlaywrightError:
+        pass
+
+
+def _accessibility_overlay(
+    session: CDPSession,
+    object_ids: list[str],
+    budget_s: float,
+) -> dict[str, _AxHit]:
+    """Role and name for as many elements as the budget allows.
+
+    The rest keep the HTML role from the walk. One partial tree per element
+    avoids building Chromium's full tree, which is the slow step on tables.
+    """
+    if budget_s <= 0 or not object_ids:
+        return {}
+    session.send("Accessibility.enable")
+    started = time.perf_counter()
+    resolved: dict[str, _AxHit] = {}
+    for index, object_id in enumerate(object_ids):
+        if time.perf_counter() - started >= budget_s:
+            break
+        try:
+            tree = session.send(
+                "Accessibility.getPartialAXTree",
+                {"objectId": object_id, "fetchRelatives": False},
+            )
+        except PlaywrightError:
+            break
+        hit = _hit_from_partial(tree)
+        if hit is not None:
+            resolved[str(index)] = hit
+    return resolved
+
+
+def _hit_from_partial(tree: object) -> _AxHit | None:
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("ignored") is True:
+            continue
+        role = _ax_role(node)
+        if role is None or role in _SKIP_AX_ROLES:
+            continue
+        return _AxHit(role=role, name=_ax_name(node))
+    return None
 
 
 def _frame_id(tree: object) -> str:
@@ -282,7 +400,7 @@ def _frame_id(tree: object) -> str:
     return frame_id
 
 
-def _evaluation_value(result: object) -> Any:
+def _remote_object(result: object) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise TypeError("fact collector returned no result")
     details = result.get("exceptionDetails")
@@ -295,6 +413,11 @@ def _evaluation_value(result: object) -> Any:
     remote = result.get("result")
     if not isinstance(remote, dict):
         raise TypeError("fact collector returned no result")
+    return remote
+
+
+def _evaluation_value(result: object) -> Any:
+    remote = _remote_object(result)
     if remote.get("type") == "undefined":
         return None
     if "value" not in remote:
@@ -323,92 +446,6 @@ def _is_collection_abort(exc: Exception) -> bool:
         or "timed out" in text
         or "timeout" in text
     )
-
-
-def _marker_attribute(payload: object) -> str:
-    if not isinstance(payload, dict):
-        raise TypeError("fact collector must return an object")
-    attribute = payload.get("markerAttribute")
-    prefix = len(_MARKER_PREFIX)
-    hex_part = attribute[prefix:] if isinstance(attribute, str) else ""
-    if (
-        isinstance(attribute, str)
-        and attribute.startswith(_MARKER_PREFIX)
-        and len(hex_part) == _MARKER_HEX
-        and all(char in "0123456789abcdef" for char in hex_part)
-    ):
-        return attribute
-    raise TypeError("fact collector returned no marker attribute")
-
-
-def _clear_markers(attribute: str) -> str:
-    # attribute has already passed _marker_attribute, so it is safe to embed.
-    return (
-        "(() => {"
-        f" const name = '{attribute}';"
-        " document.querySelectorAll('[data-ic-fact]').forEach((el) =>"
-        " el.removeAttribute('data-ic-fact'));"
-        " document.querySelectorAll('[' + CSS.escape(name) + ']').forEach((el) =>"
-        " el.removeAttribute(name));"
-        "})()"
-    )
-
-
-def _accessibility_overlay(session: CDPSession, attribute: str) -> dict[str, _AxHit]:
-    session.send("DOM.enable")
-    session.send("Accessibility.enable")
-    document = session.send("DOM.getDocument", {"depth": -1, "pierce": True})
-    root = document.get("root") if isinstance(document, dict) else None
-    markers = _markers(root, attribute)
-    tree = session.send("Accessibility.getFullAXTree")
-    nodes = tree.get("nodes") if isinstance(tree, dict) else None
-    if not isinstance(nodes, list):
-        raise TypeError("accessibility tree has no nodes")
-    resolved: dict[str, _AxHit] = {}
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        backend_id = node.get("backendDOMNodeId")
-        if not isinstance(backend_id, int):
-            continue
-        marker = markers.get(backend_id)
-        if marker is None or marker in resolved:
-            continue
-        role = _ax_role(node)
-        if role is None or role in _SKIP_AX_ROLES:
-            continue
-        resolved[marker] = _AxHit(role=role, name=_ax_name(node))
-    return resolved
-
-
-def _markers(root: object, attribute: str) -> dict[int, str]:
-    found: dict[int, str] = {}
-    counts: dict[str, int] = {}
-    stack: list[object] = [root]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        attributes = node.get("attributes")
-        backend_id = node.get("backendNodeId")
-        if isinstance(attributes, list) and isinstance(backend_id, int):
-            pairs = [item for item in attributes if isinstance(item, str)]
-            attr = dict(zip(pairs[0::2], pairs[1::2], strict=False))
-            marker = attr.get(attribute)
-            if isinstance(marker, str) and marker:
-                found[backend_id] = marker
-                counts[marker] = counts.get(marker, 0) + 1
-        for key in ("children", "shadowRoots"):
-            children = node.get(key)
-            if isinstance(children, list):
-                stack.extend(children)
-        content = node.get("contentDocument")
-        if isinstance(content, dict):
-            stack.append(content)
-    ambiguous = {marker for marker, count in counts.items() if count != 1}
-    if not ambiguous:
-        return found
-    return {backend_id: marker for backend_id, marker in found.items() if marker not in ambiguous}
 
 
 def _ax_role(node: dict[str, Any]) -> str | None:
@@ -481,6 +518,8 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
         input_type=_opt(item, "input_type", str),
         href=_opt(item, "href", str),
         form_index=_opt(item, "form_index", int),
+        form_method=_opt(item, "form_method", str),
+        form_action=_opt(item, "form_action", str),
         disabled=_req(item, "disabled", bool),
         readonly=_req(item, "readonly", bool),
         aria_disabled=_req(item, "aria_disabled", bool),

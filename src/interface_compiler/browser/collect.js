@@ -75,10 +75,18 @@
     return clean(el.getAttribute("title"));
   }
 
-  // Filled once per collection. labelFor and cssOf must not rescan the document.
+  // Filled once per collection. The element walk must not rescan the document.
   let labelsByFor = new Map();
   let idCounts = new Map();
   let nameCounts = new Map();
+  let nthOfType = new Map();
+  let legendText = new Map();
+  let formIndexes = new Map();
+  let flagHidden = new Map();
+  let flagAriaHidden = new Map();
+  let flagInert = new Map();
+  let flagAriaDisabled = new Map();
+  let styleHidden = new Map();
 
   function labelFor(el) {
     if (!el.id) {
@@ -122,8 +130,7 @@
     }
     const fieldset = el.closest("fieldset");
     if (fieldset) {
-      const legend = fieldset.querySelector("legend");
-      const text = legend ? ownText(legend) : "";
+      const text = legendText.get(fieldset) || "";
       if (text) {
         return text;
       }
@@ -272,8 +279,7 @@
     }
     const fieldset = el.closest("fieldset");
     if (fieldset) {
-      const legend = fieldset.querySelector("legend");
-      const text = legend ? ownText(legend) : "";
+      const text = legendText.get(fieldset) || "";
       if (text) {
         return text;
       }
@@ -305,22 +311,9 @@
         parts.unshift("body");
         break;
       }
-      const parent = node.parentElement;
-      if (!parent) {
-        break;
-      }
-      let nth = 0;
-      let count = 0;
-      for (const child of parent.children) {
-        if (child.tagName === node.tagName) {
-          count += 1;
-          if (child === node) {
-            nth = count;
-          }
-        }
-      }
+      const nth = nthOfType.get(node) || 1;
       parts.unshift(`${node.tagName.toLowerCase()}:nth-of-type(${nth})`);
-      node = parent;
+      node = node.parentElement;
     }
     return parts.join(" > ");
   }
@@ -361,7 +354,7 @@
       return Array.from(el.options, (opt) => ({
         value: opt.value,
         label: clean(opt.label),
-        disabled: opt.matches(":disabled"),
+        disabled: optionDisabled(opt),
       }));
     }
     let box = el.getAttribute("role") === "listbox" ? el : null;
@@ -379,21 +372,13 @@
     return Array.from(box.querySelectorAll("[role='option']"), (opt) => ({
       value: opt.getAttribute("data-value") || ownText(opt),
       label: ownText(opt),
-      disabled: opt.matches(":disabled"),
+      disabled: optionDisabled(opt),
     }));
   }
 
   function isVisible(el, rect) {
-    if (el.closest("[hidden]")) {
+    if (flagHidden.get(el) === true || styleHidden.get(el) === true) {
       return false;
-    }
-    let node = el;
-    while (node && node.nodeType === 1) {
-      const style = getComputedStyle(node);
-      if (style.display === "none" || style.visibility === "hidden") {
-        return false;
-      }
-      node = node.parentElement;
     }
     return rect.width > 0 && rect.height > 0;
   }
@@ -427,12 +412,13 @@
     );
   }
 
-  // HTML non-negative integer: ASCII digits only. "1.5" and "-1" are absent.
-  function nonNegativeInteger(value) {
-    if (value === null || !/^\d+$/.test(value)) {
+  // IDL minLength/maxLength is -1 when the attribute is absent or invalid.
+  // Chrome's reflection parses " 3 " as 3 and "1.5" as 1.
+  function reflectedLength(value) {
+    if (typeof value !== "number" || value < 0) {
       return null;
     }
-    return Number(value);
+    return value;
   }
 
   function constraintsOf(el) {
@@ -442,8 +428,8 @@
       min: el.getAttribute("min"),
       max: el.getAttribute("max"),
       step: el.getAttribute("step"),
-      minlength: nonNegativeInteger(el.getAttribute("minlength")),
-      maxlength: nonNegativeInteger(el.getAttribute("maxlength")),
+      minlength: reflectedLength(el.minLength),
+      maxlength: reflectedLength(el.maxLength),
     };
   }
 
@@ -451,8 +437,29 @@
     if (!el.form) {
       return null;
     }
-    const index = Array.from(document.forms).indexOf(el.form);
-    return index >= 0 ? index : null;
+    const index = formIndexes.get(el.form);
+    return index === undefined ? null : index;
+  }
+
+  function optionDisabled(opt) {
+    return opt.matches(":disabled") || flagAriaDisabled.get(opt) === true;
+  }
+
+  function submitBinding(el) {
+    const tag = el.tagName;
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    const submit =
+      (tag === "BUTTON" && (type === "" || type === "submit")) ||
+      (tag === "INPUT" && (type === "submit" || type === "image"));
+    if (!submit) {
+      return { form_method: null, form_action: null };
+    }
+    const method = el.formMethod ? String(el.formMethod).toLowerCase() : null;
+    // formAction is the resolved URL. A document without a base leaves it blank.
+    const action = el.hasAttribute("formaction")
+      ? String(el.formAction || el.getAttribute("formaction") || "") || null
+      : null;
+    return { form_method: method, form_action: action };
   }
 
   function controlValue(el) {
@@ -476,29 +483,18 @@
     return null;
   }
 
-  function markerName() {
-    const bytes = new Uint8Array(16);
-    crypto.getRandomValues(bytes);
-    let hex = "";
-    for (const byte of bytes) {
-      hex += byte.toString(16).padStart(2, "0");
-    }
-    return `data-ic-${hex}`;
-  }
-
-  function stripMarkers(attribute) {
-    for (const el of document.querySelectorAll("[data-ic-fact]")) {
-      el.removeAttribute("data-ic-fact");
-    }
-    for (const el of document.querySelectorAll(`[${CSS.escape(attribute)}]`)) {
-      el.removeAttribute(attribute);
-    }
-  }
-
   function indexDocument() {
     idCounts = new Map();
     nameCounts = new Map();
     labelsByFor = new Map();
+    nthOfType = new Map();
+    legendText = new Map();
+    formIndexes = new Map();
+    flagHidden = new Map();
+    flagAriaHidden = new Map();
+    flagInert = new Map();
+    flagAriaDisabled = new Map();
+    styleHidden = new Map();
     for (const node of document.querySelectorAll("[id]")) {
       if (!node.id) {
         continue;
@@ -519,96 +515,142 @@
         labelsByFor.set(id, label);
       }
     }
+    const forms = document.forms;
+    for (let index = 0; index < forms.length; index += 1) {
+      formIndexes.set(forms[index], index);
+    }
+    if (document.documentElement) {
+      walkTree(document.documentElement, {
+        hidden: false,
+        ariaHidden: false,
+        inert: false,
+        ariaDisabled: false,
+        visuallyHidden: false,
+      });
+    }
+  }
+
+  function walkTree(el, inherited) {
+    const hidden = inherited.hidden || el.hasAttribute("hidden");
+    const ariaHidden = inherited.ariaHidden || el.getAttribute("aria-hidden") === "true";
+    const inert = inherited.inert || el.inert === true || el.hasAttribute("inert");
+    const ariaDisabled = inherited.ariaDisabled || el.getAttribute("aria-disabled") === "true";
+    const style = getComputedStyle(el);
+    const visuallyHidden =
+      inherited.visuallyHidden || style.display === "none" || style.visibility === "hidden";
+    flagHidden.set(el, hidden);
+    flagAriaHidden.set(el, ariaHidden);
+    flagInert.set(el, inert);
+    flagAriaDisabled.set(el, ariaDisabled);
+    styleHidden.set(el, visuallyHidden);
+    if (el.tagName === "FIELDSET") {
+      let text = "";
+      for (const child of el.children) {
+        if (child.tagName === "LEGEND") {
+          text = ownText(child);
+          break;
+        }
+      }
+      legendText.set(el, text);
+    }
+    const counts = new Map();
+    const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden };
+    for (const child of el.children) {
+      const seen = (counts.get(child.tagName) || 0) + 1;
+      counts.set(child.tagName, seen);
+      nthOfType.set(child, seen);
+      walkTree(child, next);
+    }
   }
 
   indexDocument();
-  const markerAttribute = markerName();
-  stripMarkers(markerAttribute);
-  try {
-    const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el, index) => {
-      const rect = el.getBoundingClientRect();
-      const visible = isVisible(el, rect);
-      el.setAttribute(markerAttribute, String(index));
-      return {
-        marker: String(index),
-        tag: el.tagName.toLowerCase(),
-        role: elementRole(el),
-        name: fallbackName(el),
-        html_id: el.id || null,
-        field_name: el.getAttribute("name"),
-        input_type: el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
-        href: el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
-        form_index: formIndex(el),
-        disabled: el.matches(":disabled"),
-        readonly: el.readOnly === true,
-        aria_disabled: Boolean(el.closest("[aria-disabled='true']")),
-        inert: el.inert === true || Boolean(el.closest("[inert]")),
-        hidden: Boolean(el.closest("[hidden]")),
-        aria_hidden: Boolean(el.closest("[aria-hidden='true']")),
-        value: controlValue(el),
-        checked: checkedState(el),
-        selected: el.tagName === "OPTION" ? el.selected === true : null,
-        options: optionsOf(el),
-        aria_expanded: expanded(el),
-        aria_selected: el.getAttribute("aria-selected"),
-        aria_checked: el.getAttribute("aria-checked"),
-        aria_pressed: el.getAttribute("aria-pressed"),
-        aria_current: el.getAttribute("aria-current"),
-        aria_valuemin: el.getAttribute("aria-valuemin"),
-        aria_valuemax: el.getAttribute("aria-valuemax"),
-        aria_valuenow: el.getAttribute("aria-valuenow"),
-        aria_haspopup: el.getAttribute("aria-haspopup"),
-        aria_controls: el.getAttribute("aria-controls"),
-        box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-        visible,
-        covered: isCovered(el, rect, visible),
-        in_viewport: inViewport(rect),
-        validation_message: el.willValidate ? el.validationMessage : "",
-        landmark: landmarkOf(el),
-        css: cssOf(el),
-        skeleton_path: skeletonOf(el),
-        label_text: labelText(el),
-        group_key: groupKey(el),
-        constraints: constraintsOf(el),
-      };
+  const nodes = [];
+  const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el, index) => {
+    nodes.push(el);
+    const rect = el.getBoundingClientRect();
+    const visible = isVisible(el, rect);
+    const role = elementRole(el);
+    const binding = submitBinding(el);
+    return {
+      marker: String(index),
+      tag: el.tagName.toLowerCase(),
+      role,
+      name: fallbackName(el),
+      html_id: el.id || null,
+      field_name: el.getAttribute("name"),
+      input_type: el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
+      href: el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
+      form_index: formIndex(el),
+      form_method: binding.form_method,
+      form_action: binding.form_action,
+      disabled: role === "option" ? optionDisabled(el) : el.matches(":disabled"),
+      readonly: el.readOnly === true,
+      aria_disabled: flagAriaDisabled.get(el) === true,
+      inert: flagInert.get(el) === true,
+      hidden: flagHidden.get(el) === true,
+      aria_hidden: flagAriaHidden.get(el) === true,
+      value: controlValue(el),
+      checked: checkedState(el),
+      selected: el.tagName === "OPTION" ? el.selected === true : null,
+      options: optionsOf(el),
+      aria_expanded: expanded(el),
+      aria_selected: el.getAttribute("aria-selected"),
+      aria_checked: el.getAttribute("aria-checked"),
+      aria_pressed: el.getAttribute("aria-pressed"),
+      aria_current: el.getAttribute("aria-current"),
+      aria_valuemin: el.getAttribute("aria-valuemin"),
+      aria_valuemax: el.getAttribute("aria-valuemax"),
+      aria_valuenow: el.getAttribute("aria-valuenow"),
+      aria_haspopup: el.getAttribute("aria-haspopup"),
+      aria_controls: el.getAttribute("aria-controls"),
+      box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      visible,
+      covered: isCovered(el, rect, visible),
+      in_viewport: inViewport(rect),
+      validation_message: el.willValidate ? el.validationMessage : "",
+      landmark: landmarkOf(el),
+      css: cssOf(el),
+      skeleton_path: skeletonOf(el),
+      label_text: labelText(el),
+      group_key: groupKey(el),
+      constraints: constraintsOf(el),
+    };
+  });
+
+  const forms = Array.from(document.forms).map((form, index) => ({
+    index,
+    method: (form.getAttribute("method") || "get").toLowerCase(),
+    action: form.action,
+    // :invalid does not fire invalid listeners. form.checkValidity is skipped
+    // because a control named checkValidity replaces the method.
+    valid: !form.matches(":invalid"),
+    html_id: form.id || null,
+  }));
+
+  const modals = [];
+  const seen = new Set();
+  function pushModal(el, role) {
+    if (seen.has(el) || !isVisible(el, el.getBoundingClientRect())) {
+      return;
+    }
+    seen.add(el);
+    modals.push({
+      html_id: el.id || null,
+      role,
+      name: accName(el),
+      open: true,
     });
-
-    const forms = Array.from(document.forms).map((form, index) => ({
-      index,
-      method: (form.getAttribute("method") || "get").toLowerCase(),
-      action: form.action,
-      valid: form.checkValidity(),
-      html_id: form.id || null,
-    }));
-
-    const modals = [];
-    const seen = new Set();
-    function pushModal(el, role) {
-      if (seen.has(el) || !isVisible(el, el.getBoundingClientRect())) {
-        return;
-      }
-      seen.add(el);
-      modals.push({
-        html_id: el.id || null,
-        role,
-        name: accName(el),
-        open: true,
-      });
-    }
-    for (const dialog of document.querySelectorAll("dialog[open]")) {
-      if (dialog.matches(":modal")) {
-        pushModal(dialog, "dialog");
-      }
-    }
-    for (const dialog of document.querySelectorAll(
-      "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
-    )) {
-      pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
-    }
-
-    return { markerAttribute, elements, forms, modals };
-  } catch (error) {
-    stripMarkers(markerAttribute);
-    throw error;
   }
+  for (const dialog of document.querySelectorAll("dialog[open]")) {
+    if (dialog.matches(":modal")) {
+      pushModal(dialog, "dialog");
+    }
+  }
+  for (const dialog of document.querySelectorAll(
+    "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
+  )) {
+    pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
+  }
+
+  return { elements, forms, modals, nodes };
 })()

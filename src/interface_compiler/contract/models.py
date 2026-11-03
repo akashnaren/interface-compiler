@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from interface_compiler.checker.verified import probed_ok_refusal
+from interface_compiler.checker.verified import probed_ok_refusal, verified_errors
 from interface_compiler.contract.validate import (
     ContractError,
     _compile_pattern,
@@ -336,6 +336,10 @@ class DocX(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Set by the owning view after a legal document is built. Assigning url
+    # then checks that document's probed_ok rows.
+    _guard_url: Callable[[object], None] | None = PrivateAttr(default=None)
+
     schema_version: Literal["1"] | None = None
     source: Literal["compiled", "owner"] | None = None
     url: str | None = None
@@ -348,6 +352,13 @@ class DocX(BaseModel):
     registry: RegistryStats | None = None
     blocked: Blocked | None = None
 
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "url":
+            guard = getattr(self, "_guard_url", None)
+            if guard is not None:
+                guard(value)
+        super().__setattr__(name, value)
+
 
 class ViewDoc(BaseModel):
     """A compiled view document: ``view``, ``state``, ``entities``, ``affordances``, optional ``x``."""
@@ -359,6 +370,21 @@ class ViewDoc(BaseModel):
     entities: dict[str, Any]
     affordances: list[Affordance]
     x: DocX | None = None
+    _url_locked: bool = PrivateAttr(default=False)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "x" and getattr(self, "_url_locked", False):
+            self._refuse_url(value.url if isinstance(value, DocX) else None)
+        super().__setattr__(name, value)
+        if name == "x" and getattr(self, "_url_locked", False):
+            self._arm_url_guard()
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        copied = super().model_copy(update=update, deep=deep)
+        _refuse_dumped_probe(copied)
+        if copied.x is not None and (deep or copied.x is not self.x):
+            copied._arm_url_guard()
+        return copied
 
     @model_validator(mode="wrap")
     @classmethod
@@ -400,7 +426,25 @@ class ViewDoc(BaseModel):
     @model_validator(mode="after")
     def _matches_schema(self) -> Self:
         validate_doc(dump_view_doc(self))
+        self._arm_url_guard()
         return self
+
+    def _arm_url_guard(self) -> None:
+        self._url_locked = True
+        extra = self.x
+        if extra is not None:
+            extra._guard_url = self._refuse_url
+
+    def _refuse_url(self, url: object) -> None:
+        for index, item in enumerate(self.affordances):
+            extra = item.x
+            if extra is None:
+                continue
+            message = probed_ok_refusal(extra.tag, extra.verified, page_url=url)
+            if message is None:
+                continue
+            text = f"affordances/{index}/x/verified: {message}"
+            raise ContractError(text, errors=[text])
 
 
 class Predicted(BaseModel):
@@ -548,8 +592,21 @@ class ActResult(BaseModel):
 
 
 def dump_view_doc(doc: ViewDoc) -> dict[str, Any]:
-    """Serialize a compiled view document, omitting unset optional fields."""
-    return _dump_model(doc)
+    """Serialize a compiled view document, omitting unset optional fields.
+
+    A mutating ``probed_ok`` affordance on a public ``x.url`` is not serialized,
+    including when the outcome was recorded against a different page URL.
+    """
+    dumped = _dump_model(doc)
+    _refuse_dumped_probe(dumped)
+    return dumped
+
+
+def _refuse_dumped_probe(doc: ViewDoc | dict[str, Any]) -> None:
+    payload = doc if isinstance(doc, dict) else _dump_model(doc)
+    errors = verified_errors(payload)
+    if errors:
+        raise ContractError(errors[0], errors=errors)
 
 
 def dump_act_result(result: ActResult, *, echo_errors: bool = True) -> dict[str, Any]:
