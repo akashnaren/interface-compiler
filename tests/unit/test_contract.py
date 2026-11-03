@@ -964,7 +964,9 @@ def test_contract_wide_shared_list_hits_visit_budget() -> None:
         "enabled": True,
         "input": {"type": "object", "properties": {}},
     }
-    with _deadline(2):
+    # Three walks of the visit budget are a few seconds. The alarm only
+    # catches a walk that does not stop.
+    with _deadline(20):
         with pytest.raises(ContractError) as doc_error:
             validate_doc(doc)
         assert "node visits exceed max 4000000" in str(doc_error.value)

@@ -14,6 +14,16 @@ USER_AGENT_SUFFIX = (
 VIEWPORT = {"width": 1280, "height": 800}
 
 
+def _pipe_closed(exc: BaseException) -> bool:
+    return "connection closed" in str(exc).lower()
+
+
+def _driver_already_stopped(exc: BaseException) -> bool:
+    """True when Playwright is reporting a driver this process already stopped."""
+    text = str(exc).lower()
+    return _pipe_closed(exc) or "has been closed" in text or "target closed" in text
+
+
 class Engine:
     """Headless Chromium. Each `new_page` gets an ephemeral context.
 
@@ -74,13 +84,22 @@ class Engine:
         self._browser = None
         self._playwright = None
         self._user_agent = None
-        try:
-            if browser is not None:
+        failure: Exception | None = None
+        driver_gone = False
+        if browser is not None:
+            try:
                 browser.close()
-        except PlaywrightError:
-            pass
-        if playwright is not None:
+            except Exception as exc:  # noqa: BLE001  Playwright raises Exception for a dead driver.
+                if _pipe_closed(exc):
+                    driver_gone = True
+                elif not _driver_already_stopped(exc):
+                    failure = exc
+        # A killed driver has already closed the pipe. stop() would wait on it.
+        if playwright is not None and not driver_gone:
             try:
                 playwright.stop()
-            except PlaywrightError:
-                pass
+            except Exception as exc:  # noqa: BLE001  Playwright raises Exception for a dead driver.
+                if failure is None and not _driver_already_stopped(exc):
+                    failure = exc
+        if failure is not None:
+            raise failure
