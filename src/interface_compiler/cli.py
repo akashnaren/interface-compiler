@@ -70,6 +70,11 @@ def validate_command(
     except json.JSONDecodeError as exc:
         typer.echo(f"invalid JSON: {exc}", err=True)
         raise typer.Exit(1) from exc
+    except ValueError as exc:
+        # json.loads raises ValueError, not JSONDecodeError, when an integer
+        # has more than 4300 digits.
+        typer.echo(f"document: {exc}", err=True)
+        raise typer.Exit(1) from exc
     if not isinstance(data, dict):
         typer.echo("document must be a JSON object", err=True)
         raise typer.Exit(1)

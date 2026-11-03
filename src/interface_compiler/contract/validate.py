@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -32,6 +32,11 @@ _PATTERN_ECHO_LIMIT = 80
 _MAX_SCHEMA_DEPTH = 32
 # Every JSON value, not only items and properties. Depth 64 is allowed.
 _MAX_JSON_DEPTH = 64
+# Re-walking a shared container is allowed. A diamond that expands past this
+# many container entries is rejected instead of running away.
+_MAX_JSON_VISITS = 1_000_000
+# JavaScript's Number cannot represent integers outside this range.
+_MAX_SAFE_INT = 2**53 - 1
 _RFC3339 = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -284,36 +289,52 @@ def _guard_json_document(instance: object) -> None:
     _check_json_shape(instance)
 
 
+class _JsonLeave(NamedTuple):
+    identity: int
+
+
+_JsonFrame = tuple[object, int, tuple[str, ...]]
+_ShapeStack = list[_JsonFrame | _JsonLeave]
+
+
 def _check_json_shape(value: object) -> None:
     """Reject a value that JSON cannot express.
 
-    Walks with an explicit stack and a permanent ``id`` set. A cycle or any
-    other repeated container is an error. Depth counts container edges from
+    Walks with an explicit stack. A container id on the current ancestor path
+    is a cycle. The same container reached by another path is ordinary Python
+    reuse and is allowed. Each container entry counts toward ``_MAX_JSON_VISITS``
+    so a shared diamond still fails fast. Depth counts container edges from
     ``value``: 64 is allowed and 65 is not. Scalars are ``str``, ``bool``,
-    ``int``, finite ``float``, and ``None``. Object keys are strings. Lone
-    surrogates are rejected so this matches ``model_validate_json``.
+    ``int`` inside ±(2**53 - 1), finite ``float``, and ``None``. Object keys
+    are strings. Lone surrogates are rejected so this matches ``model_validate_json``.
     """
-    stack: list[tuple[object, int, tuple[str, ...]]] = [(value, 0, ())]
-    seen: set[int] = set()
+    stack: _ShapeStack = [(value, 0, ())]
+    ancestors: set[int] = set()
+    visits = [0]
     while stack:
-        current, depth, path = stack.pop()
+        frame = stack.pop()
+        if isinstance(frame, _JsonLeave):
+            ancestors.remove(frame.identity)
+            continue
+        current, depth, path = frame
         if _is_json_scalar(current):
             _reject_bad_scalar(current, path)
             continue
         if isinstance(current, dict):
-            _push_json_object(current, depth, path, seen, stack)
+            _push_json_object(current, depth, path, ancestors, visits, stack)
             continue
         if isinstance(current, list):
-            _push_json_list(current, depth, path, seen, stack)
+            _push_json_list(current, depth, path, ancestors, visits, stack)
             continue
         _reject_json_type(current, path)
 
 
 def _json_copy(value: object) -> Any:
-    """Deep-copy a tree that already passed ``_check_json_shape``.
+    """Deep-copy a value that already passed ``_check_json_shape``.
 
-    ``json.dumps`` recurses, which stays inside the stack limit once repeated
-    containers are rejected and nesting is capped at 64.
+    ``json.dumps`` recurses. Nesting is capped at 64, and a shared structure
+    that would explode is rejected by the visit budget first. Sharing that
+    fits in the budget is duplicated, which is how JSON encodes it.
     """
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return json.loads(text)
@@ -328,8 +349,14 @@ def _is_json_scalar(value: object) -> bool:
 
 
 def _reject_bad_scalar(value: object, path: tuple[str, ...]) -> None:
+    if value is None or isinstance(value, bool):
+        return
     if isinstance(value, str):
         _reject_lone_surrogate(value, path)
+        return
+    if isinstance(value, int):
+        if value > _MAX_SAFE_INT or value < -_MAX_SAFE_INT:
+            _json_shape_error(path, "integer must be within ±(2**53 - 1)")
         return
     if isinstance(value, float) and not math.isfinite(value):
         _json_shape_error(path, "number must be finite")
@@ -346,16 +373,18 @@ def _push_json_object(
     current: dict[object, object],
     depth: int,
     path: tuple[str, ...],
-    seen: set[int],
-    stack: list[tuple[object, int, tuple[str, ...]]],
+    ancestors: set[int],
+    visits: list[int],
+    stack: _ShapeStack,
 ) -> None:
-    _enter_json_container(current, depth, path, seen)
+    identity = _enter_json_container(current, depth, path, ancestors, visits)
     pairs: list[tuple[str, object]] = []
     for key, item in current.items():
         if not isinstance(key, str):
             _json_shape_error(path, f"object key {key!r} is not a string")
         _reject_lone_surrogate(key, path)
         pairs.append((key, item))
+    stack.append(_JsonLeave(identity))
     for key, item in reversed(pairs):
         stack.append((item, depth + 1, path + (key,)))
 
@@ -364,24 +393,34 @@ def _push_json_list(
     current: list[object],
     depth: int,
     path: tuple[str, ...],
-    seen: set[int],
-    stack: list[tuple[object, int, tuple[str, ...]]],
+    ancestors: set[int],
+    visits: list[int],
+    stack: _ShapeStack,
 ) -> None:
-    _enter_json_container(current, depth, path, seen)
+    identity = _enter_json_container(current, depth, path, ancestors, visits)
     indexed = list(enumerate(current))
+    stack.append(_JsonLeave(identity))
     for index, item in reversed(indexed):
         stack.append((item, depth + 1, path + (str(index),)))
 
 
 def _enter_json_container(
-    current: object, depth: int, path: tuple[str, ...], seen: set[int]
-) -> None:
+    current: object,
+    depth: int,
+    path: tuple[str, ...],
+    ancestors: set[int],
+    visits: list[int],
+) -> int:
     if depth > _MAX_JSON_DEPTH:
         _json_shape_error(path, f"nesting exceeds max {_MAX_JSON_DEPTH}")
     identity = id(current)
-    if identity in seen:
-        _json_shape_error(path, "repeated container")
-    seen.add(identity)
+    if identity in ancestors:
+        _json_shape_error(path, "cyclic container")
+    visits[0] += 1
+    if visits[0] > _MAX_JSON_VISITS:
+        _json_shape_error(path, f"node visits exceed max {_MAX_JSON_VISITS}")
+    ancestors.add(identity)
+    return identity
 
 
 def _reject_json_type(value: object, path: tuple[str, ...]) -> None:
@@ -406,7 +445,8 @@ def _schema_nesting_errors(
     ``depth`` is the number of ``items`` or nested ``properties`` edges followed
     to reach ``node``. Depth 32 is allowed. Depth 33 is not. The input object's
     own ``properties`` map is not an edge; callers pass each property at depth 0.
-    A repeated container is left for ``_check_json_shape``; it is not walked twice.
+    A container already seen on this walk is skipped so shared schema nodes stay
+    linear. Cycles and visit blowups are left to ``_check_json_shape``.
     """
     if seen is None:
         seen = set()

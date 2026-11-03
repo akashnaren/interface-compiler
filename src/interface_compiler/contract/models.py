@@ -273,7 +273,7 @@ class DocX(BaseModel):
 class ViewDoc(BaseModel):
     """A compiled view document: ``view``, ``state``, ``entities``, ``affordances``, optional ``x``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     view: str = Field(pattern=_ID)
     state: dict[str, Any]
@@ -428,7 +428,7 @@ class Counters(BaseModel):
 class ActResult(BaseModel):
     """The response from ``act``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     status: Literal[
         "ok",

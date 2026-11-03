@@ -3,6 +3,7 @@
 import json
 import re
 import signal
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -857,27 +858,47 @@ def test_contract_cyclic_open_object_is_rejected() -> None:
     with _deadline():
         with pytest.raises(ContractError) as doc_error:
             validate_doc(doc)
-        assert "repeated container" in str(doc_error.value)
+        assert "cyclic container" in str(doc_error.value)
         with pytest.raises(ValidationError) as view_error:
             ViewDoc.model_validate(doc)
-        assert "repeated container" in str(view_error.value)
+        assert "cyclic container" in str(view_error.value)
         with pytest.raises(ContractError) as effect_error:
             validate_effect(act)
-        assert "repeated container" in str(effect_error.value)
+        assert "cyclic container" in str(effect_error.value)
         with pytest.raises(ValidationError) as act_error:
             ActResult.model_validate(act)
-        assert "repeated container" in str(act_error.value)
+        assert "cyclic container" in str(act_error.value)
+
+
+def _shared_diamond(levels: int) -> dict:
+    node: dict = {"leaf": True}
+    for _ in range(levels):
+        node = {"l": node, "r": node}
+    return node
+
+
+def test_contract_shared_container_reuse_is_allowed() -> None:
+    shared_input = {"type": "object", "properties": {"q": {"type": "string"}}}
+    doc = _paper()
+    doc["affordances"][0]["input"] = shared_input
+    doc["affordances"][1]["input"] = shared_input
+    empty: dict = {}
+    doc["entities"]["left"] = empty
+    doc["entities"]["right"] = empty
+    with _deadline():
+        validate_doc(doc)
+        ViewDoc.model_validate(doc)
+        strip_x(doc)
+        ablate(doc)
+        to_flat_tools(doc)
+        token_counts(doc)
 
 
 def test_contract_shared_references_are_rejected() -> None:
-    node: dict = {"leaf": True}
-    for _ in range(40):
-        node = {"l": node, "r": node}
+    node = _shared_diamond(40)
     doc = _with_locator_extra(node)
     act = _act_result()
     act["effect"]["predicted"]["detail"] = node
-    shared = {"leaf": True}
-    affordance = {"id": "go", "enabled": True, "input": {"type": "object", "properties": {}}}
     schema_node: dict = {"type": "string"}
     for _ in range(40):
         schema_node = {"type": "object", "properties": {"l": schema_node, "r": schema_node}}
@@ -886,16 +907,67 @@ def test_contract_shared_references_are_rejected() -> None:
     with _deadline():
         with pytest.raises(ContractError) as doc_error:
             validate_doc(doc)
-        assert "repeated container" in str(doc_error.value)
-        with pytest.raises(ValidationError):
+        assert "node visits exceed max 1000000" in str(doc_error.value)
+        with pytest.raises(ValidationError) as view_error:
             ViewDoc.model_validate(doc)
-        with pytest.raises(ValidationError):
+        assert "node visits exceed max 1000000" in str(view_error.value)
+        with pytest.raises(ValidationError) as act_error:
             ActResult.model_validate(act)
-        with pytest.raises(ContractError) as args_error:
-            validate_args(affordance, {"x": shared, "y": shared})
-        assert "repeated container" in str(args_error.value)
+        assert "node visits exceed max 1000000" in str(act_error.value)
         with pytest.raises(ContractError):
             validate_doc(schema_doc)
+
+
+def test_contract_validation_error_hides_shared_input() -> None:
+    doc = _with_locator_extra(_shared_diamond(40))
+    with _deadline():
+        with pytest.raises(ValidationError) as caught:
+            ViewDoc.model_validate(doc)
+        started = time.perf_counter()
+        rendered = str(caught.value)
+        repr_rendered = repr(caught.value)
+        elapsed = time.perf_counter() - started
+    assert elapsed < 0.25
+    assert "node visits exceed max 1000000" in rendered
+    assert "input_value" not in rendered
+    assert len(rendered) < 2_000
+    assert len(repr_rendered) < 2_000
+
+
+def test_contract_cli_rejects_oversized_integer(tmp_path: Path) -> None:
+    path = tmp_path / "huge.json"
+    path.write_text('{"n": ' + ("1" * 4301) + "}", encoding="utf-8")
+    with _deadline():
+        result = RUNNER.invoke(app, ["validate", str(path)])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
+    assert "Traceback" not in captured
+    assert "4301" in result.stderr
+
+
+def test_contract_integer_must_fit_in_js_safe_range() -> None:
+    allowed = _paper()
+    allowed["state"]["cart_count"] = 2**53 - 1
+    allowed["state"]["order_count"] = -(2**53 - 1)
+    rejected = _paper()
+    rejected["state"]["cart_count"] = 2**60
+    with _deadline():
+        validate_doc(allowed)
+        ViewDoc.model_validate(allowed)
+        for outside in (2**53, -(2**53)):
+            edge = _paper()
+            edge["state"]["cart_count"] = outside
+            with pytest.raises(ContractError) as edge_error:
+                validate_doc(edge)
+            assert "integer must be within ±(2**53 - 1)" in str(edge_error.value)
+        with pytest.raises(ContractError) as exc:
+            validate_doc(rejected)
+        assert "integer must be within ±(2**53 - 1)" in str(exc.value)
+        for transform in (strip_x, ablate, to_flat_tools, token_counts):
+            with pytest.raises(ContractError) as transform_error:
+                transform(rejected)
+            assert "integer must be within ±(2**53 - 1)" in str(transform_error.value)
 
 
 def test_contract_transforms_reject_deep_open_object() -> None:
