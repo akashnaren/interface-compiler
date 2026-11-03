@@ -10,11 +10,24 @@
   const pageTitle = document.title;
   const walkStarted = performance.now();
   let truncated = false;
+  let indexFinished = false;
+  // Selection, the index, and per-row flags stop on shares of the walk budget.
+  // A later phase still runs after an earlier one sets truncated, so a slow
+  // index cannot reduce emission to a single row.
+  let phaseLimitMs = Infinity;
+
+  function overPhase() {
+    return performance.now() - walkStarted > phaseLimitMs;
+  }
+
+  function shareLimit(fraction) {
+    if (typeof WALK_BUDGET_MS !== "number" || WALK_BUDGET_MS <= 0) {
+      return Infinity;
+    }
+    return WALK_BUDGET_MS * fraction;
+  }
 
   function budgetSpent() {
-    if (truncated) {
-      return true;
-    }
     if (typeof WALK_BUDGET_MS !== "number") {
       return false;
     }
@@ -22,7 +35,7 @@
     if (WALK_BUDGET_MS <= 0) {
       return true;
     }
-    if (performance.now() - walkStarted > WALK_BUDGET_MS) {
+    if (overPhase() || performance.now() - walkStarted > WALK_BUDGET_MS) {
       truncated = true;
       return true;
     }
@@ -62,6 +75,10 @@
   const readLocalName = Object.getOwnPropertyDescriptor(Element.prototype, "localName").get;
   const readChildren = Object.getOwnPropertyDescriptor(Element.prototype, "children").get;
   const readParentElement = Object.getOwnPropertyDescriptor(Node.prototype, "parentElement").get;
+  const readPreviousElementSibling = Object.getOwnPropertyDescriptor(
+    Element.prototype,
+    "previousElementSibling",
+  ).get;
   const readChildNodes = Object.getOwnPropertyDescriptor(Node.prototype, "childNodes").get;
   const readNodeType = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
   const readTextContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").get;
@@ -72,6 +89,7 @@
   const readMatches = Element.prototype.matches;
   const readContains = Node.prototype.contains;
   const readRect = Element.prototype.getBoundingClientRect;
+  const readCheckVisibility = Element.prototype.checkVisibility;
   const readQuery = Element.prototype.querySelector;
   const readQueryAll = Element.prototype.querySelectorAll;
   const readElementFromPoint = Document.prototype.elementFromPoint;
@@ -102,6 +120,10 @@
 
   function parentElement(el) {
     return readParentElement.call(el);
+  }
+
+  function previousElementSibling(el) {
+    return readPreviousElementSibling.call(el);
   }
 
   function childNodes(el) {
@@ -176,10 +198,12 @@
     if (displayNone.get(el) === true) {
       return true;
     }
-    if (displayNone.get(el) === undefined && getComputedStyle(el).display === "none") {
-      return true;
+    if (displayNone.get(el) === false) {
+      return false;
     }
-    return false;
+    // Closed details content is not display:none, and its text still belongs
+    // in the name. checkVisibility is false there, so it cannot decide this.
+    return getComputedStyle(el).display === "none" || closest(el, "[hidden]") !== null;
   }
 
   function skipsOwnText(el) {
@@ -260,6 +284,7 @@
   let styleHidden = new Map();
   let displayNone = new Map();
   let visibilityHidden = new Map();
+  let flagFieldsetDisabled = new Map();
 
   function labelFor(el) {
     const id = elementId(el);
@@ -652,7 +677,12 @@
         parts.unshift("body");
         break;
       }
-      const nth = nthOfType.get(node) || 1;
+      // A missing nth-of-type must not become 1. That selector names an
+      // earlier sibling, so the row is omitted instead.
+      const nth = nthOfType.get(node);
+      if (typeof nth !== "number" || nth < 1) {
+        return "";
+      }
       parts.unshift(`${localName(node)}:nth-of-type(${nth})`);
       node = parentElement(node);
     }
@@ -718,10 +748,48 @@
   }
 
   function isVisible(el, rect) {
+    // A row whose flags were not computed is omitted from visibility. Default
+    // false would report a covered control as actionable.
+    if (!styleHidden.has(el)) {
+      return false;
+    }
     if (flagHidden.get(el) === true || styleHidden.get(el) === true) {
       return false;
     }
     return rect.width > 0 && rect.height > 0;
+  }
+
+  // Flags come from this element's ancestors, not from the document walk.
+  // One closest() per condition so an inner inert node does not hide an outer
+  // aria-hidden ancestor. visibility:hidden still has a box, so it is a second check.
+  function applyRowFlags(el) {
+    const hidden = closest(el, "[hidden]") !== null;
+    const ariaHidden = closest(el, "[aria-hidden='true']") !== null;
+    const inert = closest(el, "[inert]") !== null;
+    const ariaDisabled = closest(el, "[aria-disabled='true']") !== null;
+    const fieldsetDisabled = closest(el, "fieldset[disabled]") !== null;
+    let displayHidden = hidden;
+    let visibilityIsHidden = false;
+    if (typeof readCheckVisibility === "function") {
+      const rendered = readCheckVisibility.call(el) === true;
+      if (!rendered) {
+        displayHidden = true;
+      } else if (readCheckVisibility.call(el, { visibilityProperty: true }) !== true) {
+        visibilityIsHidden = true;
+      }
+    } else {
+      const style = getComputedStyle(el);
+      displayHidden = style.display === "none" || hidden;
+      visibilityIsHidden = style.visibility === "hidden";
+    }
+    flagHidden.set(el, hidden);
+    flagAriaHidden.set(el, ariaHidden);
+    flagInert.set(el, inert);
+    flagAriaDisabled.set(el, ariaDisabled);
+    flagFieldsetDisabled.set(el, fieldsetDisabled);
+    displayNone.set(el, displayHidden);
+    visibilityHidden.set(el, visibilityIsHidden);
+    styleHidden.set(el, displayHidden || visibilityIsHidden);
   }
 
   function coveredBy(el, hit) {
@@ -914,6 +982,7 @@
     styleHidden = new Map();
     displayNone = new Map();
     visibilityHidden = new Map();
+    flagFieldsetDisabled = new Map();
     const ids = document.querySelectorAll("[id]");
     for (let index = 0; index < ids.length; index += 1) {
       if (!withinBudget()) {
@@ -954,37 +1023,16 @@
       }
       formIndexes.set(forms[index], index);
     }
-    if (document.documentElement) {
-      walkTree(document.documentElement, {
-        hidden: false,
-        ariaHidden: false,
-        inert: false,
-        ariaDisabled: false,
-        visuallyHidden: false,
-        displayHidden: false,
-      });
-    }
+    indexFinished = document.documentElement ? walkTree(document.documentElement) : true;
   }
 
-  function walkTree(el, inherited) {
+  // nth-of-type and legends only. Ancestor flags are computed per chosen row
+  // so a walk that stops early does not leave later controls looking actionable.
+  // False means the walk stopped, and the accessibility tree is not safe to open.
+  function walkTree(el) {
     if (!withinBudget()) {
-      return;
+      return false;
     }
-    const hidden = inherited.hidden || hasAttribute(el, "hidden");
-    const ariaHidden = inherited.ariaHidden || getAttribute(el, "aria-hidden") === "true";
-    const inert = inherited.inert || el.inert === true || hasAttribute(el, "inert");
-    const ariaDisabled = inherited.ariaDisabled || getAttribute(el, "aria-disabled") === "true";
-    const style = getComputedStyle(el);
-    const displayHidden = inherited.displayHidden || style.display === "none";
-    const visibilityIsHidden = style.visibility === "hidden";
-    const visuallyHidden = displayHidden || visibilityIsHidden;
-    flagHidden.set(el, hidden);
-    flagAriaHidden.set(el, ariaHidden);
-    flagInert.set(el, inert);
-    flagAriaDisabled.set(el, ariaDisabled);
-    styleHidden.set(el, visuallyHidden);
-    displayNone.set(el, displayHidden);
-    visibilityHidden.set(el, visibilityIsHidden);
     if (tagName(el) === "FIELDSET") {
       let text = "";
       for (const child of children(el)) {
@@ -996,16 +1044,86 @@
       legendText.set(el, text);
     }
     const counts = new Map();
-    const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden, displayHidden };
     for (const child of children(el)) {
       if (!withinBudget()) {
-        return;
+        return false;
       }
       const seen = (counts.get(tagName(child)) || 0) + 1;
       counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
-      walkTree(child, next);
+      if (!walkTree(child)) {
+        return false;
+      }
     }
+    return true;
+  }
+
+  // Fill nth-of-type from earlier siblings when the document walk stopped
+  // first. A known sibling of the same tag makes the next row constant time,
+  // so a long table does not rescan from the start. The scan gives up at
+  // read-back and the row is then omitted rather than given nth 1.
+  function recordNth(el) {
+    if (nthOfType.has(el)) {
+      return true;
+    }
+    const tag = tagName(el);
+    let scanned = 0;
+    let sib = previousElementSibling(el);
+    let known = 0;
+    const gap = [];
+    while (sib) {
+      scanned += 1;
+      if ((scanned & 127) === 0 && pastReadback()) {
+        return false;
+      }
+      if (tagName(sib) === tag) {
+        const prior = nthOfType.get(sib);
+        if (typeof prior === "number" && prior > 0) {
+          known = prior;
+          break;
+        }
+        gap.push(sib);
+      }
+      sib = previousElementSibling(sib);
+    }
+    let nth = known + 1;
+    for (let index = gap.length - 1; index >= 0; index -= 1) {
+      nthOfType.set(gap[index], nth);
+      nth += 1;
+    }
+    nthOfType.set(el, nth);
+    return true;
+  }
+
+  function nthReady(el) {
+    let node = el;
+    while (node && nodeType(node) === 1 && tagName(node) !== "HTML") {
+      if (tagName(node) === "BODY") {
+        return true;
+      }
+      if (!recordNth(node)) {
+        return false;
+      }
+      node = parentElement(node);
+    }
+    return true;
+  }
+
+  // An id or name selector does not use nth-of-type. Skipping the sibling
+  // scan keeps the flag budget for the rows that still need one.
+  function selectorWithoutNth(el) {
+    const id = elementId(el);
+    if (id && idCounts.get(id) === 1) {
+      return true;
+    }
+    const name = getAttribute(el, "name");
+    if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
+      const key = `${localName(el)}\n${name}`;
+      if (nameCounts.get(key) === 1) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function elementRow(el, rect, coveredFlag) {
@@ -1023,7 +1141,14 @@
       formIndex(el),
       binding.form_method,
       binding.form_action,
-      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
+      role === "option"
+        ? optionDisabled(el) || flagFieldsetDisabled.get(el) === true
+        : elementMatches(el, ":disabled") ||
+          (flagFieldsetDisabled.get(el) === true &&
+            (tagName(el) === "BUTTON" ||
+              tagName(el) === "INPUT" ||
+              tagName(el) === "SELECT" ||
+              tagName(el) === "TEXTAREA")),
       el.readOnly === true,
       flagAriaDisabled.get(el) === true,
       flagInert.get(el) === true,
@@ -1081,9 +1206,11 @@
     }
   }
 
-  // Rows are chosen before the tree walk. A throttled tree can spend the
-  // whole walk budget, and the read-back still has to ship a prefix.
+  // Selection and the index each stop on a share of the walk budget. Flags
+  // then take half of the time still left before read-back, and emission
+  // keeps the rest, so a throttled table still ships a prefix.
   const matched = document.querySelectorAll(SELECTOR);
+  phaseLimitMs = shareLimit(0.3);
   const chosen = [];
   const rects = [];
   for (let index = 0; index < matched.length; index += 1) {
@@ -1097,7 +1224,43 @@
     return deadlinePayload();
   }
 
+  phaseLimitMs = shareLimit(0.45);
   indexDocument();
+  const reserveMs = typeof WALK_RESERVE_MS === "number" ? WALK_RESERVE_MS : 1000;
+  const readbackAt =
+    typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS > 0
+      ? WALK_BUDGET_MS + reserveMs - 800
+      : Infinity;
+  const elapsedNow = performance.now() - walkStarted;
+  phaseLimitMs = elapsedNow + Math.max(0, (readbackAt - elapsedNow) * 0.5);
+  const kept = [];
+  const keptRects = [];
+  for (let index = 0; index < chosen.length; index += 1) {
+    if (overPhase() || pastReadback()) {
+      truncated = true;
+      break;
+    }
+    const row = chosen[index];
+    // Flags come from this row's ancestors. A positional selector still needs
+    // a real nth-of-type; when that cannot be filled in time the row is omitted.
+    if (!selectorWithoutNth(row) && !nthReady(row)) {
+      truncated = true;
+      break;
+    }
+    try {
+      applyRowFlags(row);
+    } catch (error) {
+      truncated = true;
+      break;
+    }
+    if (!styleHidden.has(row) || !cssOf(row)) {
+      truncated = true;
+      break;
+    }
+    kept.push(row);
+    keptRects.push(rects[index]);
+  }
+  phaseLimitMs = Infinity;
   const nodes = [];
   const fields = [
     "tag",
@@ -1142,7 +1305,7 @@
     "group_key",
     "constraints",
   ];
-  const covered = coverageOf(chosen, rects);
+  const covered = coverageOf(kept, keptRects);
   const forms = Array.from(document.forms).map((form, index) => ({
     index,
     method: (getAttribute(form, "method") || "get").toLowerCase(),
@@ -1179,26 +1342,33 @@
   }
 
   // Stringify in slices so a late clock keeps the rows already copied.
-  // budgetSpent is sticky once truncated, and must not drop those rows.
   // Each piece is one JSON array. Python reads them one at a time and stops
-  // when the next read would cross the deadline, so the copy stays interruptible.
+  // while the rows can still be built before the deadline.
   const chunks = [];
   let batch = [];
-  const chunkRows = 1000;
-  // Object ids are read in one CDP call. Cap the list so that call cannot
-  // outlast the deadline on a table of tens of thousands of rows. The head
-  // of the document is what the overlay visits first.
-  const nodeCap = 2000;
-  for (let index = 0; index < chosen.length; index += 1) {
+  const chunkRows = 800;
+  // Object ids are one CDP call, then one accessibility read each until the
+  // overlay budget runs out. The head of the document covers the on-screen
+  // widgets; a longer list spends that whole budget on a table.
+  const nodeCap = 160;
+  for (let index = 0; index < kept.length; index += 1) {
     if (index > 0 && pastReadback()) {
       truncated = true;
       break;
     }
-    if (nodes.length < nodeCap) {
-      nodes.push(chosen[index]);
+    if (!cssOf(kept[index])) {
+      truncated = true;
+      break;
     }
-    batch.push(elementRow(chosen[index], rects[index], covered[index]));
+    if (nodes.length < nodeCap) {
+      nodes.push(kept[index]);
+    }
+    batch.push(elementRow(kept[index], keptRects[index], covered[index]));
     if (batch.length === chunkRows) {
+      if (pastReadback()) {
+        truncated = true;
+        break;
+      }
       chunks.push(JSON.stringify(batch));
       batch = [];
     }
@@ -1206,7 +1376,7 @@
   if (batch.length > 0) {
     chunks.push(JSON.stringify(batch));
   }
-  if (chunks.length === 0 && matched.length > 0) {
+  if (chunks.length === 0 && matched.length > 0 && !truncated) {
     return deadlinePayload();
   }
 
@@ -1221,6 +1391,7 @@
       deadline: false,
       chunks: chunks.length,
       controls: matched.length,
+      indexed: indexFinished,
     }),
     chunks,
     nodes,

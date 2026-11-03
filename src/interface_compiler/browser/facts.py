@@ -65,9 +65,18 @@ _OVERLAY_BUDGET_CAP_S = 2.5
 # cannot be interrupted. Do not start it unless the whole call fits.
 _AX_COLD_CALL_S = 1.8
 _AX_WARM_CALL_S = 0.25
-# One returned chunk is a couple of thousand rows. Do not start the next
-# read unless it can finish before the hard deadline.
-_CHUNK_READ_S = 0.3
+# Past this many matched controls the cold tree tracks the whole document.
+# Skip it: a partial transfer still leaves that document in the page.
+_AX_LARGE_PAGE_ROWS = 20_000
+# One chunk read. The first chunk is on this clock too.
+_CHUNK_READ_S = 0.15
+# Title read plus the loader check, as one uninterruptible pair.
+_DOCUMENT_CHECK_S = 0.2
+# Building one ElementFact. Checked between rows so a huge table stops
+# with truncated set and still has time to release the CDP session.
+_ROW_BUILD_S = 0.002
+# releaseObjectGroup and session detach after the facts are built.
+_CLEANUP_S = 0.4
 # Absolute perf_counter deadline for the collection in progress. Unset when
 # overlay tests call the helper on their own.
 _ax_deadline: ContextVar[float | None] = ContextVar("ax_deadline", default=None)
@@ -213,9 +222,13 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     node raises instead of mixing two documents. The URL and title are the
     ones read at the start of the walk, so a later ``pushState`` cannot
     relabel those facts. When the deadline cuts the walk it returns the
-    elements collected so far with ``truncated`` set. A walk that is given no
-    time, or that ships no rows from a page that has controls, raises instead
-    of returning an empty document. Collection also raises when the browser
+    elements collected so far with ``truncated`` set. Ancestor flags are read
+    from each chosen row, so they do not wait on the rest of the document.
+    Chunk reads (including the first), fact construction, and the title and
+    loader checks all stop on the same clock, with ``truncated`` set, while
+    there is still time to release the session. A walk that is given no time,
+    or that ships no rows from a page that has controls, raises instead of
+    returning an empty document. Collection also raises when the browser
     driver cannot be found, so the deadline is never skipped.
 
     A renderer that is already spinning does not honor a CDP timeout. The
@@ -305,11 +318,11 @@ def _overlay_budget(deadline_s: float, elapsed_s: float) -> float:
 
 
 def _ax_call_fits(needed_s: float) -> bool:
-    """True when one more accessibility call can finish before the deadline."""
+    """True when `needed_s` of work and session cleanup both finish in time."""
     deadline = _ax_deadline.get()
     if deadline is None:
         return True
-    return time.perf_counter() + needed_s < deadline
+    return time.perf_counter() + needed_s + _CLEANUP_S < deadline
 
 
 def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
@@ -329,14 +342,33 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             },
         )
         root_id = _object_id(evaluated)
+        # Title and loader checks are on the clock. Skipping them keeps the
+        # URL and title the walk already stored and marks the facts truncated.
+        document_checked = False
+        if _ax_call_fits(_DOCUMENT_CHECK_S):
+            _page_title(page)
+            if _require_frame_stamp(session)[1] != started_loader:
+                raise FactCollectionError("fact collection lost the document")
+            document_checked = True
         payload = _collected_payload(session, root_id)
         if isinstance(payload, dict) and payload.get("deadline") is True:
             raise FactCollectionError("fact collection exceeded the deadline")
+        if isinstance(payload, dict) and not document_checked:
+            payload["truncated"] = True
         # Node ids exist only to feed the overlay. A cold partial tree is one
-        # uninterruptible call, so skip both unless that call fits.
+        # uninterruptible call, so skip both unless that call fits. A huge
+        # document is skipped outright: the tree cost follows the DOM, not
+        # how many rows the read-back kept.
         object_ids: list[str] = []
         overlay: dict[str, _AxHit] = {}
-        if _ax_call_fits(_AX_COLD_CALL_S):
+        controls = payload.get("controls") if isinstance(payload, dict) else None
+        if not isinstance(controls, int):
+            raw_rows = payload.get("elements") if isinstance(payload, dict) else None
+            controls = len(raw_rows) if isinstance(raw_rows, list) else 0
+        # An unfinished index means the DOM is larger than the walk budget.
+        # A cold accessibility tree on that document can outlast the deadline.
+        indexed = payload.get("indexed") is not False if isinstance(payload, dict) else False
+        if indexed and controls < _AX_LARGE_PAGE_ROWS and _ax_call_fits(_AX_COLD_CALL_S):
             object_ids = _node_object_ids(session, root_id)
         if object_ids and _ax_call_fits(_AX_COLD_CALL_S):
             overlay = _accessibility_overlay(
@@ -345,14 +377,19 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
                 _overlay_budget(deadline_s, time.perf_counter() - started),
                 _overlay_order(payload, len(object_ids)),
             )
-        # A closed page here is a lost document, not a deadline failure. The
-        # URL and title already captured in the walk are the ones returned.
-        _page_title(page)
-        if _require_frame_stamp(session)[1] != started_loader:
+        # The overlay can be the thing that navigates. Check the loader again
+        # after it returns; the check before the read-back is too early.
+        if (
+            document_checked
+            and _ax_call_fits(_DOCUMENT_CHECK_S)
+            and _require_frame_stamp(session)[1] != started_loader
+        ):
             raise FactCollectionError("fact collection lost the document")
         if not isinstance(payload, dict):
             raise TypeError("fact collector must return an object")
         page_url, title, truncated = _walked_document(payload)
+        # Evaluated before session cleanup, while the deadline is still set.
+        return _page_facts(page_url, title, payload, overlay, truncated)
     except FactCollectionError:
         raise
     except Exception as exc:
@@ -366,7 +403,6 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             session.detach()
         except PlaywrightError:
             pass
-    return _page_facts(page_url, title, payload, overlay, truncated)
 
 
 def _function_value(session: CDPSession, object_id: str, declaration: str) -> Any:
@@ -401,9 +437,8 @@ def _collected_payload(session: CDPSession, root_id: str) -> dict[str, Any]:
         return meta
     rows: list[object] = []
     for index in range(count):
-        # The first chunk is the prefix we already paid to copy. Later chunks
-        # wait until a read fits before the deadline.
-        if index > 0 and not _ax_call_fits(_CHUNK_READ_S):
+        # Every chunk, including the first, has to finish before cleanup.
+        if not _ax_call_fits(_CHUNK_READ_S):
             meta["truncated"] = True
             break
         piece = _function_value(
@@ -416,7 +451,12 @@ def _collected_payload(session: CDPSession, root_id: str) -> dict[str, Any]:
             raise TypeError("fact collector returned no payload")
         rows.extend(parsed)
     controls = meta.get("controls")
-    if not rows and isinstance(controls, int) and controls > 0:
+    if (
+        not rows
+        and isinstance(controls, int)
+        and controls > 0
+        and meta.get("truncated") is not True
+    ):
         meta["deadline"] = True
     meta["elements"] = rows
     return meta
@@ -779,6 +819,9 @@ def _page_facts(
         elements: list[ElementFact] = []
         field_names = [name for name in raw_fields if isinstance(name, str)]
         for index, item in enumerate(raw_elements):
+            if not _ax_call_fits(_ROW_BUILD_S):
+                truncated = True
+                break
             elements.append(_element(_element_row(item, field_names), overlay.get(str(index))))
         forms = tuple(_form(item) for item in raw_forms)
         modals = tuple(_modal(item) for item in raw_modals)

@@ -1179,6 +1179,73 @@ def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: P
             assert host.options[0].disabled is True
 
 
+def test_facts_ancestor_flags_do_not_wait_for_the_document_walk(facts_page: Page) -> None:
+    # A million inlines would exhaust the document walk. Flags still come from
+    # each control's own ancestors, or the control is absent.
+    filler = "<i>x</i> " * 1_000_000
+    try:
+        facts_page.set_content(
+            "<!doctype html><title>flags</title>"
+            f"{filler}"
+            "<div style='position:absolute;top:3000px'>"
+            "<div inert><button id='delete' type='button'>Delete account</button></div>"
+            "<button id='vis' type='button' style='visibility:hidden'>Hidden</button>"
+            "<a id='ariah' href='/x' aria-hidden='true'>Secret</a>"
+            "<div id='ariad' role='button' aria-disabled='true'>Nope</div>"
+            "<input id='vin' style='visibility:hidden'>"
+            "</div>",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        facts = collect_facts(facts_page)
+    finally:
+        facts_page.set_content(
+            "<!doctype html><title>empty</title>",
+            wait_until="domcontentloaded",
+        )
+
+    delete = _by_id(facts, "delete")
+    _expect(
+        delete,
+        inert=True,
+        hidden=False,
+        aria_hidden=False,
+        aria_disabled=False,
+        visible=True,
+        name="Delete account",
+    )
+    _expect(
+        _by_id(facts, "vis"),
+        visible=False,
+        inert=False,
+        hidden=False,
+        aria_hidden=False,
+        aria_disabled=False,
+    )
+    _expect(
+        _by_id(facts, "ariah"),
+        aria_hidden=True,
+        inert=False,
+        hidden=False,
+        aria_disabled=False,
+    )
+    _expect(
+        _by_id(facts, "ariad"),
+        aria_disabled=True,
+        inert=False,
+        hidden=False,
+        aria_hidden=False,
+    )
+    _expect(
+        _by_id(facts, "vin"),
+        visible=False,
+        hidden=False,
+        inert=False,
+        aria_hidden=False,
+        aria_disabled=False,
+    )
+
+
 @pytest.mark.parametrize(
     ("minlength", "maxlength", "expect_min", "expect_max"),
     [
@@ -1773,6 +1840,7 @@ finally:
         ("nested", 12000, 5.0, 1),
         ("nested", 14000, 5.0, 1),
         ("table", 30000, 5.0, 1),
+        ("late", 120000, 2.0, 4),
     ],
 )
 def test_facts_huge_table_is_truncated_instead_of_killed(
@@ -1810,6 +1878,16 @@ try:
                 % (index, index, index, index, index, index, index)
             )
         parts.append("</tbody></table>")
+    elif kind == "late":
+        # Controls after a long run of empty divs. A walk that stops early
+        # must not emit default flags or nth-of-type(1) for a later button.
+        parts.append("<div></div>" * count)
+        parts.append(
+            "<button id='first' type='button'>First</button>"
+            "<button id='hid' type='button' style='visibility:hidden'>Hidden</button>"
+            "<div inert><button id='nope' type='button'>No</button></div>"
+            "<button type='button'>Pay</button>"
+        )
     else:
         raise SystemExit(6)
     page.set_content("".join(parts), wait_until="domcontentloaded")
@@ -1821,7 +1899,58 @@ try:
     except FactCollectionError as exc:
         sys.stderr.write(str(exc))
         raise SystemExit(2)
-    full = count * 2 if kind == "table" else count
+    if kind == "late":
+        by_id = {element.html_id: element for element in facts.elements if element.html_id}
+        expected = {
+            "first": {"visible": True, "inert": False, "name": "First"},
+            "hid": {"visible": False, "inert": False, "hidden": False, "aria_hidden": False},
+            "nope": {"inert": True, "visible": True, "aria_disabled": False, "hidden": False},
+        }
+        for html_id, fields in expected.items():
+            element = by_id.get(html_id)
+            if element is None:
+                sys.stderr.write("missing %s\\n" % html_id)
+                raise SystemExit(3)
+            for key, value in fields.items():
+                actual = getattr(element, key)
+                if actual != value:
+                    sys.stderr.write("%s %s=%r\\n" % (html_id, key, actual))
+                    raise SystemExit(3)
+        pay = [
+            element
+            for element in facts.elements
+            if element.tag == "button" and element.name == "Pay"
+        ]
+        if len(pay) > 1:
+            sys.stderr.write("pay=%s\\n" % len(pay))
+            raise SystemExit(3)
+        checked = [by_id["first"], by_id["hid"], by_id["nope"]]
+        resolved_expect = ["first", "hid", "nope"]
+        if len(pay) == 1:
+            pay = pay[0]
+            if pay.html_id is not None or pay.inert or pay.visible is not True:
+                sys.stderr.write("pay flags\\n")
+                raise SystemExit(3)
+            if pay.aria_disabled or pay.hidden or pay.css == "body > button:nth-of-type(1)":
+                sys.stderr.write("pay css %s\\n" % pay.css)
+                raise SystemExit(3)
+            checked.append(pay)
+            resolved_expect.append("Pay")
+        elif not facts.truncated:
+            sys.stderr.write("missing pay\\n")
+            raise SystemExit(3)
+        resolved = page.evaluate(
+            "(rows) => rows.map((row) => {"
+            " const found = document.querySelector(row.css);"
+            " if (!found) return '';"
+            " return found.id || found.textContent || '';"
+            "})",
+            [{"css": element.css} for element in checked],
+        )
+        if resolved != resolved_expect:
+            sys.stderr.write("css %s\\n" % resolved)
+            raise SystemExit(3)
+    full = 4 if kind == "late" else count * 2 if kind == "table" else count
     got = len(facts.elements)
     if got <= 0 or got > full or (got < full and not facts.truncated):
         sys.stderr.write("elements=%s truncated=%s" % (got, facts.truncated))
