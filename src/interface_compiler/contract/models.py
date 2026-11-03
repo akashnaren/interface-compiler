@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Self
 
@@ -16,7 +15,12 @@ from pydantic import (
     model_validator,
 )
 
-from interface_compiler.contract.validate import ContractError, validate_doc, validate_effect
+from interface_compiler.contract.validate import (
+    ContractError,
+    _compile_pattern,
+    validate_doc,
+    validate_effect,
+)
 
 _ID = r"^[a-z][a-z0-9_]*$"
 _NULLABLE_FIELDS = frozenset({"match", "main_status", "blocked", "total", "next"})
@@ -61,10 +65,9 @@ class Prop(BaseModel):
     def _pattern_compiles(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        try:
-            re.compile(value)
-        except re.error as exc:
-            raise ValueError(f"{value!r} is not a valid regular expression ({exc})") from exc
+        failure = _compile_pattern(value)
+        if failure is not None:
+            raise ValueError(str(failure)) from failure
         return value
 
     @field_validator("enum")
@@ -193,9 +196,9 @@ class PageCursor(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    offset: int
-    limit: int
-    total: int | None = None
+    offset: StrictInt
+    limit: StrictInt
+    total: StrictInt | None = None
     next: str | None = None
 
 
@@ -214,8 +217,8 @@ class PrecheckStats(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    ok: int
-    failed: int
+    ok: StrictInt
+    failed: StrictInt
 
 
 class RegistryStats(BaseModel):
@@ -223,8 +226,8 @@ class RegistryStats(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    carried: int
-    dropped: int
+    carried: StrictInt
+    dropped: StrictInt
 
 
 class Blocked(BaseModel):

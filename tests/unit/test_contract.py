@@ -522,6 +522,46 @@ def test_contract_validate_args_invalid_pattern_is_contract_error() -> None:
     assert "pattern" in str(exc.value)
 
 
+_UNCOMPILABLE_PATTERNS = {
+    "overflow": "a{4294967296}",
+    "recursion": "(" * 5000 + "a" + ")" * 5000,
+}
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    _UNCOMPILABLE_PATTERNS.values(),
+    ids=_UNCOMPILABLE_PATTERNS.keys(),
+)
+def test_contract_pattern_compile_errors_are_contract_errors(pattern: str, tmp_path: Path) -> None:
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"]["pattern"] = pattern
+    where = "affordances/1/input/properties/size/pattern"
+
+    with pytest.raises(ContractError) as doc_error:
+        validate_doc(doc)
+    assert where in str(doc_error.value)
+
+    with pytest.raises(ValidationError) as model_error:
+        ViewDoc.model_validate(doc)
+    assert where in str(model_error.value)
+
+    with pytest.raises(ValidationError) as json_error:
+        ViewDoc.model_validate_json(json.dumps(doc))
+    assert where in str(json_error.value)
+
+    with pytest.raises(ContractError) as args_error:
+        validate_args(doc["affordances"][1], {"size": "L"})
+    assert "input/properties/size/pattern" in str(args_error.value)
+
+    result = _cli_validate(doc, tmp_path)
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
+    assert "Traceback" not in captured
+    assert where in result.stderr
+
+
 def test_contract_duplicate_affordance_ids_rejected() -> None:
     doc = _paper()
     clone = json.loads(json.dumps(doc["affordances"][6]))

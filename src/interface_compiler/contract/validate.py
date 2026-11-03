@@ -22,6 +22,9 @@ _SCHEMA_FILES = {
 # The frozen pattern uses `$`. Python's `$` succeeds before a final newline, so
 # jsonschema accepts "pay\n". `\Z` is the end of the string.
 _EXACT_ID = re.compile(r"\A[a-z][a-z0-9_]*\Z")
+# re.compile raises re.error for a bad pattern, and also OverflowError
+# (a{4294967296}) and RecursionError (thousands of nested groups).
+_PATTERN_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 _RFC3339 = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -84,9 +87,12 @@ def validate_args(affordance: object, args: object) -> None:
     except SchemaError as exc:
         message = f"input: {exc.message}"
         raise ContractError(message, errors=[message]) from exc
-    except re.error as exc:
-        message = f"input: invalid regular expression ({exc})"
-        raise ContractError(message, errors=[message]) from exc
+    except _PATTERN_COMPILE_ERRORS as exc:
+        errors = _input_object_errors(schema, "input")
+        if not errors:
+            message = f"input: invalid regular expression ({exc})"
+            errors = [message]
+        raise ContractError(errors[0], errors=errors) from exc
 
 
 def _input_schema(affordance: object) -> dict[str, Any]:
@@ -226,16 +232,25 @@ def _input_object_errors(schema: object, where: str) -> list[str]:
     return errors
 
 
+def _compile_pattern(pattern: str) -> ContractError | None:
+    """Return a contract error when Python cannot compile ``pattern``."""
+    try:
+        re.compile(pattern)
+    except _PATTERN_COMPILE_ERRORS as exc:
+        message = f"{pattern!r} is not a valid regular expression ({exc})"
+        return ContractError(message, errors=[message])
+    return None
+
+
 def _prop_errors(prop: object, where: str) -> list[str]:
     if not isinstance(prop, Mapping):
         return []
     errors: list[str] = []
     pattern = prop.get("pattern")
     if isinstance(pattern, str):
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            errors.append(f"{where}/pattern: {pattern!r} is not a valid regular expression ({exc})")
+        failure = _compile_pattern(pattern)
+        if failure is not None:
+            errors.append(f"{where}/pattern: {failure}")
     items = prop.get("items")
     if items is not None:
         errors.extend(_prop_errors(items, f"{where}/items"))
