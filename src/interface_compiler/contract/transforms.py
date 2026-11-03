@@ -7,11 +7,11 @@ builds a flat tool catalog from the same affordances.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Mapping
 from typing import Any
 
 from interface_compiler.contract.models import ViewDoc, dump_view_doc
+from interface_compiler.contract.validate import _check_json_shape, _json_copy
 
 
 def strip_x(doc: ViewDoc | Mapping[str, Any]) -> dict[str, Any]:
@@ -55,7 +55,7 @@ def to_flat_tools(doc: ViewDoc | Mapping[str, Any]) -> list[dict[str, Any]]:
     """One tool per affordance. ``name`` is the id and ``parameters`` is ``input``."""
     data = _as_document(doc)
     return [
-        {"name": affordance["id"], "parameters": copy.deepcopy(affordance["input"])}
+        {"name": affordance["id"], "parameters": _json_copy(affordance["input"])}
         for affordance in data["affordances"]
     ]
 
@@ -78,15 +78,18 @@ def extension_payload(doc: ViewDoc | Mapping[str, Any]) -> dict[str, Any]:
 
 def _as_document(doc: ViewDoc | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(doc, ViewDoc):
-        return dump_view_doc(doc)
-    if isinstance(doc, Mapping):
-        return copy.deepcopy(dict(doc))
-    raise TypeError("expected a compiled view document")
+        data: dict[str, Any] = dump_view_doc(doc)
+    elif isinstance(doc, Mapping):
+        data = dict(doc)
+    else:
+        raise TypeError("expected a compiled view document")
+    _check_json_shape(data)
+    return _json_copy(data)
 
 
 def _strip_constraints(prop: object) -> object:
     if not isinstance(prop, dict):
-        return copy.deepcopy(prop)
+        return _json_copy(prop)
     cleaned: dict[str, Any] = {}
     for key, value in prop.items():
         if _is_constraint(key):
@@ -94,7 +97,7 @@ def _strip_constraints(prop: object) -> object:
         if key == "items":
             cleaned[key] = _strip_constraints(value)
             continue
-        cleaned[key] = copy.deepcopy(value)
+        cleaned[key] = _json_copy(value)
     return cleaned
 
 

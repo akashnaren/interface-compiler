@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, NamedTuple, Self
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -18,6 +18,8 @@ from pydantic import (
 from interface_compiler.contract.validate import (
     ContractError,
     _compile_pattern,
+    _guard_json_document,
+    _json_copy,
     _schema_nesting_errors,
     nesting_too_deep,
     validate_doc,
@@ -482,38 +484,15 @@ def _reject_explicit_null(value: object, key: str) -> None:
 
 def _validate_raw(value: object, validate: Callable[[Mapping[str, Any]], None]) -> None:
     """Check JSON input against the schema before pydantic can coerce it."""
-    if not isinstance(value, Mapping) or not _is_json_value(value):
+    if not isinstance(value, dict):
         return
     try:
+        _guard_json_document(value)
         validate(value)
     except ContractError as exc:
         raise ValueError(str(exc)) from exc
     except RecursionError as exc:
         raise ValueError(nesting_too_deep("<root>")) from exc
-
-
-def _is_json_value(value: object) -> bool:
-    """True when ``value`` is JSON data.
-
-    Walks with an explicit stack. A recursive walk raises RecursionError on a
-    few hundred nested objects, before the schema depth cap can reject them.
-    """
-    stack = [value]
-    while stack:
-        current = stack.pop()
-        if current is None or isinstance(current, str | bool | int | float):
-            continue
-        if isinstance(current, Mapping):
-            for key, item in current.items():
-                if not isinstance(key, str):
-                    return False
-                stack.append(item)
-            continue
-        if isinstance(current, list):
-            stack.extend(current)
-            continue
-        return False
-    return True
 
 
 def _dump_model(model: BaseModel) -> dict[str, Any]:
@@ -531,81 +510,20 @@ def _dump_model(model: BaseModel) -> dict[str, Any]:
     return dumped
 
 
-class _JsonFrame(NamedTuple):
-    source: dict[str, Any] | list[Any]
-    dest: dict[str, Any] | list[Any]
-    children: list[tuple[Any, Any]]
-    index: int
-
-
 def _dump_value(value: Any) -> Any:
     """Return a JSON-ready copy of ``value``.
 
-    Dicts and lists are copied with an explicit stack. Open objects such as
-    locator extras can be thousands of levels deep, and a recursive copy raises
-    RecursionError after the model has already been built.
+    Nested models are dumped directly. A pure JSON container is copied with
+    ``_json_copy``, which does not walk shared structure or unbounded depth.
     """
     if isinstance(value, BaseModel):
         return _dump_model(value)
     if isinstance(value, dict):
-        copied: dict[str, Any] = {}
-        _copy_json(value, copied)
-        return copied
+        if any(isinstance(item, BaseModel) for item in value.values()):
+            return {key: _dump_value(item) for key, item in value.items()}
+        return _json_copy(value)
     if isinstance(value, list):
-        copied_list: list[Any] = []
-        _copy_json(value, copied_list)
-        return copied_list
+        if any(isinstance(item, BaseModel) for item in value):
+            return [_dump_value(item) for item in value]
+        return _json_copy(value)
     return value
-
-
-def _copy_json(source: dict[str, Any] | list[Any], dest: dict[str, Any] | list[Any]) -> None:
-    stack = [_json_frame(source, dest)]
-    visiting = {id(source)}
-    while stack:
-        frame = stack[-1]
-        if frame.index >= len(frame.children):
-            visiting.remove(id(frame.source))
-            stack.pop()
-            continue
-        key, item = frame.children[frame.index]
-        stack[-1] = frame._replace(index=frame.index + 1)
-        if isinstance(item, BaseModel):
-            _assign_json(frame.dest, key, _dump_model(item))
-            continue
-        if isinstance(item, dict):
-            _push_json_child(item, {}, frame.dest, key, stack, visiting)
-            continue
-        if isinstance(item, list):
-            _push_json_child(item, [], frame.dest, key, stack, visiting)
-            continue
-        _assign_json(frame.dest, key, item)
-
-
-def _json_frame(source: dict[str, Any] | list[Any], dest: dict[str, Any] | list[Any]) -> _JsonFrame:
-    if isinstance(source, dict):
-        children = list(source.items())
-    else:
-        children = list(enumerate(source))
-    return _JsonFrame(source, dest, children, 0)
-
-
-def _push_json_child(
-    item: dict[str, Any] | list[Any],
-    child: dict[str, Any] | list[Any],
-    dest: dict[str, Any] | list[Any],
-    key: Any,
-    stack: list[_JsonFrame],
-    visiting: set[int],
-) -> None:
-    if id(item) in visiting:
-        raise ValueError("value contains a cycle")
-    _assign_json(dest, key, child)
-    visiting.add(id(item))
-    stack.append(_json_frame(item, child))
-
-
-def _assign_json(dest: dict[str, Any] | list[Any], key: Any, item: Any) -> None:
-    if isinstance(dest, dict):
-        dest[key] = item
-        return
-    dest.append(item)

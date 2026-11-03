@@ -2,6 +2,9 @@
 
 import json
 import re
+import signal
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -27,6 +30,7 @@ from interface_compiler.contract import (
     validate_effect,
 )
 from interface_compiler.contract.models import ClientValidation, Counters
+from interface_compiler.contract.validate import _check_json_shape
 
 ROOT = Path(__file__).resolve().parents[2]
 PAPER_PATH = ROOT / "tests" / "fixtures" / "paper_example.json"
@@ -626,22 +630,22 @@ def test_contract_items_nesting_limit(tmp_path: Path) -> None:
     with pytest.raises(ContractError) as doc_error:
         validate_doc(doc)
     assert where in str(doc_error.value)
-    assert "nesting exceeds 32 (max 32)" in str(doc_error.value)
+    assert "nesting exceeds max 32" in str(doc_error.value)
 
     with pytest.raises(ValidationError) as model_error:
         ViewDoc.model_validate(doc)
-    assert "nesting exceeds 32 (max 32)" in str(model_error.value)
+    assert "nesting exceeds max 32" in str(model_error.value)
 
     with pytest.raises(ContractError) as args_error:
         validate_args(doc["affordances"][1], {"size": []})
-    assert "nesting exceeds 32 (max 32)" in str(args_error.value)
+    assert "nesting exceeds max 32" in str(args_error.value)
 
     result = _cli_validate(doc, tmp_path)
     assert result.exit_code != 0
     assert isinstance(result.exception, SystemExit)
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
-    assert "nesting exceeds 32 (max 32)" in result.stderr
+    assert "nesting exceeds max 32" in result.stderr
 
 
 def test_contract_items_nesting_boundary() -> None:
@@ -654,10 +658,10 @@ def test_contract_items_nesting_boundary() -> None:
     rejected["affordances"][1]["input"]["properties"]["size"] = _items_chain(33)
     with pytest.raises(ContractError) as exc:
         validate_doc(rejected)
-    assert "nesting exceeds 32 (max 32)" in str(exc.value)
+    assert "nesting exceeds max 32" in str(exc.value)
     with pytest.raises(ValidationError) as model_error:
         ViewDoc.model_validate(rejected)
-    assert "nesting exceeds 32 (max 32)" in str(model_error.value)
+    assert "nesting exceeds max 32" in str(model_error.value)
 
 
 def _deep_object(depth: int) -> dict:
@@ -667,40 +671,59 @@ def _deep_object(depth: int) -> dict:
     return node
 
 
-def _assert_deep_object(value: object, depth: int) -> None:
-    node = value
+def _deep_list(depth: int) -> list:
+    node: list = ["leaf"]
     for _ in range(depth):
-        assert isinstance(node, dict)
-        node = node["n"]
-    assert node == {"leaf": True}
+        node = [node]
+    return node
+
+
+@contextmanager
+def _deadline(seconds: int = 5) -> Iterator[None]:
+    """Fail the test if a walk hangs instead of returning."""
+
+    def _handle(signum: int, frame: object) -> None:
+        raise TimeoutError(f"timed out after {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _handle)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _with_locator_extra(extra: object) -> dict:
+    doc = _paper()
+    doc["affordances"][0]["x"] = {"locator": {"kind": "ax", "extra": extra}}
+    return doc
 
 
 def test_contract_model_validate_deep_values_are_not_recursion_errors() -> None:
     items = _paper()
     items["affordances"][1]["input"]["properties"]["size"] = _items_chain(3000)
-    with pytest.raises(ValidationError) as view_items:
-        ViewDoc.model_validate(items)
-    assert "nesting exceeds 32 (max 32)" in str(view_items.value)
+    with _deadline():
+        with pytest.raises(ValidationError) as view_items:
+            ViewDoc.model_validate(items)
+        assert "nesting exceeds max 32" in str(view_items.value)
 
-    act = _act_result()
-    act["doc"]["affordances"][1]["input"]["properties"]["size"] = _items_chain(3000)
-    with pytest.raises(ValidationError) as act_items:
-        ActResult.model_validate(act)
-    assert "nesting exceeds 32 (max 32)" in str(act_items.value)
+        act = _act_result()
+        act["doc"]["affordances"][1]["input"]["properties"]["size"] = _items_chain(3000)
+        with pytest.raises(ValidationError) as act_items:
+            ActResult.model_validate(act)
+        assert "nesting exceeds max 32" in str(act_items.value)
 
-    located = _paper()
-    located["affordances"][0]["x"] = {"locator": {"kind": "ax", "extra": _deep_object(3000)}}
-    parsed = ViewDoc.model_validate(located)
-    affordance_x = parsed.affordances[0].x
-    assert affordance_x is not None and affordance_x.locator is not None
-    extras = affordance_x.locator.model_extra or {}
-    _assert_deep_object(extras["extra"], 3000)
+        located = _with_locator_extra(_deep_object(3000))
+        with pytest.raises(ValidationError) as view_open:
+            ViewDoc.model_validate(located)
+        assert "nesting exceeds max 64" in str(view_open.value)
 
-    detailed = _act_result()
-    detailed["effect"]["predicted"]["detail"] = _deep_object(3000)
-    parsed_act = ActResult.model_validate(detailed)
-    assert parsed_act.effect is not None
-    _assert_deep_object(parsed_act.effect.predicted.detail, 3000)
+        detailed = _act_result()
+        detailed["effect"]["predicted"]["detail"] = _deep_object(3000)
+        with pytest.raises(ValidationError) as act_open:
+            ActResult.model_validate(detailed)
+        assert "nesting exceeds max 64" in str(act_open.value)
 
 
 def test_contract_validate_args_lets_memory_error_propagate(
@@ -776,3 +799,166 @@ def test_contract_model_strict_act_scalars() -> None:
     }
     with pytest.raises(ValidationError):
         Counters.model_validate(counters)
+
+
+def test_contract_json_value_depth_boundary() -> None:
+    # Locator extra sits 5 container edges below the document. _deep_object(k)
+    # adds k edges, so k=59 is depth 64 and k=60 is depth 65.
+    allowed = _with_locator_extra(_deep_object(59))
+    rejected = _with_locator_extra(_deep_object(60))
+    act = _act_result()
+    act["effect"]["predicted"]["detail"] = _deep_object(61)
+    act_too_deep = _act_result()
+    act_too_deep["effect"]["predicted"]["detail"] = _deep_object(62)
+    with _deadline():
+        _check_json_shape(_deep_object(64))
+        _check_json_shape(_deep_list(64))
+        with pytest.raises(ContractError) as direct:
+            _check_json_shape(_deep_object(65))
+        assert "nesting exceeds max 64" in str(direct.value)
+        with pytest.raises(ContractError) as direct_list:
+            _check_json_shape(_deep_list(65))
+        assert "nesting exceeds max 64" in str(direct_list.value)
+
+        validate_doc(allowed)
+        ViewDoc.model_validate(allowed)
+        validate_effect(act)
+        ActResult.model_validate(act)
+        strip_x(allowed)
+        ablate(allowed)
+        to_flat_tools(allowed)
+        token_counts(allowed)
+
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(rejected)
+        assert "nesting exceeds max 64" in str(doc_error.value)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(rejected)
+        assert "nesting exceeds max 64" in str(model_error.value)
+        with pytest.raises(ContractError) as effect_error:
+            validate_effect(act_too_deep)
+        assert "nesting exceeds max 64" in str(effect_error.value)
+        with pytest.raises(ValidationError) as act_error:
+            ActResult.model_validate(act_too_deep)
+        assert "nesting exceeds max 64" in str(act_error.value)
+        with pytest.raises(ValidationError) as json_error:
+            ViewDoc.model_validate_json(json.dumps(rejected))
+        assert "nesting exceeds max 64" in str(json_error.value)
+
+
+def test_contract_cyclic_open_object_is_rejected() -> None:
+    extra: dict = {}
+    extra["self"] = extra
+    doc = _with_locator_extra(extra)
+    loop: list = []
+    loop.append(loop)
+    act = _act_result()
+    act["effect"]["predicted"]["detail"] = {"loop": loop}
+    with _deadline():
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        assert "repeated container" in str(doc_error.value)
+        with pytest.raises(ValidationError) as view_error:
+            ViewDoc.model_validate(doc)
+        assert "repeated container" in str(view_error.value)
+        with pytest.raises(ContractError) as effect_error:
+            validate_effect(act)
+        assert "repeated container" in str(effect_error.value)
+        with pytest.raises(ValidationError) as act_error:
+            ActResult.model_validate(act)
+        assert "repeated container" in str(act_error.value)
+
+
+def test_contract_shared_references_are_rejected() -> None:
+    node: dict = {"leaf": True}
+    for _ in range(40):
+        node = {"l": node, "r": node}
+    doc = _with_locator_extra(node)
+    act = _act_result()
+    act["effect"]["predicted"]["detail"] = node
+    shared = {"leaf": True}
+    affordance = {"id": "go", "enabled": True, "input": {"type": "object", "properties": {}}}
+    schema_node: dict = {"type": "string"}
+    for _ in range(40):
+        schema_node = {"type": "object", "properties": {"l": schema_node, "r": schema_node}}
+    schema_doc = _paper()
+    schema_doc["affordances"][1]["input"]["properties"]["size"] = schema_node
+    with _deadline():
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        assert "repeated container" in str(doc_error.value)
+        with pytest.raises(ValidationError):
+            ViewDoc.model_validate(doc)
+        with pytest.raises(ValidationError):
+            ActResult.model_validate(act)
+        with pytest.raises(ContractError) as args_error:
+            validate_args(affordance, {"x": shared, "y": shared})
+        assert "repeated container" in str(args_error.value)
+        with pytest.raises(ContractError):
+            validate_doc(schema_doc)
+
+
+def test_contract_transforms_reject_deep_open_object() -> None:
+    doc = _with_locator_extra(_deep_object(3000))
+    with _deadline():
+        for transform in (strip_x, ablate, to_flat_tools, token_counts):
+            with pytest.raises(ContractError) as exc:
+                transform(doc)
+            assert "nesting exceeds max 64" in str(exc.value)
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        assert "nesting exceeds max 64" in str(doc_error.value)
+
+
+@pytest.mark.parametrize(
+    ("value", "detail"),
+    [
+        (set(), "set is not a JSON value"),
+        (b"abc", "bytes is not a JSON value"),
+        (float("nan"), "number must be finite"),
+        (float("inf"), "number must be finite"),
+        ((1, 2), "tuple is not a JSON value"),
+    ],
+)
+def test_contract_open_object_rejects_non_json(value: object, detail: str) -> None:
+    doc = _with_locator_extra({"v": value})
+    affordance = {
+        "id": "go",
+        "enabled": True,
+        "input": {"type": "object", "properties": {"q": {"type": "number"}}},
+    }
+    with _deadline():
+        with pytest.raises(ContractError) as exc:
+            validate_doc(doc)
+        assert detail in str(exc.value)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(doc)
+        assert detail in str(model_error.value)
+        with pytest.raises(ContractError) as args_error:
+            validate_args(affordance, {"q": value})
+        assert detail in str(args_error.value)
+
+
+def test_contract_lone_surrogate_rejected_on_every_path(tmp_path: Path) -> None:
+    doc = _paper()
+    doc["state"]["address"] = "a\ud800b"
+    text = json.dumps(_paper()).replace('"address": ""', '"address": "a\\ud800b"')
+    keyed = _with_locator_extra({"\ud800": "x"})
+    with _deadline():
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        assert "lone surrogate" in str(doc_error.value)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(doc)
+        assert "lone surrogate" in str(model_error.value)
+        with pytest.raises(ValidationError):
+            ViewDoc.model_validate_json(text)
+        with pytest.raises(ContractError) as key_error:
+            validate_doc(keyed)
+        assert "lone surrogate" in str(key_error.value)
+        result = _cli_validate(doc, tmp_path)
+        assert result.exit_code != 0
+        assert isinstance(result.exception, SystemExit)
+        captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
+        assert "Traceback" not in captured
+        assert "lone surrogate" in result.stderr

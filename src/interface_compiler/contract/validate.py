@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Mapping
 from datetime import datetime
@@ -29,6 +30,8 @@ _PATTERN_ECHO_LIMIT = 80
 # jsonschema follows items/$ref recursively and overflows the stack on a
 # chain a few hundred levels deep. Stop before that walk.
 _MAX_SCHEMA_DEPTH = 32
+# Every JSON value, not only items and properties. Depth 64 is allowed.
+_MAX_JSON_DEPTH = 64
 _RFC3339 = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -81,7 +84,13 @@ def validate_args(affordance: object, args: object) -> None:
     if not isinstance(args, dict):
         message = "<root>: args must be a JSON object"
         raise ContractError(message, errors=[message])
+    _check_json_shape(args)
     schema = _input_schema(affordance)
+    depth_errors = _input_nesting_errors(schema, "input")
+    if depth_errors:
+        raise ContractError(depth_errors[0], errors=depth_errors)
+    if isinstance(affordance, dict):
+        _check_json_shape(affordance)
     _ensure_input_schema(schema, "input")
     try:
         validator = Draft202012Validator(schema, format_checker=_format_checker())
@@ -120,9 +129,7 @@ def _input_schema(affordance: object) -> dict[str, Any]:
 
 
 def _validate(name: str, instance: object) -> None:
-    depth_errors = _document_nesting_errors(instance)
-    if depth_errors:
-        raise ContractError(depth_errors[0], errors=depth_errors)
+    _guard_json_document(instance)
     _raise_if_invalid(_validator(name), instance)
     errors = [
         *_exact_id_errors(instance),
@@ -262,29 +269,164 @@ def _echo_pattern(pattern: str) -> str:
 
 def nesting_too_deep(where: str) -> str:
     """Contract message for an items or properties chain past the nesting limit."""
-    return f"{where}: nesting exceeds {_MAX_SCHEMA_DEPTH} (max {_MAX_SCHEMA_DEPTH})"
+    return f"{where}: nesting exceeds max {_MAX_SCHEMA_DEPTH}"
 
 
-def _schema_nesting_errors(node: object, where: str, *, depth: int = 0) -> list[str]:
+def _guard_json_document(instance: object) -> None:
+    """Schema-nesting guard, then the JSON shape gate.
+
+    Items and properties chains report the schema limit of 32. The shape gate
+    then rejects every other value that is not a JSON tree of depth at most 64.
+    """
+    depth_errors = _document_nesting_errors(instance)
+    if depth_errors:
+        raise ContractError(depth_errors[0], errors=depth_errors)
+    _check_json_shape(instance)
+
+
+def _check_json_shape(value: object) -> None:
+    """Reject a value that JSON cannot express.
+
+    Walks with an explicit stack and a permanent ``id`` set. A cycle or any
+    other repeated container is an error. Depth counts container edges from
+    ``value``: 64 is allowed and 65 is not. Scalars are ``str``, ``bool``,
+    ``int``, finite ``float``, and ``None``. Object keys are strings. Lone
+    surrogates are rejected so this matches ``model_validate_json``.
+    """
+    stack: list[tuple[object, int, tuple[str, ...]]] = [(value, 0, ())]
+    seen: set[int] = set()
+    while stack:
+        current, depth, path = stack.pop()
+        if _is_json_scalar(current):
+            _reject_bad_scalar(current, path)
+            continue
+        if isinstance(current, dict):
+            _push_json_object(current, depth, path, seen, stack)
+            continue
+        if isinstance(current, list):
+            _push_json_list(current, depth, path, seen, stack)
+            continue
+        _reject_json_type(current, path)
+
+
+def _json_copy(value: object) -> Any:
+    """Deep-copy a tree that already passed ``_check_json_shape``.
+
+    ``json.dumps`` recurses, which stays inside the stack limit once repeated
+    containers are rejected and nesting is capped at 64.
+    """
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    return json.loads(text)
+
+
+def _is_json_scalar(value: object) -> bool:
+    if value is None or isinstance(value, str | bool):
+        return True
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float)
+
+
+def _reject_bad_scalar(value: object, path: tuple[str, ...]) -> None:
+    if isinstance(value, str):
+        _reject_lone_surrogate(value, path)
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        _json_shape_error(path, "number must be finite")
+
+
+def _reject_lone_surrogate(text: str, path: tuple[str, ...]) -> None:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        _json_shape_error(path, "lone surrogate in string")
+
+
+def _push_json_object(
+    current: dict[object, object],
+    depth: int,
+    path: tuple[str, ...],
+    seen: set[int],
+    stack: list[tuple[object, int, tuple[str, ...]]],
+) -> None:
+    _enter_json_container(current, depth, path, seen)
+    pairs: list[tuple[str, object]] = []
+    for key, item in current.items():
+        if not isinstance(key, str):
+            _json_shape_error(path, f"object key {key!r} is not a string")
+        _reject_lone_surrogate(key, path)
+        pairs.append((key, item))
+    for key, item in reversed(pairs):
+        stack.append((item, depth + 1, path + (key,)))
+
+
+def _push_json_list(
+    current: list[object],
+    depth: int,
+    path: tuple[str, ...],
+    seen: set[int],
+    stack: list[tuple[object, int, tuple[str, ...]]],
+) -> None:
+    _enter_json_container(current, depth, path, seen)
+    indexed = list(enumerate(current))
+    for index, item in reversed(indexed):
+        stack.append((item, depth + 1, path + (str(index),)))
+
+
+def _enter_json_container(
+    current: object, depth: int, path: tuple[str, ...], seen: set[int]
+) -> None:
+    if depth > _MAX_JSON_DEPTH:
+        _json_shape_error(path, f"nesting exceeds max {_MAX_JSON_DEPTH}")
+    identity = id(current)
+    if identity in seen:
+        _json_shape_error(path, "repeated container")
+    seen.add(identity)
+
+
+def _reject_json_type(value: object, path: tuple[str, ...]) -> None:
+    _json_shape_error(path, f"{type(value).__name__} is not a JSON value")
+
+
+def _json_shape_error(path: tuple[str, ...], detail: str) -> None:
+    where = "/".join(path) if path else "<root>"
+    message = f"{where}: {detail}"
+    raise ContractError(message, errors=[message])
+
+
+def _schema_nesting_errors(
+    node: object,
+    where: str,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> list[str]:
     """Reject a schema node more than ``_MAX_SCHEMA_DEPTH`` edges below its property.
 
     ``depth`` is the number of ``items`` or nested ``properties`` edges followed
     to reach ``node``. Depth 32 is allowed. Depth 33 is not. The input object's
     own ``properties`` map is not an edge; callers pass each property at depth 0.
+    A repeated container is left for ``_check_json_shape``; it is not walked twice.
     """
+    if seen is None:
+        seen = set()
     if depth > _MAX_SCHEMA_DEPTH:
         return [nesting_too_deep(where)]
     if not isinstance(node, Mapping):
         return []
+    identity = id(node)
+    if identity in seen:
+        return []
+    seen.add(identity)
     errors: list[str] = []
     properties = node.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
             child_where = f"{where}/properties/{key}"
-            errors.extend(_schema_nesting_errors(child, child_where, depth=depth + 1))
+            errors.extend(_schema_nesting_errors(child, child_where, depth=depth + 1, seen=seen))
     items = node.get("items")
     if isinstance(items, Mapping):
-        errors.extend(_schema_nesting_errors(items, f"{where}/items", depth=depth + 1))
+        errors.extend(_schema_nesting_errors(items, f"{where}/items", depth=depth + 1, seen=seen))
     return errors
 
 
@@ -292,28 +434,37 @@ def _input_nesting_errors(schema: object, where: str) -> list[str]:
     if not isinstance(schema, Mapping):
         return []
     errors: list[str] = []
+    seen: set[int] = set()
     properties = schema.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
             child_where = f"{where}/properties/{key}"
-            errors.extend(_schema_nesting_errors(child, child_where, depth=0))
+            errors.extend(_schema_nesting_errors(child, child_where, depth=0, seen=seen))
     return errors
 
 
 def _document_nesting_errors(instance: object, *, prefix: str = "") -> list[str]:
-    if not isinstance(instance, Mapping):
-        return []
     errors: list[str] = []
-    affordances = instance.get("affordances")
-    if isinstance(affordances, list):
-        for index, item in enumerate(affordances):
-            if not isinstance(item, Mapping):
-                continue
-            where = f"{prefix}affordances/{index}/input"
-            errors.extend(_input_nesting_errors(item.get("input"), where))
-    doc = instance.get("doc")
-    if isinstance(doc, Mapping):
-        errors.extend(_document_nesting_errors(doc, prefix=f"{prefix}doc/"))
+    stack: list[tuple[object, str]] = [(instance, prefix)]
+    seen: set[int] = set()
+    while stack:
+        current, current_prefix = stack.pop()
+        if not isinstance(current, Mapping):
+            continue
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        affordances = current.get("affordances")
+        if isinstance(affordances, list):
+            for index, item in enumerate(affordances):
+                if not isinstance(item, Mapping):
+                    continue
+                where = f"{current_prefix}affordances/{index}/input"
+                errors.extend(_input_nesting_errors(item.get("input"), where))
+        doc = current.get("doc")
+        if isinstance(doc, Mapping):
+            stack.append((doc, f"{current_prefix}doc/"))
     return errors
 
 
@@ -354,11 +505,22 @@ def _input_schema_validator() -> Draft202012Validator:
     return Draft202012Validator(schema, format_checker=_format_checker())
 
 
-def _prop_errors(prop: object, where: str, depth: int = 0) -> list[str]:
+def _prop_errors(
+    prop: object,
+    where: str,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> list[str]:
+    if seen is None:
+        seen = set()
     if depth > _MAX_SCHEMA_DEPTH:
         return [nesting_too_deep(where)]
     if not isinstance(prop, Mapping):
         return []
+    identity = id(prop)
+    if identity in seen:
+        return []
+    seen.add(identity)
     errors: list[str] = []
     pattern = prop.get("pattern")
     if isinstance(pattern, str):
@@ -367,7 +529,7 @@ def _prop_errors(prop: object, where: str, depth: int = 0) -> list[str]:
             errors.append(f"{where}/pattern: {failure}")
     items = prop.get("items")
     if isinstance(items, Mapping):
-        errors.extend(_prop_errors(items, f"{where}/items", depth + 1))
+        errors.extend(_prop_errors(items, f"{where}/items", depth + 1, seen))
     return errors
 
 
