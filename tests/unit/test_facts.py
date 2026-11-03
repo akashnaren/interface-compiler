@@ -1752,6 +1752,22 @@ def test_facts_input_roles_agree_when_the_overlay_stops(
             "<button id='c'><span style='display:none'>Search</span>Pay now</button>",
             "Pay now",
         ),
+        (
+            "<button id='c'>Pay <span aria-hidden='true'>Secret</span></button>",
+            "Pay",
+        ),
+        (
+            "<button id='c'>Pay <span aria-hidden='TRUE'>Secret</span></button>",
+            "Pay",
+        ),
+        (
+            "<button id='c'>Pay <span aria-hidden=' true '>Secret</span></button>",
+            "Pay",
+        ),
+        (
+            "<button id='c'>Save <span aria-hidden='True'>and delete all</span></button>",
+            "Save",
+        ),
     ],
 )
 def test_facts_html_fallback_names_skip_legend_and_hidden_text(

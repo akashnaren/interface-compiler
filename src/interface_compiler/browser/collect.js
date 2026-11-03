@@ -192,7 +192,12 @@
     if (flagHidden.get(el) === true || flagAriaHidden.get(el) === true) {
       return true;
     }
-    if (hasAttribute(el, "hidden") || getAttribute(el, "aria-hidden") === "true") {
+    // Same parse as ariaHiddenState, on this node only. The walk already recurses.
+    const ariaHidden = getAttribute(el, "aria-hidden");
+    if (
+      hasAttribute(el, "hidden") ||
+      (ariaHidden !== null && asciiLower(ariaHidden.trim()) === "true")
+    ) {
       return true;
     }
     if (displayNone.get(el) === true) {
