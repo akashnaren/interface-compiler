@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from interface_compiler.browser.facts import ElementFact, FormFact
 from interface_compiler.contract.models import Locator
+from interface_compiler.extract.lexicon import Lexicon
 from interface_compiler.extract.naming import field_name, slug
 from interface_compiler.mapping.choice import map_choice_group
 from interface_compiler.mapping.enabled import element_enabled
@@ -12,6 +13,7 @@ from interface_compiler.mapping.range import map_range
 from interface_compiler.mapping.select import map_select
 from interface_compiler.mapping.toggle import map_checkbox
 from interface_compiler.mapping.types import (
+    _BEFORE_HARD,
     MapContext,
     MapResult,
     affordance,
@@ -42,21 +44,72 @@ def fill_missing(
     result: MapResult,
     filled: set[str],
     submit: ElementFact | None = None,
+    *,
+    form_disabled: bool = False,
 ) -> MapResult:
-    """Drop a missing-fields reason only after the submit is checked again."""
+    """Re-run the full submit check once every missing field is filled."""
+    lexicon = Lexicon()
     updated: list = []
     for item in result.affordances:
-        reason = item.x.reason if item.x else None
-        if reason and reason.startswith("missing: ") and submit is not None:
-            names = {part.strip() for part in reason.removeprefix("missing: ").split(",")}
-            if names <= filled:
-                enabled, new_reason = element_enabled(submit)
-                extra = item.x.model_copy(update={"reason": new_reason}) if item.x else None
-                updated.append(item.model_copy(update={"enabled": enabled, "x": extra}))
-                continue
-        updated.append(item)
+        extra = item.x
+        reason = extra.reason if extra else None
+        if extra is None or not (reason and reason.startswith("missing: ")):
+            updated.append(item)
+            continue
+        names = {
+            part.strip() for part in reason.removeprefix("missing: ").split(",") if part.strip()
+        }
+        if submit is None or not names <= filled:
+            updated.append(item)
+            continue
+        enabled, new_reason = element_enabled(submit)
+        verb = item.id
+        if lexicon.hard_block(verb) is None:
+            named = lexicon.verb(extra.label or "")
+            if named:
+                verb = named
+        enabled, new_reason = gate_submit(
+            enabled,
+            new_reason,
+            verb=verb,
+            lexicon=lexicon,
+            form_disabled=form_disabled or submit.disabled,
+        )
+        updated.append(
+            item.model_copy(
+                update={
+                    "enabled": enabled,
+                    "x": extra.model_copy(update={"reason": new_reason}),
+                }
+            )
+        )
     result.affordances = updated
     return result
+
+
+def gate_submit(
+    enabled: bool,
+    reason: str | None,
+    *,
+    verb: str | None,
+    lexicon: Lexicon,
+    form_disabled: bool = False,
+    missing: tuple[str, ...] = (),
+    upload: bool = False,
+) -> tuple[bool, str | None]:
+    """Hard-block beats a missing field. ``form.disabled`` sticks either way."""
+    if upload:
+        return False, "hard-blocked in v1: upload"
+    enabled, reason = apply_hard_block(enabled, reason, verb, lexicon)
+    if reason and (reason.startswith("hard-blocked") or reason in _BEFORE_HARD):
+        return False, reason
+    if not enabled:
+        return False, reason
+    if form_disabled:
+        return False, "disabled"
+    if missing:
+        return False, "missing: " + ", ".join(missing)
+    return True, None
 
 
 def _field_grain_result(
@@ -72,20 +125,25 @@ def _field_grain_result(
     for element in controls:
         if element.role == "radio":
             radios.setdefault(element.group_key or element.name or "choice", []).append(element)
+        elif _numeric(element):
+            parts.append(map_range(element, ctx))
         elif element.tag == "select" or element.role in {"combobox", "listbox"}:
             parts.append(map_select(element, ctx))
         elif element.role in {"checkbox", "switch"}:
             parts.append(map_checkbox(element, ctx))
-        elif element.role in {"slider", "spinbutton"} or element.input_type in {"range", "number"}:
-            parts.append(map_range(element, ctx))
     for group in radios.values():
         parts.append(map_choice_group(group, ctx))
     if submit is not None and verb:
-        gated = login_gated(submit, ctx, verb) or ctx.lexicon.login_target(form.action)
-        enabled, reason = element_enabled(submit, login_gated=gated, missing=tuple(missing))
-        if enabled and form.disabled:
-            enabled, reason = False, "disabled"
-        enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
+        gated = _form_login(submit, form.action, ctx, verb)
+        enabled, reason = element_enabled(submit, login_gated=gated)
+        enabled, reason = gate_submit(
+            enabled,
+            reason,
+            verb=verb,
+            lexicon=ctx.lexicon,
+            form_disabled=form.disabled,
+            missing=tuple(missing),
+        )
         parts.append(
             MapResult(
                 affordances=[
@@ -140,22 +198,23 @@ def _form_grain_result(
     else:
         affordance_id = "submit_" + (_form_slug(form, controls) or "form")
     label = submit.name if submit else affordance_id
-    gated = ctx.lexicon.login_target(form.action) or (
-        submit is not None and login_gated(submit, ctx, affordance_id)
-    )
+    upload = any(element.input_type == "file" for element in controls)
+    gated = _form_login(submit, form.action, ctx, affordance_id)
+    if affordance_id == "go_sign_in":
+        gated = False
     if submit is not None:
-        enabled, reason = element_enabled(
-            submit, login_gated=gated and affordance_id != "go_sign_in"
-        )
+        enabled, reason = element_enabled(submit, login_gated=gated)
     else:
-        enabled, reason = _form_enabled(
-            form, controls, login_gated=gated and affordance_id != "go_sign_in"
-        )
-    if enabled and form.disabled:
-        enabled, reason = False, "disabled"
-    enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
-    if any(element.input_type == "file" for element in controls):
-        enabled, reason = False, "hard-blocked in v1: upload"
+        enabled, reason = _form_enabled(form, controls, login_gated=gated)
+    enabled, reason = gate_submit(
+        enabled,
+        reason,
+        verb=verb,
+        lexicon=ctx.lexicon,
+        form_disabled=form.disabled,
+        upload=upload,
+    )
+    if upload:
         verb = "upload"
     # A POST search still mutates. Only a GET search is safe.
     if search and form.method == "get":
@@ -203,10 +262,33 @@ def _field_grain(controls: list[ElementFact], verb: str | None) -> bool:
     return not any(_free_text(element) for element in controls)
 
 
+def _numeric(element: ElementFact) -> bool:
+    return element.input_type in {"range", "number"} or element.role in {"slider", "spinbutton"}
+
+
 def _free_text(element: ElementFact) -> bool:
+    if _numeric(element):
+        return False
     if element.tag == "textarea":
         return True
     return element.input_type in _FREE or element.role in {"textbox", "searchbox"}
+
+
+def _form_login(
+    submit: ElementFact | None,
+    action: str,
+    ctx: MapContext,
+    affordance_id: str,
+) -> bool:
+    if submit is not None and login_gated(submit, ctx, affordance_id, action=action):
+        return True
+    return ctx.lexicon.login_target(
+        action,
+        account_action=ctx.lexicon.account_action(
+            label=submit.name if submit else "",
+            url=action,
+        ),
+    )
 
 
 def _missing(form: FormFact, controls: list[ElementFact]) -> list[str]:
@@ -252,7 +334,24 @@ def _form_enabled(
         return False, "disabled"
     if login_gated:
         return False, "requires sign-in"
+    blocked = _unusable_fields(fields)
+    if blocked:
+        return False, blocked
     return True, None
+
+
+def _unusable_fields(fields: list[ElementFact]) -> str | None:
+    """No submitter: every hidden, disabled, or aria-disabled field blocks the form."""
+    if not fields:
+        return None
+    first: str | None = None
+    for element in fields:
+        enabled, reason = element_enabled(element)
+        if enabled:
+            return None
+        if first is None:
+            first = reason or "disabled"
+    return first
 
 
 def _is_submit(element: ElementFact) -> bool:

@@ -167,8 +167,10 @@ def test_long_line_does_not_fail_close_a_later_button(facts_page: Page) -> None:
     facts = collect_facts(facts_page)
     by_id = {element.html_id: element for element in facts.elements}
     # a0 and a2 are inside the 12-hit budget. a0 sits on the mask.
+    # a20 is past that budget, so the hit test fails closed.
     assert by_id["a0"].covered is True
     assert by_id["a2"].covered is False
+    assert by_id["a20"].covered is True
     assert by_id["clear"].covered is False
 
 
@@ -213,3 +215,32 @@ finally:
         timeout=90,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_shadow_hit_test_covers_the_light_button(facts_page: Page) -> None:
+    facts_page.set_content(
+        "<style>body{margin:0}</style>"
+        "<button id='under' style='position:absolute;left:0;top:0;width:80px;height:24px'>Under</button>"
+        "<div><template shadowrootmode='open'>"
+        "<div style='position:fixed;top:0;left:0;width:80px;height:24px'></div></template></div>"
+        "<div style='position:absolute;top:48px'>"
+        "<template shadowrootmode='open'>"
+        "<button id='in' type='button' style='width:80px;height:24px'>Inside</button>"
+        "</template></div>",
+        wait_until="domcontentloaded",
+    )
+    facts = collect_facts(facts_page)
+    by_id = {item.html_id: item for item in facts.elements}
+    assert by_id["under"].covered is True
+    assert by_id["in"].covered is False
+
+
+def test_truncated_page_omits_open_shadow_controls(facts_page: Page) -> None:
+    facts_page.set_content(
+        "<div></div>" * 8001
+        + "<div><template shadowrootmode='open'><button type='button'>Inside</button></template></div>",
+        wait_until="domcontentloaded",
+    )
+    facts = collect_facts(facts_page)
+    assert facts.truncated is True
+    assert "Inside" not in {item.name for item in facts.elements}

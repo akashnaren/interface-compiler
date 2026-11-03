@@ -1085,17 +1085,78 @@
     if (!modals.length) {
       return null;
     }
-    const hit = hitTarget(1, 1);
-    let node = hit;
-    const seen = new Set();
-    while (node && !seen.has(node)) {
-      if (modals.includes(node)) {
-        return node;
+    // Hit-test each dialog at its own center (or its first control). The
+    // dialog that contains that hit is a candidate. Never sample (1, 1).
+    const hits = [];
+    for (let index = 0; index < modals.length; index += 1) {
+      const modal = modals[index];
+      const point = modalPoint(modal);
+      if (!point) {
+        continue;
       }
-      seen.add(node);
-      node = parentNodeAcross(node);
+      const target = hitTarget(point.x, point.y);
+      if (target && nodeInside(modal, target)) {
+        hits.push(modal);
+      }
     }
-    return modals[modals.length - 1];
+    return highestModal(hits.length ? hits : modals);
+  }
+
+  function modalPoint(modal) {
+    const center = clippedPoint(boundingRect(modal));
+    if (center) {
+      return center;
+    }
+    let control = null;
+    try {
+      control = query(modal, "button, a[href], input, select, textarea, [role='button']");
+    } catch (error) {
+      control = null;
+    }
+    if (!control) {
+      return null;
+    }
+    return clippedPoint(boundingRect(control));
+  }
+
+  function nodeInside(modal, node) {
+    let current = node;
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      if (current === modal) {
+        return true;
+      }
+      seen.add(current);
+      current = parentNodeAcross(current);
+    }
+    return false;
+  }
+
+  function highestModal(modals) {
+    let best = modals[0];
+    let bestRank = modalRank(best, 0);
+    for (let index = 1; index < modals.length; index += 1) {
+      const rank = modalRank(modals[index], index);
+      if (rank >= bestRank) {
+        best = modals[index];
+        bestRank = rank;
+      }
+    }
+    return best;
+  }
+
+  function modalRank(modal, index) {
+    let z = 0;
+    try {
+      const value = Number(getComputedStyle(modal).zIndex);
+      if (Number.isFinite(value)) {
+        z = value;
+      }
+    } catch (error) {
+      z = 0;
+    }
+    // Later DOM order wins a tie. That is the topmost paint order.
+    return z * 100000 + index;
   }
 
   function inTopModal(el) {
@@ -1896,21 +1957,9 @@
     keptAt.set(kept[index], index);
   }
   function fieldsetDisabled(form) {
-    if (closestAcross(form, "fieldset[disabled]") !== null) {
-      return true;
-    }
-    let controls;
-    try {
-      controls = queryAll(form, "input, select, textarea, button");
-    } catch (error) {
-      return true;
-    }
-    for (let index = 0; index < controls.length; index += 1) {
-      if (closestAcross(controls[index], "fieldset[disabled]") !== null) {
-        return true;
-      }
-    }
-    return false;
+    // A disabled fieldset disables the controls inside it, not the whole form.
+    // The form is disabled only when the form element itself sits in one.
+    return closestAcross(form, "fieldset[disabled]") !== null;
   }
   const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map(
     (form, index) => {

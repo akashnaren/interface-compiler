@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 from interface_compiler.extract.naming import normalize_label
 
@@ -32,7 +32,7 @@ _MUTATING = frozenset(
 )
 _VERBS: tuple[tuple[str, str], ...] = (
     ("pay", r"pay(?: now)?|complete (?:purchase|payment)|submit payment"),
-    ("place_order", r"place (?:my )?order|confirm (?:order|purchase)|buy now|purchase"),
+    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy now|purchase"),
     ("delete", r"delete|remove (?:account|address|card)|close account"),
     ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
     ("add_to_cart", r"add to (?:cart|bag|basket|trolley)"),
@@ -73,7 +73,7 @@ _VERBS: tuple[tuple[str, str], ...] = (
 )
 _HARD_LABELS: tuple[tuple[str, str], ...] = (
     ("pay", r"pay(?: now)?|complete (?:purchase|payment)|submit payment"),
-    ("place_order", r"place (?:my )?order|confirm (?:order|purchase)|buy now|purchase"),
+    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy now|purchase"),
     ("delete", r"delete|remove (?:account|address|card)|close account"),
     ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
     ("upload", r"upload"),
@@ -100,6 +100,23 @@ _VIEWS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 _LOGIN_PATH = re.compile(r"(?:^|/)(?:login|signin|sign-in|account/login|auth|session/new)(?:/|$)")
 _LOGIN_LABEL = re.compile(r"^(?:(?:sign|log) ?in to |login required|members only|account required)")
+_LOGIN_HINT = re.compile(r"(?:(?:sign|log) ?in to |login required|members only|account required)")
+# Social and account verbs, plus the same words when they are the URL path.
+_ACCOUNT = frozenset(
+    {
+        "vote",
+        "like",
+        "follow",
+        "comment",
+        "save",
+        "reply",
+        "flag",
+        "subscribe",
+        "register",
+        "book",
+        "reserve",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,22 +164,48 @@ class Lexicon:
     def login_label(self, label: str) -> bool:
         return _LOGIN_LABEL.search(normalize_label(label)) is not None
 
-    def login_target(self, url: str) -> bool:
-        parsed = urlsplit(url)
-        if _LOGIN_PATH.search(parsed.path or ""):
+    def login_hint(self, text: str) -> bool:
+        """Unanchored sign-in hint for title and aria-describedby text."""
+        return _LOGIN_HINT.search(normalize_label(text)) is not None
+
+    def account_action(self, *, label: str = "", url: str = "") -> bool:
+        """True for vote/like/follow/comment/save/reply/flag and similar verbs."""
+        verb = self.verb(label) if label else None
+        if verb in _ACCOUNT:
             return True
-        # next/goto/redirect that points back at this site, not only at /login.
+        parts = [part.casefold() for part in urlsplit(url).path.split("/") if part]
+        return any(part in _ACCOUNT for part in parts)
+
+    def login_target(self, url: str, *, account_action: bool = False) -> bool:
+        """A redirect gates when its path is a login route, on any host.
+
+        An account-action link or form also gates when the param points back
+        at this site. Other relative values, including ``next=/products``, do not.
+        """
+        parsed = urlsplit(url)
+        if _login_path(parsed.path):
+            return True
         for key, value in parse_qsl(parsed.query, keep_blank_values=False):
             if key.lower() not in _REDIRECT or not value:
                 continue
             target = urlsplit(value)
-            if target.scheme or target.netloc:
-                if target.netloc == parsed.netloc:
-                    return True
-                continue
-            return True
+            if _login_path(target.path):
+                return True
+            if account_action and _points_back(parsed, target):
+                return True
         return False
 
 
 def _strip_amounts(text: str) -> str:
     return " ".join(part for part in text.split() if _AMOUNT.fullmatch(part) is None)
+
+
+def _login_path(path: str) -> bool:
+    return _LOGIN_PATH.search(path or "") is not None
+
+
+def _points_back(page: SplitResult, target: SplitResult) -> bool:
+    """Relative targets and same-host absolute targets point at this site."""
+    if target.scheme or target.netloc:
+        return bool(page.netloc) and target.netloc.casefold() == page.netloc.casefold()
+    return True

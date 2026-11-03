@@ -149,19 +149,30 @@ def link_id(element: ElementFact, ctx: MapContext) -> str:
     return f"go_{text}"
 
 
-def login_gated(element: ElementFact, ctx: MapContext, affordance_id: str) -> bool:
+# These element reasons outrank a hard block. Disabled and missing do not.
+_BEFORE_HARD = frozenset({"not visible", "aria-disabled", "inert", "covered", "requires sign-in"})
+
+
+def login_gated(
+    element: ElementFact,
+    ctx: MapContext,
+    affordance_id: str,
+    *,
+    action: str | None = None,
+) -> bool:
     if affordance_id == "go_sign_in" or ctx.signed_in:
         return False
-    texts = (
-        element.name,
-        element.label_text,
-        element.title,
-        element.described_by,
-    )
-    if any(text and ctx.lexicon.login_label(text) for text in texts):
+    if any(text and ctx.lexicon.login_label(text) for text in (element.name, element.label_text)):
         return True
-    for target in (element.href, element.form_action):
-        if target and ctx.lexicon.login_target(target):
+    if any(text and ctx.lexicon.login_hint(text) for text in (element.title, element.described_by)):
+        return True
+    seen: list[str] = []
+    for target in (element.href, element.form_action, action):
+        if not target or target in seen:
+            continue
+        seen.append(target)
+        account = ctx.lexicon.account_action(label=element.name, url=target)
+        if ctx.lexicon.login_target(target, account_action=account):
             return True
     return False
 
@@ -173,11 +184,11 @@ def apply_hard_block(
     lexicon: Lexicon,
 ) -> tuple[bool, str | None]:
     blocked = lexicon.hard_block(verb)
-    if blocked and enabled:
-        return False, blocked
-    if blocked and reason is None:
-        return False, blocked
-    return enabled, reason
+    if not blocked:
+        return enabled, reason
+    if reason in _BEFORE_HARD:
+        return False, reason
+    return False, blocked
 
 
 def normalize(text: str) -> str:

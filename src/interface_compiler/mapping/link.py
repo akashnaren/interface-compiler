@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import base64
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from interface_compiler.browser.facts import ElementFact
 from interface_compiler.contract.models import Locator
 from interface_compiler.extract.naming import plural, slug
 from interface_compiler.extract.repeats import RepeatGroup
-from interface_compiler.mapping.enabled import element_enabled, group_enabled
+from interface_compiler.mapping.enabled import element_enabled
 from interface_compiler.mapping.types import (
     MapContext,
     MapResult,
@@ -28,7 +28,7 @@ def map_link(element: ElementFact, ctx: MapContext) -> MapResult:
     affordance_id = link_id(element, ctx)
     gated = login_gated(element, ctx, affordance_id)
     enabled, reason = element_enabled(element, login_gated=gated)
-    tag = "safe"
+    tag = _link_tag(element, ctx)
     return MapResult(
         affordances=[
             affordance(
@@ -48,17 +48,24 @@ def map_link(element: ElementFact, ctx: MapContext) -> MapResult:
 def map_link_groups(groups: list[RepeatGroup], ctx: MapContext) -> MapResult:
     """One ``open_<entity>`` per entity type. Secondary links stay off unless asked."""
     by_entity: dict[str, list[tuple[ElementFact, list[ElementFact]]]] = {}
+    by_action: dict[str, list[tuple[ElementFact, list[ElementFact]]]] = {}
     for group in groups:
         for item in group.items:
             links = [element for element in item.elements if _is_link(element)]
             if not links:
                 continue
             primary = _primary(links)
+            action = _account_verb(primary, ctx)
+            if action:
+                by_action.setdefault(action, []).append((primary, links))
+                continue
             entity = _entity_name(primary.href or "")
             by_entity.setdefault(entity, []).append((primary, links))
     result = MapResult()
     for entity, rows in by_entity.items():
-        result = _merge_entity(result, entity, rows, ctx)
+        result = _merge_entity(result, entity, rows, ctx, action=None)
+    for action, rows in by_action.items():
+        result = _merge_entity(result, action, rows, ctx, action=action)
     return result
 
 
@@ -73,27 +80,42 @@ def _merge_entity(
     entity: str,
     rows: list[tuple[ElementFact, list[ElementFact]]],
     ctx: MapContext,
+    *,
+    action: str | None,
 ) -> MapResult:
     records: list[dict[str, object]] = []
     seen: set[str] = set()
     secondaries: dict[str, ElementFact] = {}
+    skipped: list[str] = []
     landmark = ""
-    for primary, links in rows:
-        record_id = _record_id(primary)
-        if record_id in seen:
-            continue
-        seen.add(record_id)
-        records.append({"id": record_id, "name": primary.name})
+    affordance_id = action or f"open_{entity}"
+    for index, (primary, links) in enumerate(rows):
+        gated = login_gated(primary, ctx, affordance_id)
+        enabled, reason = element_enabled(primary, login_gated=gated)
         landmark = landmark or primary.landmark
         for link in links:
             if link is primary:
                 continue
             key = _secondary_slug(primary, link)
             secondaries.setdefault(key, link)
+        if not enabled:
+            if reason:
+                skipped.append(reason)
+            continue
+        record_id = _record_id(primary, index, seen)
+        seen.add(record_id)
+        records.append({"id": record_id, "name": primary.name})
+    if records:
+        enabled, reason = True, None
+    elif "requires sign-in" in skipped:
+        enabled, reason = False, "requires sign-in"
+    elif skipped:
+        enabled, reason = False, skipped[0]
+    else:
+        enabled, reason = False, "not visible"
     key = plural(entity)
-    window, cursor = _window(records, 0)
-    enabled, reason = _group_enabled(rows)
     prop = f"{entity}_id"
+    tag = "mutating" if action else "safe"
     locator = Locator.model_validate(
         {
             "kind": "repeat",
@@ -106,38 +128,45 @@ def _merge_entity(
     )
     result.affordances.append(
         affordance(
-            f"open_{entity}",
+            affordance_id,
             enabled=enabled,
             schema=input_schema({prop: {"type": "string"}}, [prop]),
             label=entity,
             locator=locator,
             grain="collapsed",
-            tag="safe",
+            tag=tag,
             reason=reason,
-            signature=stable_signature("link-group", entity, landmark),
+            signature=stable_signature("link-group", affordance_id, landmark),
         )
     )
-    result.entities[key] = window
-    result.catalog[key] = records
-    result.entities_from[key] = "repeat"
-    result.page[key] = cursor
+    if records:
+        window, cursor = _window(records, 0)
+        result.entities[key] = window
+        result.catalog[key] = records
+        result.entities_from[key] = "repeat"
+        result.page[key] = cursor
     for slug_key, link in secondaries.items():
+        if action:
+            continue
         token = f"{entity}.{slug_key}"
         wanted = (
             token in ctx.include_secondary or f"open_{entity}_{slug_key}" in ctx.include_secondary
         )
         if not wanted:
             continue
+        secondary_id = f"open_{entity}_{slug_key}"
+        sec_gated = login_gated(link, ctx, secondary_id)
+        sec_enabled, sec_reason = element_enabled(link, login_gated=sec_gated)
         result.affordances.append(
             affordance(
-                f"open_{entity}_{slug_key}",
-                enabled=enabled,
+                secondary_id,
+                enabled=sec_enabled,
                 schema=input_schema({prop: {"type": "string"}}, [prop]),
                 label=link.name,
                 locator=ax_locator(link, kind="repeat", item_key="href"),
                 grain="collapsed",
-                tag="safe",
-                reason=reason,
+                tag=_link_tag(link, ctx),
+                reason=sec_reason,
                 signature=stable_signature("secondary", entity, slug_key, landmark),
             )
         )
@@ -165,12 +194,6 @@ def _decode(cursor: str) -> tuple[str, int]:
     return _kind, int(offset)
 
 
-def _group_enabled(
-    rows: list[tuple[ElementFact, list[ElementFact]]],
-) -> tuple[bool, str | None]:
-    return group_enabled([item for item, _links in rows])
-
-
 def _is_link(element: ElementFact) -> bool:
     return element.tag == "a" or element.role == "link"
 
@@ -194,11 +217,45 @@ def _entity_name(href: str) -> str:
     return "item"
 
 
-def _record_id(element: ElementFact) -> str:
-    parts = [part for part in urlsplit(element.href or "").path.split("/") if part]
-    if parts:
-        return parts[-1]
-    return slug(element.name) or "item"
+def _record_id(element: ElementFact, index: int, seen: set[str]) -> str:
+    """Last path segment, plus the query id when that segment is shared."""
+    parsed = urlsplit(element.href or "")
+    parts = [part for part in parsed.path.split("/") if part]
+    base = parts[-1] if parts else (slug(element.name) or "item")
+    query_id = ""
+    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+        if key.lower() == "id" and value:
+            query_id = value
+            break
+    if query_id:
+        candidate = query_id
+    elif parsed.query:
+        candidate = f"{base}-{slug(parsed.query) or index}"
+    else:
+        candidate = base
+    if candidate in seen:
+        candidate = f"{candidate}-{index}"
+    return candidate
+
+
+def _account_verb(element: ElementFact, ctx: MapContext) -> str | None:
+    label = ctx.lexicon.verb(element.name)
+    if label and ctx.lexicon.account_action(label=element.name):
+        return label
+    parts = [part.casefold() for part in urlsplit(element.href or "").path.split("/") if part]
+    for part in parts:
+        if ctx.lexicon.account_action(url=f"/{part}"):
+            return part
+    return None
+
+
+def _link_tag(element: ElementFact, ctx: MapContext) -> str:
+    verb = ctx.lexicon.verb(element.name)
+    if verb:
+        return ctx.lexicon.tag(verb)
+    if ctx.lexicon.account_action(url=element.href or ""):
+        return "mutating"
+    return "safe"
 
 
 def _secondary_slug(primary: ElementFact, link: ElementFact) -> str:

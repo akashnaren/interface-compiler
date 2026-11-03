@@ -60,6 +60,8 @@ def property_for(element: ElementFact) -> dict[str, object] | None:
     role = element.role
     if kind in {"file", "hidden", "submit", "reset", "image", "button"}:
         return None
+    if role in {"slider", "spinbutton"} or kind in {"range", "number"}:
+        return _numeric(element)
     if role in {"checkbox", "switch"} or kind == "checkbox":
         return {"type": "boolean"}
     if element.tag == "select" or role in {"listbox", "combobox"} and element.options:
@@ -76,8 +78,6 @@ def property_for(element: ElementFact) -> dict[str, object] | None:
         if values:
             return {"type": "string", "enum": values}
         return {"type": "string"}
-    if role in {"slider", "spinbutton"} or kind in {"range", "number"}:
-        return _numeric(element)
     prop: dict[str, object] = {"type": "string"}
     if kind == "email":
         prop["format"] = "email"

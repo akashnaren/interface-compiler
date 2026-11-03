@@ -359,7 +359,7 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
                 "expression": _collect_source(deadline_s, started),
                 "contextId": context_id,
                 "returnByValue": False,
-                "timeout": _EVAL_TIMEOUT_MS,
+                "timeout": max(_EVAL_TIMEOUT_MS, int(deadline_s * 1000)),
                 "objectGroup": _NODE_GROUP,
             },
         )

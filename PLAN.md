@@ -456,7 +456,7 @@ Each look runs these steps in order. Rules decide structure, `enabled`, and sche
      - `skeleton_path` (tag+role path for the repeat detector);
      - `label_text` (`<label for>`, wrapping label, `aria-labelledby`, placeholder, `legend`);
      - `group_key` (radio `name`, `role=radiogroup` parent, `fieldset`, toolbar of `aria-pressed` chips).
-   - Also capture an open modal: `<dialog open>` with `:modal`, or `[role=dialog|alertdialog][aria-modal=true]` that is visible.
+   - Also capture an open modal: `<dialog open>` with `:modal`, or `[role=dialog|alertdialog][aria-modal=true]` that is visible. The top modal is the dialog whose own center (or first control) hit-tests inside itself, then the highest z-order; the corner point `(1, 1)` is not used. Closed shadow roots are a v1 limit: the collector cannot read them, so controls that exist only in a closed root are omitted even when the accessibility tree lists them.
 4. **Structured data.**
    - `extruct` on `page.content()` for JSON-LD and microdata, yielding typed objects and `potentialAction`.
    - WebMCP: `webmcp_shim.js` is added with `context.add_init_script`. It wraps `document.modelContext` and `navigator.modelContext`, both the `registerTool` and the `provideContext({tools})` forms, recording `{name, description, inputSchema, annotations}` and keeping `execute` callable through `window.__icWebMCP.call(name, args)`. The builder confirms the API surface against the current proposal (§15 item 3).
@@ -662,7 +662,7 @@ A data module, not code paths. Each entry is canonical verb → regex list over 
 
 - Hard-block verbs (§7.1), matched first:
   - `pay`: `pay( now)?`, `complete (purchase|payment)`, `submit payment`;
-  - `place_order`: `place (my )?order`, `confirm (order|purchase)`, `buy now`, `purchase`;
+  - `place_order`: `place (my |your )?order`, `confirm (order|purchase)`, `buy now`, `purchase`;
   - `checkout_submit`: a form submit on a `checkout` view;
   - `delete`: `delete`, `remove (account|address|card)`, `close account`;
   - `send`: `send( message)?`, `post( comment| reply)?`, `publish`, `tweet`, `submit (review|comment)`.
@@ -692,7 +692,7 @@ A data module, not code paths. Each entry is canonical verb → regex list over 
 - Counter lexicon: `cart|bag|basket|trolley`→`cart_count`, `notifications?|alerts?`→`notification_count`, `messages?|inbox`→`message_count`.
 - Login-gate lexicon (R2):
   - labels: `^(sign|log) ?in to `, `login required`, `members only`, `account required`;
-  - login routes: `/login`, `/signin`, `/sign-in`, `/account/login`, `/auth`, `/session/new`, or any path with a `next=`/`return(To|_to|Url)=`/`redirect=` param pointing back to this site.
+  - login routes: `/login`, `/signin`, `/sign-in`, `/account/login`, `/auth`, `/session/new`; a `next`/`return`/`return_to`/`returnTo`/`returnUrl`/`redirect`/`goto` param gates only when its target path is one of those routes on any host, or the link or form is an account-action verb (vote, like, follow, comment, save, reply, flag, and similar) and the param points back to this site.
 - Flow-step lexicon (R5):
   - ids `set_address`, `set_shipping*`, `set_delivery*`, `set_billing*`, `set_payment*`, `set_card*`, `apply_coupon`, `pay`, `place_order`, `checkout_submit`, `continue_to_*`, `next_step`, `confirm_*`, `review_order`;
   - any affordance first seen on a view in `{cart, checkout, payment, shipping, review, confirmation}` whose `x.grain` is `field` or `form`.

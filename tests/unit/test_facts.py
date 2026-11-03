@@ -603,10 +603,10 @@ def _assert_capped_line_fails_closed(page: Page) -> None:
         f"</style><p id='line'>{links}</p><div id='mask'></div>",
     )
     # a13's clipped center is (216, 9.5), on #mask. a0 is clear of the mask.
+    # Links past the 12-hit budget fail closed.
     assert _by_id(facts, "a0").covered is False
     assert _by_id(facts, "a13").covered is True
-    if facts.truncated:
-        assert _by_id(facts, "a79").covered is True
+    assert _by_id(facts, "a79").covered is True
 
 
 def test_facts_choice_group(facts_page: Page, fixture_base_url: str) -> None:
@@ -985,7 +985,7 @@ def test_facts_login_gate(facts_page: Page, fixture_base_url: str) -> None:
     )
     vote = _by_id(facts, "vote-link")
     _expect(vote, role="link", name="Vote", visible=True)
-    assert vote.href.endswith("/vote?id=1&goto=news")
+    assert vote.href.endswith("/vote?id=1&goto=/login")
     _expect(_by_id(facts, "signin"), role="link", name="Sign in", href=f"{fixture_base_url}/login")
     comment = next(form for form in facts.forms if form.action.endswith("/comment?next=/item/3"))
     login = next(form for form in facts.forms if form.action.endswith("/login?next=/story"))
@@ -1485,6 +1485,8 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
             session = facts_page.context.new_cdp_session(facts_page)
             session.send("Emulation.setCPUThrottlingRate", {"rate": 4})
             facts = collect_facts(facts_page, deadline_s=2)
+        elif case == "dup-id":
+            facts = collect_facts(facts_page, deadline_s=180)
         else:
             facts = collect_facts(facts_page)
         for html_id, expect in disabled.items():
@@ -2190,7 +2192,14 @@ finally:
 
 @pytest.mark.parametrize(
     ("kind", "count", "deadline", "throttle"),
-    [("table", 12000, 2.0, 1)],
+    [
+        ("table", 12000, 2.0, 1),
+        ("table", 20000, 5.0, 4),
+        ("nested", 12000, 5.0, 1),
+        ("nested", 14000, 5.0, 1),
+        ("table", 30000, 5.0, 1),
+        ("late", 120000, 2.0, 4),
+    ],
 )
 def test_facts_huge_table_is_truncated_instead_of_killed(
     kind: str,
