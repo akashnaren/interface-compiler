@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Fields</title>
+</head>
+<body>
+
+  <main aria-label="Product">
+    <form id="fields" method="get" action="/fields">
+      <label>Email <input id="email" type="email" name="email" required></label>
+      <label>Site <input id="site" type="url" name="site"></label>
+      <label>Qty <input id="qty" type="number" name="qty" min="1" max="9" step="1"></label>
+      <label>When <input id="when" type="date" name="when"></label>
+      <label>Phone <input id="tel" type="tel" name="tel"></label>
+      <label>Code <input id="code" type="text" name="code" pattern="[A-Z]{3}" minlength="3" maxlength="3"></label>
+      <label>Note <textarea id="note" name="note"></textarea></label>
+      <label>Lock <input id="lock" type="text" name="lock" readonly value="fixed"></label>
+    </form>
+  </main>
+
+</body>
+</html>

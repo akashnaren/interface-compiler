@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sort</title>
+</head>
+<body>
+
+  <main aria-label="Catalog">
+    <button id="sort" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="sort-menu">Sort by</button>
+    <div id="sort-menu" role="menu" hidden>
+      <div id="sort-newest" role="menuitemradio" aria-checked="true">Newest</div>
+      <div id="sort-price" role="menuitemradio" aria-checked="false">Price</div>
+    </div>
+    <button id="sort-open" type="button" aria-haspopup="menu" aria-expanded="true" aria-controls="open-menu">Sort by</button>
+    <div id="open-menu" role="menu">
+      <div id="open-newest" role="menuitemradio" aria-checked="false">Newest</div>
+      <div id="open-price" role="menuitemradio" aria-checked="true">Price</div>
+    </div>
+    <label for="native">Size</label>
+    <select id="native" name="size">
+      <option value="new">Newest</option>
+      <option value="price">Price</option>
+    </select>
+  </main>
+
+</body>
+</html>

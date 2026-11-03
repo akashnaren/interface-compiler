@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from playwright.sync_api import Error as PlaywrightError
 
 from interface_compiler import __version__
+from interface_compiler.browser.engine import Engine
+from interface_compiler.browser.raw import raw_snapshot
 from interface_compiler.contract.validate import (
     ContractError,
     UnknownSchemaError,
@@ -88,3 +91,38 @@ def validate_command(
         typer.echo(nesting_too_deep("document"), err=True)
         raise typer.Exit(1) from exc
     typer.echo("valid")
+
+
+def _short_playwright_error(exc: PlaywrightError) -> str:
+    text = str(exc).splitlines()[0] if str(exc) else "page load failed"
+    if len(text) > 200:
+        return f"{text[:199]}…"
+    return text
+
+
+@app.command("raw")
+def raw_command(
+    url: Annotated[str, typer.Argument(help="Page to snapshot.")],
+) -> None:
+    """Print the Playwright aria snapshot for a URL.
+
+    The browser is closed before this process exits. Leaving Chromium running
+    would keep the command from finishing.
+    """
+    engine = Engine()
+    page = None
+    try:
+        engine.start()
+        page = engine.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        text = raw_snapshot(page)
+    except PlaywrightError as exc:
+        typer.echo(_short_playwright_error(exc), err=True)
+        raise typer.Exit(1) from exc
+    finally:
+        try:
+            if page is not None:
+                page.context.close()
+        finally:
+            engine.close()
+    sys.stdout.write(text if text.endswith("\n") else f"{text}\n")

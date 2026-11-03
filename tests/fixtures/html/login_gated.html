@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Story</title>
+</head>
+<body>
+
+  <main aria-label="Story">
+    <button id="vote" type="button">Log in to vote</button>
+    <a id="vote-link" href="/vote?id=1&amp;goto=/login">Vote</a>
+    <form id="login" method="post" action="/login?next=/story">
+      <label for="email">Email</label>
+      <input id="email" type="email" name="email" required>
+      <button type="submit">Continue</button>
+    </form>
+    <a id="signin" href="/login">Sign in</a>
+  </main>
+
+</body>
+</html>
