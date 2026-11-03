@@ -13,6 +13,7 @@ from playwright.sync_api import Page
 
 from interface_compiler.browser.engine import USER_AGENT_SUFFIX, Engine
 from interface_compiler.browser.facts import (
+    _COLLECT_SOURCE,
     Constraints,
     ElementFact,
     FactCollectionError,
@@ -276,47 +277,105 @@ def test_facts_buttons(facts_page: Page, fixture_base_url: str) -> None:
 
 
 def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
-    # 40px links on one line. C is covered and . is not. The rows are the full
-    # bar, the first of a pair, a solo mask, the middle link, and partial bars.
+    # 40px targets. C is covered. Fixed bars, then masks that are not position:fixed.
     cases = (
-        ("full", 10, 0, 10, "CCCCCCCCCC", False),
-        ("pair", 2, 0, 1, "C.", False),
-        ("solo", 1, 0, 1, "C", False),
-        ("mid", 3, 1, 2, ".C.", False),
-        ("tail", 10, 5, 10, ".....CCCCC", False),
-        ("one", 10, 4, 5, "....C.....", False),
-        ("right", 10, 7, 10, ".......CCC", True),
-        ("head", 10, 0, 3, "CCC.......", False),
+        ("full", "fixed", 10, 0, 10, "CCCCCCCCCC"),
+        ("pair", "fixed", 2, 0, 1, "C."),
+        ("solo", "fixed", 1, 0, 1, "C"),
+        ("mid", "fixed", 3, 1, 2, ".C."),
+        ("tail", "fixed", 10, 5, 10, ".....CCCCC"),
+        ("one", "fixed", 10, 4, 5, "....C....."),
+        ("right", "inline", 10, 7, 10, ".......CCC"),
+        ("head", "fixed", 10, 0, 3, "CCC......."),
+        ("xform", "transform", 3, 0, 3, "CCC"),
+        ("shadow", "shadow", 3, 0, 3, "CCC"),
+        ("fade", "margin", 3, 0, 3, "CCC"),
+        ("grid", "grid", 3, 0, 3, "CCC"),
+        ("flex", "flex", 3, 0, 3, "CCC"),
+        ("over", "overflow", 1, 0, 1, "C"),
+        ("before", "before", 3, 1, 3, ".CC"),
     )
     parts = [
         "<!doctype html><title>cover</title><style>",
         "body{margin:0}",
         ".row{position:absolute;left:0;height:20px;margin:0;white-space:nowrap}",
         ".mask{position:fixed;height:20px}",
+        "#before0{position:relative;z-index:1}",
+        "#before0::before{content:'';position:absolute;left:100%;top:0;width:120px;height:20px}",
         "</style>",
     ]
-    for slot, (prefix, count, start, end, _expected, plain) in enumerate(cases):
-        top = slot * 40
-        links: list[str] = []
-        for index in range(count):
-            if plain:
-                links.append(
-                    f'<a id="{prefix}{index}" href="/{index}">'
-                    '<span style="display:inline-block;width:40px;height:20px">x</span></a>'
-                )
-            else:
-                links.append(
-                    f'<a id="{prefix}{index}" href="/{index}" '
-                    'style="display:inline-block;width:40px;height:20px">x</a>'
-                )
-        parts.append(f'<div class="row" style="top:{top}px">{"".join(links)}</div>')
-        parts.append(
-            f'<div class="mask" style="top:{top}px;left:{start * 40}px;'
-            f'width:{(end - start) * 40}px"></div>'
+
+    def link(prefix: str, index: int, plain: bool) -> str:
+        if plain:
+            return (
+                f'<a id="{prefix}{index}" href="/{index}">'
+                '<span style="display:inline-block;width:40px;height:20px">x</span></a>'
+            )
+        return (
+            f'<a id="{prefix}{index}" href="/{index}" '
+            'style="display:inline-block;width:40px;height:20px">x</a>'
         )
+
+    for slot, (prefix, kind, count, start, end, _expected) in enumerate(cases):
+        top = slot * 40
+        links = "".join(link(prefix, index, kind == "inline") for index in range(count))
+        width = (end - start) * 40
+        if kind in {"fixed", "inline"}:
+            parts.append(f'<div class="row" style="top:{top}px">{links}</div>')
+            parts.append(
+                f'<div class="mask" style="top:{top}px;left:{start * 40}px;width:{width}px"></div>'
+            )
+        elif kind == "transform":
+            parts.append(
+                f'<div class="row" style="top:{top}px">{links}'
+                '<span style="display:inline-block;width:120px;height:20px;'
+                'transform:translateX(-120px)"></span></div>'
+            )
+        elif kind == "shadow":
+            parts.append(f'<div class="row" style="top:{top}px">{links}</div>')
+            parts.append(
+                "<div><template shadowrootmode='open'>"
+                f'<div style="position:fixed;top:{top}px;left:0;width:120px;height:20px"></div>'
+                "</template></div>"
+            )
+        elif kind == "margin":
+            parts.append(
+                f'<div class="row" style="top:{top}px">{links}'
+                '<span style="display:inline-block;width:120px;height:20px;'
+                'margin-left:-120px;opacity:.99"></span></div>'
+            )
+        elif kind == "grid":
+            parts.append(
+                f'<div class="row" style="top:{top}px;display:grid;'
+                'grid-template-columns:40px 40px 40px;width:120px">'
+                f'<a id="{prefix}0" href="/0" style="grid-area:1/1;width:40px;height:20px">x</a>'
+                f'<a id="{prefix}1" href="/1" style="grid-area:1/2;width:40px;height:20px">x</a>'
+                f'<a id="{prefix}2" href="/2" style="grid-area:1/3;width:40px;height:20px">x</a>'
+                '<div style="grid-area:1/1/2/4;z-index:1"></div></div>'
+            )
+        elif kind == "flex":
+            parts.append(
+                f'<div class="row" style="top:{top}px;display:flex;width:120px">'
+                f'<a id="{prefix}0" href="/0" style="flex:0 0 40px;height:20px">x</a>'
+                f'<a id="{prefix}1" href="/1" style="flex:0 0 40px;height:20px">x</a>'
+                f'<a id="{prefix}2" href="/2" style="flex:0 0 40px;height:20px">x</a>'
+                '<div style="flex:0 0 120px;height:20px;margin-left:-120px;z-index:1"></div>'
+                "</div>"
+            )
+        elif kind == "overflow":
+            parts.append(
+                f'<div class="row" style="top:{top}px;height:24px">'
+                f'<button id="{prefix}0" style="width:80px;height:24px">Go</button>'
+                '<div style="position:relative;width:10px;height:10px;margin-top:-24px">'
+                '<div style="width:80px;height:24px"></div></div></div>'
+            )
+        elif kind == "before":
+            parts.append(f'<div class="row" style="top:{top}px">{links}</div>')
+        else:
+            raise AssertionError(kind)
     facts_page.set_content("".join(parts), wait_until="domcontentloaded")
     facts = collect_facts(facts_page)
-    for prefix, count, _start, _end, expected, _plain in cases:
+    for prefix, _kind, count, _start, _end, expected in cases:
         flags = [
             "C" if _by_id(facts, f"{prefix}{index}").covered else "." for index in range(count)
         ]
@@ -1121,6 +1180,9 @@ def test_facts_html_fallback_names_skip_legend_and_hidden_text(
         ),
         ("<button id='c' aria-label='Remove'>Delete</button>", "Remove"),
         ("<label for='c'>Save</label><button id='c' title='Go'></button>", "Save"),
+        ("<label for='c'>Save</label><button id='c'>Delete</button>", "Save"),
+        ("<a id='c' href='/x' title='Home'>Delete account</a>", "Delete account"),
+        ("<div id='c' role='button' tabindex='0' title='Save'>Delete</div>", "Delete"),
         (
             (
                 "<button id='c'>Go <span style='visibility:hidden'>NO "
@@ -1142,7 +1204,7 @@ def test_facts_html_fallback_names_skip_legend_and_hidden_text(
         ("<h1 id='c'>Hello <span style='visibility:hidden'>Secret</span></h1>", "Hello"),
         (
             "<h1 id='c' style='visibility:hidden'><span style='visibility:visible'>Secret</span></h1>",
-            "Secret",
+            "",
         ),
     ],
 )
@@ -1240,14 +1302,22 @@ def test_facts_push_state_keeps_the_walked_document(
 
 
 @pytest.mark.parametrize(
-    "message",
+    ("message", "match"),
     [
-        "Execution context was destroyed, most likely because of a navigation",
-        "Target page, context or browser has been closed",
+        (
+            "Execution context was destroyed, most likely because of a navigation",
+            "fact collection lost the document",
+        ),
+        (
+            "Target page, context or browser has been closed",
+            "fact collection lost the document",
+        ),
+        ("page.title blew up", "fact collection could not read the document title"),
     ],
 )
 def test_facts_title_failure_loses_the_document(
     message: str,
+    match: str,
     facts_page: Page,
     fixture_base_url: str,
 ) -> None:
@@ -1257,9 +1327,37 @@ def test_facts_title_failure_loses_the_document(
         raise PlaywrightError(message)
 
     facts_page.title = lost
-    with pytest.raises(FactCollectionError, match="fact collection lost the document") as exc:
+    with pytest.raises(FactCollectionError, match=match) as exc:
         collect_facts(facts_page)
     assert "deadline" not in str(exc.value)
+
+
+def test_facts_one_second_deadline_returns_the_control(facts_page: Page) -> None:
+    facts_page.set_content("<!doctype html><title>t</title><button id='c'>Go</button>")
+    facts = collect_facts(facts_page, deadline_s=1.0)
+    assert facts.truncated is False
+    assert _by_id(facts, "c").name == "Go"
+
+
+def test_facts_zero_walk_budget_raises_the_deadline(
+    facts_page: Page, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "interface_compiler.browser.facts._collect_source",
+        lambda _deadline, _started: f"var WALK_BUDGET_MS = 0;\n{_COLLECT_SOURCE}",
+    )
+    facts_page.set_content("<!doctype html><title>t</title><button id='c'>Go</button>")
+    with pytest.raises(FactCollectionError, match="fact collection exceeded the deadline"):
+        collect_facts(facts_page)
+
+
+def test_facts_missing_driver_refuses_to_collect(
+    facts_page: Page, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("interface_compiler.browser.facts._driver_pid", lambda _page: None)
+    facts_page.set_content("<!doctype html><title>t</title><button id='c'>Go</button>")
+    with pytest.raises(FactCollectionError, match="cannot find the browser driver"):
+        collect_facts(facts_page)
 
 
 @pytest.mark.parametrize(
@@ -1306,7 +1404,10 @@ def test_facts_overlay_prefers_visible_widgets(rows: list[list[object]], order: 
     assert _overlay_order(payload, len(rows)) == order
 
 
-@pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table"), (4000, "inline")])
+@pytest.mark.parametrize(
+    ("rows", "layout"),
+    [(3000, "flat"), (3000, "table"), (4000, "table"), (4000, "inline")],
+)
 def test_facts_row_count_finishes_under_the_deadline(rows: int, layout: str) -> None:
     # Own browser: a deadline kill must not take down the session engine.
     script = """
@@ -1381,7 +1482,10 @@ try:
         raise SystemExit(2)
     if not covered or any(element.tag not in actionable for element in covered):
         raise SystemExit(2)
-    print(f"{elapsed:.3f} {_DEADLINE_S:.3f}")
+    if facts.truncated:
+        sys.stderr.write("truncated elements=%s\\n" % len(facts.elements))
+        raise SystemExit(6)
+    print(f"{elapsed:.3f} {_DEADLINE_S:.3f} {layout} {rows} {len(facts.elements)}")
 finally:
     engine.close()
 
@@ -1422,10 +1526,12 @@ finally:
         timeout=45,
     )
     assert completed.returncode == 0, completed.stderr
-    elapsed_text, deadline_text = completed.stdout.split()
+    elapsed_text, deadline_text = completed.stdout.split()[:2]
     elapsed = float(elapsed_text)
     deadline = float(deadline_text)
-    assert elapsed < deadline * 0.8, f"{rows} {layout} rows took {elapsed:.2f}s"
+    assert elapsed < deadline * 0.8, (
+        f"{rows} {layout} rows took {elapsed:.2f}s ({completed.stdout})"
+    )
 
 
 def test_facts_huge_table_is_truncated_instead_of_killed() -> None:
@@ -1472,6 +1578,7 @@ finally:
         timeout=60,
     )
     assert completed.returncode == 0, completed.stderr
+    assert int(completed.stdout.strip()) > 0
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

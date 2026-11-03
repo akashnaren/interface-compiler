@@ -3,9 +3,8 @@
 import json
 from pathlib import Path
 
-import pydantic_core
 import pytest
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from interface_compiler.browser.facts import normalized_page_url
 from interface_compiler.contract import (
@@ -380,26 +379,15 @@ def _dump_probe(model: ViewDoc | ActResult, dump: str) -> None:
     if dump == "model_dump_json":
         model.model_dump_json()
         return
-    if dump == "to_json":
-        pydantic_core.to_json(model)
-        return
-    if dump == "dump_json":
-        TypeAdapter(type(model)).dump_json(model)
-        return
-    if dump == "dump_python":
-        TypeAdapter(type(model)).dump_python(model)
-        return
     raise AssertionError(dump)
 
 
 @pytest.mark.parametrize(
     "dump",
-    ["model_dump", "model_dump_json", "to_json", "dump_json", "dump_python"],
+    ["model_dump", "model_dump_json", "dump_view_doc", "dump_act_result"],
 )
 def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
     doc = _public_probe_bypassing_the_url_guard()
-    with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
-        _dump_probe(doc, dump)
     result = ActResult.model_validate(
         {
             "status": "ok",
@@ -416,6 +404,16 @@ def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
         }
     )
     result.doc = doc
+    if dump == "dump_view_doc":
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            dump_view_doc(doc)
+        return
+    if dump == "dump_act_result":
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            dump_act_result(result)
+        return
+    with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+        _dump_probe(doc, dump)
     with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
         _dump_probe(result, dump)
 

@@ -11,18 +11,16 @@
   const walkStarted = performance.now();
   let truncated = false;
 
-  // Reading every node back is the slow step after the walk. The cap scales
-  // with the time left so a short deadline returns a partial row instead of
-  // being killed while those nodes are copied out.
-  const elementCap =
-    typeof WALK_BUDGET_MS === "number" ? Math.max(1, Math.floor(WALK_BUDGET_MS * 3)) : Infinity;
-
   function budgetSpent() {
     if (truncated) {
       return true;
     }
     if (typeof WALK_BUDGET_MS !== "number") {
       return false;
+    }
+    // No time was given. Stop without claiming the deadline cut a walk.
+    if (WALK_BUDGET_MS <= 0) {
+      return true;
     }
     if (performance.now() - walkStarted > WALK_BUDGET_MS) {
       truncated = true;
@@ -192,10 +190,12 @@
     return getComputedStyle(el).visibility === "hidden";
   }
 
-  function ownText(el) {
-    // The element's own text is its name even when this element is hidden.
-    // hidesSubtree prunes descendants only; visibility:hidden still skips
-    // direct text below and keeps a visibility:visible descendant.
+  function ownText(el, nested) {
+    // A visibility:hidden element's name stays empty, descendant included.
+    // A visible parent still walks through it, so "Go VIS" keeps VIS.
+    if (!nested && skipsOwnText(el)) {
+      return "";
+    }
     let text = "";
     const skipDirect = skipsOwnText(el);
     for (const node of childNodes(el)) {
@@ -215,7 +215,7 @@
           text += ` ${getAttribute(node, "alt") || ""}`;
           continue;
         }
-        text += ` ${ownText(node)}`;
+        text += ` ${ownText(node, true)}`;
       }
     }
     return clean(text);
@@ -528,6 +528,20 @@
     return clean(getAttribute(el, "title"));
   }
 
+  function namedFromContent(el) {
+    const role = elementRole(el);
+    return (
+      role === "link" ||
+      role === "button" ||
+      role === "menuitem" ||
+      role === "tab" ||
+      role === "option" ||
+      role === "treeitem" ||
+      role === "checkbox" ||
+      role === "radio"
+    );
+  }
+
   function buttonName(el) {
     const by = labelledByText(el);
     if (by) {
@@ -537,13 +551,26 @@
     if (aria) {
       return aria;
     }
+    // Chromium names a <button> from its label before the button's text.
+    // A link or an ARIA widget keeps its text, and title beats that label.
+    if (tagName(el) === "BUTTON") {
+      const label = associatedLabel(el);
+      if (label) {
+        return label;
+      }
+    }
     const text = ownText(el);
     if (text) {
       return text;
     }
-    const label = associatedLabel(el);
-    if (label) {
-      return label;
+    if (tagName(el) === "INPUT") {
+      const type = (getAttribute(el, "type") || "text").toLowerCase();
+      if (type === "checkbox" || type === "radio") {
+        const label = associatedLabel(el);
+        if (label) {
+          return label;
+        }
+      }
     }
     return clean(getAttribute(el, "title"));
   }
@@ -557,7 +584,7 @@
     if (tagName(el) === "FORM") {
       return accName(el);
     }
-    if (tagName(el) === "BUTTON") {
+    if (tagName(el) === "BUTTON" || namedFromContent(el)) {
       return buttonName(el);
     }
     const named = accName(el);
@@ -693,13 +720,6 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  // A same-line miss must not be reused: a mask can cover one sibling only.
-  // Hit-testing every inline link is quadratic on a long line, so the point is
-  // tested only when a positioned box or a modal backdrop can actually cover it.
-  let positioned = [];
-  let coverBoxes = null;
-  let modalDialog = undefined;
-
   function coveredBy(el, hit) {
     if (!hit) {
       return true;
@@ -707,60 +727,60 @@
     return hit !== el && !contains(el, hit);
   }
 
-  function centerInRect(box, cx, cy) {
-    return Boolean(
-      box && cx >= box.left && cx < box.right && cy >= box.top && cy < box.bottom,
-    );
-  }
-
-  function topModal() {
-    if (modalDialog !== undefined) {
-      return modalDialog;
-    }
-    modalDialog = null;
-    for (const dialog of document.querySelectorAll("dialog[open]")) {
-      if (elementMatches(dialog, ":modal")) {
-        modalDialog = dialog;
-      }
-    }
-    return modalDialog;
-  }
-
-  function boxesThatCover() {
-    if (coverBoxes) {
-      return coverBoxes;
-    }
-    coverBoxes = [];
-    for (const mask of positioned) {
-      coverBoxes.push({ mask, rect: boundingRect(mask) });
-    }
-    return coverBoxes;
-  }
-
-  function isCovered(el, rect, visible) {
-    if (!visible) {
-      return false;
-    }
+  function centerOutside(rect) {
     const cx = rect.left + rect.width / 2;
     const cy = rect.top + rect.height / 2;
-    if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) {
-      return false;
-    }
-    const modal = topModal();
-    if (modal && el !== modal && !contains(modal, el)) {
-      return true;
-    }
-    for (const item of boxesThatCover()) {
-      const mask = item.mask;
-      if (mask === el || contains(el, mask) || contains(mask, el)) {
+    return cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight;
+  }
+
+  // Hit-test every visible in-viewport center. Boxes fully to the right or
+  // below the viewport are display:none for that pass so a long inline line
+  // does not make each elementFromPoint walk every fragment. Masks that are
+  // not collected elements stay in the tree. The inline styles are restored.
+  function coverageOf(els, rects) {
+    const flags = [];
+    const viewport = [];
+    for (let index = 0; index < els.length; index += 1) {
+      flags.push(false);
+      const rect = rects[index];
+      if (!isVisible(els[index], rect) || centerOutside(rect)) {
         continue;
       }
-      if (!centerInRect(item.rect, cx, cy)) {
+      viewport.push(index);
+    }
+    const keep = new Set();
+    for (const index of viewport) {
+      let node = els[index];
+      while (node) {
+        keep.add(node);
+        node = parentElement(node);
+      }
+    }
+    const hidden = [];
+    for (let index = 0; index < els.length; index += 1) {
+      const rect = rects[index];
+      const el = els[index];
+      const outside = rect.top >= window.innerHeight || rect.left >= window.innerWidth;
+      if (!outside || keep.has(el)) {
         continue;
       }
-      return coveredBy(el, elementFromPoint(cx, cy));
+      hidden.push({ el, display: el.style.display });
+      el.style.display = "none";
     }
-    return false;
+    try {
+      for (const index of viewport) {
+        const rect = rects[index];
+        flags[index] = coveredBy(
+          els[index],
+          elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2),
+        );
+      }
+    } finally {
+      for (const item of hidden) {
+        item.el.style.display = item.display;
+      }
+    }
+    return flags;
   }
 
   function inViewport(rect) {
@@ -915,9 +935,6 @@
     styleHidden.set(el, visuallyHidden);
     displayNone.set(el, displayHidden);
     visibilityHidden.set(el, visibilityIsHidden);
-    if (style.position !== "static") {
-      positioned.push(el);
-    }
     if (tagName(el) === "FIELDSET") {
       let text = "";
       for (const child of children(el)) {
@@ -938,6 +955,22 @@
       counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
       walkTree(child, next);
+    }
+  }
+
+  if (typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS <= 0) {
+    if (document.querySelectorAll(SELECTOR).length > 0) {
+      return {
+        fields: [],
+        elements: [],
+        forms: [],
+        modals: [],
+        nodes: [],
+        url: pageUrl,
+        title: pageTitle,
+        truncated: false,
+        deadline: true,
+      };
     }
   }
 
@@ -988,17 +1021,30 @@
   ];
   const elements = [];
   const matched = document.querySelectorAll(SELECTOR);
+  const chosen = [];
+  const rects = [];
+  // Shipping one kept row takes a fraction of a millisecond. Stop while
+  // the deadline can still carry the rows already kept.
+  const rowCopyMs = 0.2;
   for (let index = 0; index < matched.length; index += 1) {
-    if (elements.length >= elementCap) {
-      truncated = true;
-      break;
-    }
     if (budgetSpent()) {
       break;
     }
-    const el = matched[index];
+    if (
+      typeof WALK_BUDGET_MS === "number" &&
+      performance.now() - walkStarted + chosen.length * rowCopyMs > WALK_BUDGET_MS
+    ) {
+      truncated = true;
+      break;
+    }
+    chosen.push(matched[index]);
+    rects.push(boundingRect(matched[index]));
+  }
+  const covered = coverageOf(chosen, rects);
+  for (let index = 0; index < chosen.length; index += 1) {
+    const el = chosen[index];
     nodes.push(el);
-    const rect = boundingRect(el);
+    const rect = rects[index];
     const visible = isVisible(el, rect);
     const role = elementRole(el);
     const binding = submitBinding(el);
@@ -1035,7 +1081,7 @@
       getAttribute(el, "aria-controls"),
       { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       visible,
-      isCovered(el, rect, visible),
+      covered[index],
       inViewport(rect),
       willValidate(el) ? el.validationMessage : "",
       landmarkOf(el),

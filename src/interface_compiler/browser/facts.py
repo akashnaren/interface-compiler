@@ -62,7 +62,7 @@ _OVERLAY_BUDGET_CAP_S = 2.5
 _READ_PAYLOAD = (
     "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
     "forms:this.forms,modals:this.modals,url:this.url,title:this.title,"
-    "truncated:this.truncated});}"
+    "truncated:this.truncated,deadline:this.deadline});}"
 )
 
 
@@ -201,7 +201,9 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     two documents. The URL and title are the ones read at the start of the
     walk, so a later ``pushState`` cannot relabel those facts. When the walk
     runs out of time it returns the elements collected so far with
-    ``truncated`` set.
+    ``truncated`` set. A walk that is given no time, on a page that has
+    controls, raises instead of returning no elements. Collection also raises
+    when the browser driver cannot be found, so the deadline is never skipped.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -210,6 +212,8 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     if deadline_s <= 0:
         raise ValueError("deadline must be positive")
     pid = _driver_pid(page)
+    if not isinstance(pid, int):
+        raise FactCollectionError("fact collection cannot find the browser driver")
     stop = threading.Event()
     killed = threading.Event()
     watcher = threading.Thread(
@@ -309,6 +313,8 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             )
         )
         payload = json.loads(raw_payload) if isinstance(raw_payload, str) else None
+        if isinstance(payload, dict) and payload.get("deadline") is True:
+            raise FactCollectionError("fact collection exceeded the deadline")
         object_ids = _node_object_ids(session, root_id)
         overlay = _accessibility_overlay(
             session,
@@ -534,9 +540,13 @@ def _require_frame_stamp(session: CDPSession) -> tuple[str, str]:
 
 
 def _collect_source(deadline_s: float, started: float) -> str:
-    """The collector, with the walk's remaining time bound in milliseconds."""
+    """The collector, with the walk's remaining time bound in milliseconds.
+
+    The walk gets the whole remaining deadline, which is the time it had
+    before a reserved overlay second could shrink that budget to zero.
+    """
     remaining_ms = int((deadline_s - (time.perf_counter() - started)) * 1000)
-    budget_ms = max(0, remaining_ms - int(_OVERLAY_MARGIN_S * 1000))
+    budget_ms = max(0, remaining_ms)
     # var, not const: the isolated world persists, and a second collect
     # redeclares this binding.
     return f"var WALK_BUDGET_MS = {budget_ms};\n{_COLLECT_SOURCE}"
@@ -561,7 +571,7 @@ def _page_title(page: Page) -> str:
     except PlaywrightError as exc:
         if _is_document_lost(exc) or _is_closed_page(exc):
             raise FactCollectionError("fact collection lost the document") from exc
-        raise
+        raise FactCollectionError("fact collection could not read the document title") from exc
 
 
 def _is_closed_page(exc: Exception) -> bool:

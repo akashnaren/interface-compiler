@@ -6,7 +6,6 @@ from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from typing import Any, Literal, NoReturn, Self
 
-import pydantic_core
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -14,7 +13,6 @@ from pydantic import (
     PrivateAttr,
     StrictBool,
     StrictInt,
-    TypeAdapter,
     field_validator,
     model_serializer,
     model_validator,
@@ -46,9 +44,8 @@ _VERIFIED_STATES = (
 # still construct a mutating probed_ok affordance. Direct construction has none.
 _affordance_page_url: ContextVar[object] = ContextVar("affordance_page_url", default=None)
 # The wrap serializer raises ContractError, and pydantic-core wraps that in
-# PydanticSerializationError before model_dump, model_dump_json, to_json, or
-# TypeAdapter.dump_json / dump_python returns. The original error is stashed
-# here so those callers still see ContractError.
+# PydanticSerializationError before model_dump or model_dump_json returns.
+# The original error is stashed here so those callers still see ContractError.
 _pending_probe: ContextVar[ContractError | None] = ContextVar("pending_probe", default=None)
 
 
@@ -691,7 +688,7 @@ def dump_view_doc(doc: ViewDoc) -> dict[str, Any]:
 
 
 def _checked_serialize(model: BaseModel, handler: Any) -> Any:
-    """Run the probe refusal for ``model_dump``, ``model_dump_json``, and ``to_json``."""
+    """Run the probe refusal for ``model_dump`` and ``model_dump_json``."""
     dumped = handler(model)
     if isinstance(dumped, dict):
         try:
@@ -722,26 +719,6 @@ def _reraise_probe(exc: PydanticSerializationError) -> NoReturn:
             raise cause from None
         cause = cause.__cause__
     raise exc
-
-
-def _to_json_refusing_probe(value: object, *args: object, **kwargs: object) -> Any:
-    return _dump_refusing_probe(lambda: _PYDANTIC_TO_JSON(value, *args, **kwargs))
-
-
-def _type_adapter_dump_json(self: Any, instance: Any, /, **kwargs: Any) -> Any:
-    return _dump_refusing_probe(lambda: _TYPE_ADAPTER_DUMP_JSON(self, instance, **kwargs))
-
-
-def _type_adapter_dump_python(self: Any, instance: Any, /, **kwargs: Any) -> Any:
-    return _dump_refusing_probe(lambda: _TYPE_ADAPTER_DUMP_PYTHON(self, instance, **kwargs))
-
-
-_PYDANTIC_TO_JSON = pydantic_core.to_json
-pydantic_core.to_json = _to_json_refusing_probe
-_TYPE_ADAPTER_DUMP_JSON = TypeAdapter.dump_json
-_TYPE_ADAPTER_DUMP_PYTHON = TypeAdapter.dump_python
-TypeAdapter.dump_json = _type_adapter_dump_json  # type: ignore[method-assign]
-TypeAdapter.dump_python = _type_adapter_dump_python  # type: ignore[method-assign]
 
 
 def _refuse_dumped_probe(doc: ViewDoc | dict[str, Any]) -> None:
