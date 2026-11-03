@@ -69,7 +69,8 @@ def _is_loopback(url: object) -> bool:
     trick such as ``http://evil.com\\@127.0.0.1/`` must not count: Chromium
     navigates to the name before the backslash. Backslashes, whitespace,
     control characters, userinfo, and any scheme other than http or https
-    fail closed. An explicit port must be an integer from 1 to 65535.
+    fail closed. An explicit port must be one to five ASCII digits and an
+    integer from 1 to 65535. Any other port is not loopback.
     """
     if not isinstance(url, str) or url == "":
         return False
@@ -86,7 +87,8 @@ def _is_loopback(url: object) -> bool:
         return False
     if port is None:
         return True
-    if not port.isdigit():
+    # Unicode digits pass str.isdigit and can make int() raise or accept a port.
+    if not (port.isascii() and port.isdigit() and len(port) <= 5):
         return False
     number = int(port)
     return 1 <= number <= 65535
