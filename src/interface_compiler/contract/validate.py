@@ -27,14 +27,17 @@ _EXACT_ID = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 # (a{4294967296}) and RecursionError (thousands of nested groups).
 _PATTERN_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 _PATTERN_ECHO_LIMIT = 80
+# Contract errors quote the failing value. A long quote is cut to about this.
+_VALUE_ECHO_LIMIT = 200
 # jsonschema follows items/$ref recursively and overflows the stack on a
 # chain a few hundred levels deep. Stop before that walk.
 _MAX_SCHEMA_DEPTH = 32
 # Every JSON value, not only items and properties. Depth 64 is allowed.
 _MAX_JSON_DEPTH = 64
-# Re-walking a shared container is allowed. A diamond that expands past this
-# many container entries is rejected instead of running away.
-_MAX_JSON_VISITS = 1_000_000
+# Re-walking a shared container is allowed. Every value counts, scalars
+# included. A realistic page is about 99k values; this stops a shared list
+# of lists before it walks hundreds of millions of scalars.
+_MAX_JSON_VISITS = 4_000_000
 # JavaScript's Number cannot represent integers outside this range.
 _MAX_SAFE_INT = 2**53 - 1
 _RFC3339 = re.compile(
@@ -159,7 +162,12 @@ def _raise_if_invalid(validator: Draft202012Validator, instance: object) -> None
 def _error_message(error: ValidationError) -> str:
     location = "/".join(str(part) for part in error.absolute_path)
     where = location or "<root>"
-    return f"{where}: {error.message}"
+    detail = error.message
+    if len(detail) > _VALUE_ECHO_LIMIT:
+        rendered = repr(error.instance)
+        if len(rendered) > _VALUE_ECHO_LIMIT and rendered in detail:
+            detail = detail.replace(rendered, _truncate_repr(rendered), 1)
+    return f"{where}: {detail}"
 
 
 @lru_cache(maxsize=1)
@@ -178,7 +186,7 @@ def _exact_id_errors(instance: object, *, prefix: str = "") -> list[str]:
     errors: list[str] = []
     view = instance.get("view")
     if isinstance(view, str) and _EXACT_ID.fullmatch(view) is None:
-        errors.append(f"{prefix}view: {view!r} does not match '^[a-z][a-z0-9_]*$'")
+        errors.append(f"{prefix}view: {_echo_value(view)} does not match '^[a-z][a-z0-9_]*$'")
     affordances = instance.get("affordances")
     if isinstance(affordances, list):
         for index, item in enumerate(affordances):
@@ -187,7 +195,7 @@ def _exact_id_errors(instance: object, *, prefix: str = "") -> list[str]:
             ident = item.get("id")
             if isinstance(ident, str) and _EXACT_ID.fullmatch(ident) is None:
                 where = f"{prefix}affordances/{index}/id"
-                errors.append(f"{where}: {ident!r} does not match '^[a-z][a-z0-9_]*$'")
+                errors.append(f"{where}: {_echo_value(ident)} does not match '^[a-z][a-z0-9_]*$'")
     doc = instance.get("doc")
     if isinstance(doc, Mapping):
         errors.extend(_exact_id_errors(doc, prefix=f"{prefix}doc/"))
@@ -214,7 +222,7 @@ def _duplicate_id_errors(instance: object, *, prefix: str = "") -> list[str]:
                 continue
             where = f"{prefix}affordances/{index}/id"
             also = f"{prefix}affordances/{previous}/id"
-            errors.append(f"{where}: duplicate id {ident!r} (also at {also})")
+            errors.append(f"{where}: duplicate id {_echo_value(ident)} (also at {also})")
     doc = instance.get("doc")
     if isinstance(doc, Mapping):
         errors.extend(_duplicate_id_errors(doc, prefix=f"{prefix}doc/"))
@@ -249,7 +257,7 @@ def _input_object_errors(schema: object, where: str) -> list[str]:
     if isinstance(required, list):
         for index, name in enumerate(required):
             if isinstance(name, str) and name not in known:
-                errors.append(f"{where}/required/{index}: {name!r} is not a property")
+                errors.append(f"{where}/required/{index}: {_echo_value(name)} is not a property")
     if isinstance(properties, Mapping):
         for key, prop in properties.items():
             errors.extend(_prop_errors(prop, f"{where}/properties/{key}"))
@@ -270,6 +278,17 @@ def _echo_pattern(pattern: str) -> str:
     if len(pattern) <= _PATTERN_ECHO_LIMIT:
         return repr(pattern)
     return repr(f"{pattern[:_PATTERN_ECHO_LIMIT]}...")
+
+
+def _echo_value(value: object) -> str:
+    """Repr of a failing value, cut so one large value cannot dominate the message."""
+    return _truncate_repr(repr(value))
+
+
+def _truncate_repr(rendered: str) -> str:
+    if len(rendered) <= _VALUE_ECHO_LIMIT:
+        return rendered
+    return f"{rendered[:_VALUE_ECHO_LIMIT]}..."
 
 
 def nesting_too_deep(where: str) -> str:
@@ -302,11 +321,12 @@ def _check_json_shape(value: object) -> None:
 
     Walks with an explicit stack. A container id on the current ancestor path
     is a cycle. The same container reached by another path is ordinary Python
-    reuse and is allowed. Each container entry counts toward ``_MAX_JSON_VISITS``
-    so a shared diamond still fails fast. Depth counts container edges from
-    ``value``: 64 is allowed and 65 is not. Scalars are ``str``, ``bool``,
-    ``int`` inside ±(2**53 - 1), finite ``float``, and ``None``. Object keys
-    are strings. Lone surrogates are rejected so this matches ``model_validate_json``.
+    reuse and is allowed. Every value counts toward ``_MAX_JSON_VISITS``,
+    scalars included, so a shared list of lists still fails fast. Depth counts
+    container edges from ``value``: 64 is allowed and 65 is not. Scalars are
+    ``str``, ``bool``, ``int`` inside ±(2**53 - 1), finite ``float``, and
+    ``None``. Object keys are strings. Lone surrogates are rejected so this
+    matches ``model_validate_json``.
     """
     stack: _ShapeStack = [(value, 0, ())]
     ancestors: set[int] = set()
@@ -317,14 +337,16 @@ def _check_json_shape(value: object) -> None:
             ancestors.remove(frame.identity)
             continue
         current, depth, path = frame
-        if _is_json_scalar(current):
-            _reject_bad_scalar(current, path)
-            continue
         if isinstance(current, dict):
             _push_json_object(current, depth, path, ancestors, visits, stack)
             continue
         if isinstance(current, list):
             _push_json_list(current, depth, path, ancestors, visits, stack)
+            continue
+        if _charge_visit(visits):
+            _too_many_visits(path)
+        if _is_json_scalar(current):
+            _reject_bad_scalar(current, path)
             continue
         _reject_json_type(current, path)
 
@@ -378,15 +400,14 @@ def _push_json_object(
     stack: _ShapeStack,
 ) -> None:
     identity = _enter_json_container(current, depth, path, ancestors, visits)
-    pairs: list[tuple[str, object]] = []
+    pending: list[_JsonFrame] = []
     for key, item in current.items():
         if not isinstance(key, str):
-            _json_shape_error(path, f"object key {key!r} is not a string")
+            _json_shape_error(path, f"object key {_echo_value(key)} is not a string")
         _reject_lone_surrogate(key, path)
-        pairs.append((key, item))
+        _enqueue_or_count(item, depth + 1, path, key, visits, pending)
     stack.append(_JsonLeave(identity))
-    for key, item in reversed(pairs):
-        stack.append((item, depth + 1, path + (key,)))
+    stack.extend(reversed(pending))
 
 
 def _push_json_list(
@@ -398,10 +419,42 @@ def _push_json_list(
     stack: _ShapeStack,
 ) -> None:
     identity = _enter_json_container(current, depth, path, ancestors, visits)
-    indexed = list(enumerate(current))
+    pending: list[_JsonFrame] = []
+    for index, item in enumerate(current):
+        # str(index) is built only when the child needs a path. The wide-list
+        # case is millions of small ints, and the index text is unused until
+        # a visit actually fails.
+        if _is_budget_scalar(item):
+            if _charge_visit(visits):
+                _too_many_visits((*path, str(index)))
+            continue
+        _enqueue_or_count(item, depth + 1, path, str(index), visits, pending)
     stack.append(_JsonLeave(identity))
-    for index, item in reversed(indexed):
-        stack.append((item, depth + 1, path + (str(index),)))
+    stack.extend(reversed(pending))
+
+
+def _enqueue_or_count(
+    item: object,
+    depth: int,
+    path: tuple[str, ...],
+    key: str,
+    visits: list[int],
+    pending: list[_JsonFrame],
+) -> None:
+    if isinstance(item, dict | list):
+        pending.append((item, depth, (*path, key)))
+        return
+    if _is_budget_scalar(item):
+        if _charge_visit(visits):
+            _too_many_visits((*path, key))
+        return
+    child = (*path, key)
+    if _charge_visit(visits):
+        _too_many_visits(child)
+    if _is_json_scalar(item):
+        _reject_bad_scalar(item, child)
+        return
+    _reject_json_type(item, child)
 
 
 def _enter_json_container(
@@ -416,11 +469,30 @@ def _enter_json_container(
     identity = id(current)
     if identity in ancestors:
         _json_shape_error(path, "cyclic container")
-    visits[0] += 1
-    if visits[0] > _MAX_JSON_VISITS:
-        _json_shape_error(path, f"node visits exceed max {_MAX_JSON_VISITS}")
+    if _charge_visit(visits):
+        _too_many_visits(path)
     ancestors.add(identity)
     return identity
+
+
+def _is_budget_scalar(value: object) -> bool:
+    """True for None, bool, and an int inside the JavaScript safe range.
+
+    ``bool`` is a subclass of ``int``. ``True`` and ``False`` fall inside the
+    safe range, so they need no further scalar check.
+    """
+    if value is None:
+        return True
+    return isinstance(value, int) and -_MAX_SAFE_INT <= value <= _MAX_SAFE_INT
+
+
+def _charge_visit(visits: list[int]) -> bool:
+    visits[0] += 1
+    return visits[0] > _MAX_JSON_VISITS
+
+
+def _too_many_visits(path: tuple[str, ...]) -> None:
+    _json_shape_error(path, f"node visits exceed max {_MAX_JSON_VISITS}")
 
 
 def _reject_json_type(value: object, path: tuple[str, ...]) -> None:

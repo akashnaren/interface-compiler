@@ -894,7 +894,14 @@ def test_contract_shared_container_reuse_is_allowed() -> None:
         token_counts(doc)
 
 
-def test_contract_shared_references_are_rejected() -> None:
+def _limit_visits(monkeypatch: pytest.MonkeyPatch, limit: int = 1_000) -> int:
+    """Use a small visit budget so a shared diamond does not walk millions of nodes."""
+    monkeypatch.setattr("interface_compiler.contract.validate._MAX_JSON_VISITS", limit)
+    return limit
+
+
+def test_contract_shared_references_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    limit = _limit_visits(monkeypatch)
     node = _shared_diamond(40)
     doc = _with_locator_extra(node)
     act = _act_result()
@@ -907,18 +914,21 @@ def test_contract_shared_references_are_rejected() -> None:
     with _deadline():
         with pytest.raises(ContractError) as doc_error:
             validate_doc(doc)
-        assert "node visits exceed max 1000000" in str(doc_error.value)
+        assert f"node visits exceed max {limit}" in str(doc_error.value)
         with pytest.raises(ValidationError) as view_error:
             ViewDoc.model_validate(doc)
-        assert "node visits exceed max 1000000" in str(view_error.value)
+        assert f"node visits exceed max {limit}" in str(view_error.value)
         with pytest.raises(ValidationError) as act_error:
             ActResult.model_validate(act)
-        assert "node visits exceed max 1000000" in str(act_error.value)
+        assert f"node visits exceed max {limit}" in str(act_error.value)
         with pytest.raises(ContractError):
             validate_doc(schema_doc)
 
 
-def test_contract_validation_error_hides_shared_input() -> None:
+def test_contract_validation_error_hides_shared_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = _limit_visits(monkeypatch)
     doc = _with_locator_extra(_shared_diamond(40))
     with _deadline():
         with pytest.raises(ValidationError) as caught:
@@ -928,7 +938,7 @@ def test_contract_validation_error_hides_shared_input() -> None:
         repr_rendered = repr(caught.value)
         elapsed = time.perf_counter() - started
     assert elapsed < 0.25
-    assert "node visits exceed max 1000000" in rendered
+    assert f"node visits exceed max {limit}" in rendered
     assert "input_value" not in rendered
     assert len(rendered) < 2_000
     assert len(repr_rendered) < 2_000
@@ -944,6 +954,50 @@ def test_contract_cli_rejects_oversized_integer(tmp_path: Path) -> None:
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
     assert "4301" in result.stderr
+
+
+def test_contract_wide_shared_list_hits_visit_budget() -> None:
+    rows = [list(range(100_000))] * 10_000
+    doc = _with_locator_extra(rows)
+    affordance = {
+        "id": "go",
+        "enabled": True,
+        "input": {"type": "object", "properties": {}},
+    }
+    with _deadline(2):
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        assert "node visits exceed max 4000000" in str(doc_error.value)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(doc)
+        assert "node visits exceed max 4000000" in str(model_error.value)
+        with pytest.raises(ContractError) as args_error:
+            validate_args(affordance, {"rows": rows})
+        assert "node visits exceed max 4000000" in str(args_error.value)
+
+
+def test_contract_error_message_truncates_long_value() -> None:
+    pattern_doc = _paper()
+    pattern_doc["view"] = "Z" + ("a" * 20_000)
+    newline_doc = _paper()
+    newline_doc["view"] = ("a" * 20_000) + "\n"
+    short_doc = _paper()
+    short_doc["view"] = "Nope"
+    with pytest.raises(ContractError) as pattern_error:
+        validate_doc(pattern_doc)
+    with pytest.raises(ContractError) as newline_error:
+        validate_doc(newline_doc)
+    with pytest.raises(ContractError) as short_error:
+        validate_doc(short_doc)
+    pattern_message = str(pattern_error.value)
+    newline_message = str(newline_error.value)
+    assert "does not match" in pattern_message
+    assert "does not match" in newline_message
+    assert len(pattern_message) < 400
+    assert len(newline_message) < 400
+    assert "a" * 250 not in pattern_message
+    assert "a" * 250 not in newline_message
+    assert "'Nope'" in str(short_error.value)
 
 
 def test_contract_integer_must_fit_in_js_safe_range() -> None:
