@@ -18,6 +18,7 @@ from pydantic import (
 from interface_compiler.contract.validate import (
     ContractError,
     _compile_pattern,
+    _schema_nesting_errors,
     validate_doc,
     validate_effect,
 )
@@ -59,6 +60,15 @@ class Prop(BaseModel):
     maximum: int | float | None = None
     multipleOf: int | float | None = None
     items: Prop | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _limit_nesting(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            errors = _schema_nesting_errors(value, "items")
+            if errors:
+                raise ValueError(errors[0])
+        return value
 
     @field_validator("pattern")
     @classmethod

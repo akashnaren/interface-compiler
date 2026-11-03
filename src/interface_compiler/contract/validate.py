@@ -25,6 +25,10 @@ _EXACT_ID = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 # re.compile raises re.error for a bad pattern, and also OverflowError
 # (a{4294967296}) and RecursionError (thousands of nested groups).
 _PATTERN_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
+_PATTERN_ECHO_LIMIT = 80
+# jsonschema follows items/$ref recursively and overflows the stack on a
+# chain a few hundred levels deep. Stop before that walk.
+_MAX_SCHEMA_DEPTH = 32
 _RFC3339 = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -78,12 +82,12 @@ def validate_args(affordance: object, args: object) -> None:
         message = "<root>: args must be a JSON object"
         raise ContractError(message, errors=[message])
     schema = _input_schema(affordance)
-    schema_errors = _input_object_errors(schema, "input")
-    if schema_errors:
-        raise ContractError(schema_errors[0], errors=schema_errors)
+    _ensure_input_schema(schema, "input")
     try:
         validator = Draft202012Validator(schema, format_checker=_format_checker())
         _raise_if_invalid(validator, args)
+    except ContractError:
+        raise
     except SchemaError as exc:
         message = f"input: {exc.message}"
         raise ContractError(message, errors=[message]) from exc
@@ -93,6 +97,9 @@ def validate_args(affordance: object, args: object) -> None:
             message = f"input: invalid regular expression ({exc})"
             errors = [message]
         raise ContractError(errors[0], errors=errors) from exc
+    except Exception as exc:
+        message = f"input: {type(exc).__name__}: {exc}"
+        raise ContractError(message, errors=[message]) from exc
 
 
 def _input_schema(affordance: object) -> dict[str, Any]:
@@ -111,6 +118,9 @@ def _input_schema(affordance: object) -> dict[str, Any]:
 
 
 def _validate(name: str, instance: object) -> None:
+    depth_errors = _document_nesting_errors(instance)
+    if depth_errors:
+        raise ContractError(depth_errors[0], errors=depth_errors)
     _raise_if_invalid(_validator(name), instance)
     errors = [
         *_exact_id_errors(instance),
@@ -237,12 +247,96 @@ def _compile_pattern(pattern: str) -> ContractError | None:
     try:
         re.compile(pattern)
     except _PATTERN_COMPILE_ERRORS as exc:
-        message = f"{pattern!r} is not a valid regular expression ({exc})"
+        message = f"{_echo_pattern(pattern)} is not a valid regular expression ({exc})"
         return ContractError(message, errors=[message])
     return None
 
 
-def _prop_errors(prop: object, where: str) -> list[str]:
+def _echo_pattern(pattern: str) -> str:
+    if len(pattern) <= _PATTERN_ECHO_LIMIT:
+        return repr(pattern)
+    return repr(f"{pattern[:_PATTERN_ECHO_LIMIT]}...")
+
+
+def nesting_too_deep(where: str) -> str:
+    """Contract message for an items or properties chain past the nesting limit."""
+    return f"{where}: nesting exceeds {_MAX_SCHEMA_DEPTH}"
+
+
+def _schema_nesting_errors(node: object, where: str, *, depth: int = 0) -> list[str]:
+    if depth > _MAX_SCHEMA_DEPTH:
+        return [nesting_too_deep(where)]
+    if not isinstance(node, Mapping):
+        return []
+    errors: list[str] = []
+    properties = node.get("properties")
+    if isinstance(properties, Mapping):
+        for key, child in properties.items():
+            child_where = f"{where}/properties/{key}"
+            errors.extend(_schema_nesting_errors(child, child_where, depth=depth + 1))
+    items = node.get("items")
+    if isinstance(items, Mapping):
+        errors.extend(_schema_nesting_errors(items, f"{where}/items", depth=depth + 1))
+    return errors
+
+
+def _document_nesting_errors(instance: object, *, prefix: str = "") -> list[str]:
+    if not isinstance(instance, Mapping):
+        return []
+    errors: list[str] = []
+    affordances = instance.get("affordances")
+    if isinstance(affordances, list):
+        for index, item in enumerate(affordances):
+            if not isinstance(item, Mapping):
+                continue
+            where = f"{prefix}affordances/{index}/input"
+            errors.extend(_schema_nesting_errors(item.get("input"), where))
+    doc = instance.get("doc")
+    if isinstance(doc, Mapping):
+        errors.extend(_document_nesting_errors(doc, prefix=f"{prefix}doc/"))
+    return errors
+
+
+def _ensure_input_schema(schema: object, where: str) -> None:
+    """Reject an affordance input that the frozen input schema would reject."""
+    depth_errors = _schema_nesting_errors(schema, where)
+    if depth_errors:
+        raise ContractError(depth_errors[0], errors=depth_errors)
+    if not isinstance(schema, Mapping):
+        message = f"{where}: input schema must be an object"
+        raise ContractError(message, errors=[message])
+    try:
+        _raise_if_invalid(_input_schema_validator(), schema)
+    except ContractError as exc:
+        raise _prefix_contract_error(exc, where) from exc
+    errors = _input_object_errors(schema, where)
+    if errors:
+        raise ContractError(errors[0], errors=errors)
+
+
+def _prefix_contract_error(exc: ContractError, where: str) -> ContractError:
+    errors: list[str] = []
+    for message in exc.errors:
+        location, separator, detail = message.partition(": ")
+        if separator and location == "<root>":
+            errors.append(f"{where}: {detail}")
+        elif separator:
+            errors.append(f"{where}/{location}: {detail}")
+        else:
+            errors.append(f"{where}: {message}")
+    return ContractError(errors[0], errors=errors)
+
+
+@lru_cache(maxsize=1)
+def _input_schema_validator() -> Draft202012Validator:
+    full = load_schema("view-doc")
+    schema = {"$defs": full["$defs"], "$ref": "#/$defs/input"}
+    return Draft202012Validator(schema, format_checker=_format_checker())
+
+
+def _prop_errors(prop: object, where: str, depth: int = 1) -> list[str]:
+    if depth > _MAX_SCHEMA_DEPTH:
+        return [nesting_too_deep(where)]
     if not isinstance(prop, Mapping):
         return []
     errors: list[str] = []
@@ -252,8 +346,8 @@ def _prop_errors(prop: object, where: str) -> list[str]:
         if failure is not None:
             errors.append(f"{where}/pattern: {failure}")
     items = prop.get("items")
-    if items is not None:
-        errors.extend(_prop_errors(items, f"{where}/items"))
+    if isinstance(items, Mapping):
+        errors.extend(_prop_errors(items, f"{where}/items", depth + 1))
     return errors
 
 

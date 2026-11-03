@@ -541,6 +541,8 @@ def test_contract_pattern_compile_errors_are_contract_errors(pattern: str, tmp_p
     with pytest.raises(ContractError) as doc_error:
         validate_doc(doc)
     assert where in str(doc_error.value)
+    if len(pattern) > 80:
+        assert pattern[:81] not in str(doc_error.value)
 
     with pytest.raises(ValidationError) as model_error:
         ViewDoc.model_validate(doc)
@@ -560,6 +562,86 @@ def test_contract_pattern_compile_errors_are_contract_errors(pattern: str, tmp_p
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
     assert where in result.stderr
+
+
+_MALFORMED_INPUTS = [
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "string", "pattern": 123}}},
+        {"q": "x"},
+        id="pattern-int",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "string", "pattern": ["a"]}}},
+        {"q": "x"},
+        id="pattern-list",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "strin"}}},
+        {"q": "x"},
+        id="type",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "number", "minimum": "a"}}},
+        {"q": 1},
+        id="minimum",
+    ),
+    pytest.param(
+        {"type": "object", "properties": ["q"]},
+        {"q": "x"},
+        id="properties",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "array", "items": 5}}},
+        {"q": [1]},
+        id="items",
+    ),
+    pytest.param(
+        {"type": "object", "properties": {"q": {"type": "string"}}, "required": [["q"]]},
+        {},
+        id="required",
+    ),
+]
+
+
+@pytest.mark.parametrize(("schema", "args"), _MALFORMED_INPUTS)
+def test_contract_validate_args_rejects_malformed_input(schema: dict, args: dict) -> None:
+    affordance = {"id": "go", "enabled": True, "input": schema}
+    with pytest.raises(ContractError) as exc:
+        validate_args(affordance, args)
+    assert "input" in str(exc.value)
+
+
+def _items_chain(depth: int) -> dict:
+    node: dict = {"type": "string"}
+    for _ in range(depth):
+        node = {"type": "array", "items": node}
+    return node
+
+
+def test_contract_items_nesting_limit(tmp_path: Path) -> None:
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"] = _items_chain(300)
+    where = "affordances/1/input"
+
+    with pytest.raises(ContractError) as doc_error:
+        validate_doc(doc)
+    assert where in str(doc_error.value)
+    assert "nesting exceeds 32" in str(doc_error.value)
+
+    with pytest.raises(ValidationError) as model_error:
+        ViewDoc.model_validate(doc)
+    assert "nesting exceeds 32" in str(model_error.value)
+
+    with pytest.raises(ContractError) as args_error:
+        validate_args(doc["affordances"][1], {"size": []})
+    assert "nesting exceeds 32" in str(args_error.value)
+
+    result = _cli_validate(doc, tmp_path)
+    assert result.exit_code != 0
+    assert isinstance(result.exception, SystemExit)
+    captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
+    assert "Traceback" not in captured
+    assert "nesting exceeds 32" in result.stderr
 
 
 def test_contract_duplicate_affordance_ids_rejected() -> None:

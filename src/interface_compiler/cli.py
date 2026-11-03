@@ -13,6 +13,7 @@ from interface_compiler import __version__
 from interface_compiler.contract.validate import (
     ContractError,
     UnknownSchemaError,
+    nesting_too_deep,
     schema_text,
     validate_doc,
 )
@@ -77,5 +78,8 @@ def validate_command(
     except ContractError as exc:
         for line in exc.errors:
             typer.echo(line, err=True)
+        raise typer.Exit(1) from exc
+    except RecursionError as exc:
+        typer.echo(nesting_too_deep("document"), err=True)
         raise typer.Exit(1) from exc
     typer.echo("valid")
