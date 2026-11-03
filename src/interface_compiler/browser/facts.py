@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from playwright.sync_api import CDPSession, Page
 from playwright.sync_api import Error as PlaywrightError
@@ -27,15 +27,14 @@ _COLLECT_SOURCE = Path(__file__).with_name("collect.js").read_text(encoding="utf
 _SKIP_AX_ROLES = frozenset({"none", "InlineTextBox", "StaticText", "ignored"})
 # Chromium's internal names for controls whose ARIA role is the one below.
 _AX_ROLE_ALIASES = {"Date": "textbox", "DisclosureTriangle": "button"}
-# Overlay visits these before landmarks and headings. The budget then runs out
-# on controls instead of on the content that already has an HTML role.
-_ACTIONABLE_TAGS = frozenset({"a", "button", "input", "select", "textarea", "summary", "option"})
-_ACTIONABLE_ROLES = frozenset(
+# Widgets are overlaid before links. Headings and landmarks are not overlaid.
+_WIDGET_TAGS = frozenset({"button", "input", "select", "textarea", "summary", "option"})
+_WIDGET_ROLES = frozenset(
     {
         "button",
         "checkbox",
         "combobox",
-        "link",
+        "gridcell",
         "listbox",
         "menu",
         "menuitem",
@@ -49,17 +48,17 @@ _ACTIONABLE_ROLES = frozenset(
         "switch",
         "tab",
         "textbox",
+        "treeitem",
     }
 )
 _ISOLATED_WORLD = "interface-compiler"
 _NODE_GROUP = "interface-compiler-nodes"
 _EVAL_TIMEOUT_MS = 5_000
 _DEADLINE_S = 5.0
-# Stop overlaying once this much of the deadline is gone and keep HTML roles.
-# A partial tree is about a millisecond per node, so the cap is what keeps a
-# table of thousands of controls inside the deadline.
-_OVERLAY_BUDGET_FRACTION = 0.25
-_OVERLAY_BUDGET_CAP_S = 0.35
+# The DOM walk uses about the first two seconds. The rest of the deadline is
+# for accessible names on widgets, then links.
+_OVERLAY_BUDGET_FRACTION = 0.5
+_OVERLAY_BUDGET_CAP_S = 2.5
 _READ_PAYLOAD = (
     "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
     "forms:this.forms,modals:this.modals});}"
@@ -139,7 +138,7 @@ class ElementFact:
     label_text: str
     group_key: str | None
     constraints: Constraints
-    from_ax: bool = False
+    name_source: Literal["ax", "html"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,12 +187,14 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
 
     The DOM walk in `collect.js` is the source of the element list. It runs in
     an isolated world, so a page that replaces ``querySelectorAll`` or
-    ``Array.from`` cannot change the walk.     Chromium's accessibility tree
-    overlays role and name, actionable controls first. Each element is joined
-    by the object id returned from that world, not by an attribute the page
-    can see. Shadow controls (a date input's spinbuttons, for example) are not
-    separate facts. When the overlay budget runs out, or a partial tree fails,
-    the remaining controls keep the HTML role.
+    ``Array.from`` cannot change the walk. Chromium's accessibility tree
+    overlays role and name for widgets, then links. Each element is joined by
+    the object id returned from that world, not by an attribute the page can
+    see. Shadow controls (a date input's spinbuttons, for example) are not
+    separate facts. Headings keep the HTML
+    name. When the overlay budget runs out, the remaining controls keep the
+    HTML name and ``name_source`` is ``html``. A navigation or a stale node
+    raises instead of mixing two documents.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -274,6 +275,8 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
     session = page.context.new_cdp_session(page)
     try:
         context_id = _isolated_context(session)
+        started_frame = _require_frame_stamp(session)
+        started_url = started_frame[0]
         evaluated = session.send(
             "Runtime.evaluate",
             {
@@ -301,8 +304,10 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
             session,
             object_ids,
             _overlay_budget(deadline_s),
-            _actionable_first(payload, len(object_ids)),
+            _overlay_order(payload, len(object_ids)),
         )
+        if _require_frame_stamp(session) != started_frame:
+            raise FactCollectionError("fact collection lost the document")
     except Exception as exc:
         if _is_collection_abort(exc):
             raise FactCollectionError("fact collection exceeded the deadline") from exc
@@ -315,7 +320,9 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
             pass
     if not isinstance(payload, dict):
         raise TypeError("fact collector must return an object")
-    return _page_facts(normalized_page_url(page), page.title(), payload, overlay)
+    # The URL is the one recorded before the walk. A navigation after the
+    # stamp check cannot relabel these facts with the next document.
+    return _page_facts(started_url, page.title(), payload, overlay)
 
 
 def _isolated_context(session: CDPSession) -> int:
@@ -382,30 +389,30 @@ def _release_nodes(session: CDPSession) -> None:
         pass
 
 
-def _actionable_first(payload: object, count: int) -> list[int]:
-    """Indexes of actionable controls, then everything else, in document order."""
+def _overlay_order(payload: object, count: int) -> list[int]:
+    """Widget indexes, then links. Everything else is left on the HTML name."""
     if count <= 0:
         return []
     rows = payload.get("elements") if isinstance(payload, dict) else None
     fields = payload.get("fields") if isinstance(payload, dict) else None
     if not isinstance(rows, list) or not isinstance(fields, list):
-        return list(range(count))
+        return []
     tag_at = fields.index("tag") if "tag" in fields else None
     role_at = fields.index("role") if "role" in fields else None
     if not isinstance(tag_at, int) or not isinstance(role_at, int):
-        return list(range(count))
-    first: list[int] = []
-    rest: list[int] = []
+        return []
+    widgets: list[int] = []
+    links: list[int] = []
     for index in range(min(count, len(rows))):
         row = rows[index]
         tag = row[tag_at] if isinstance(row, list) and tag_at < len(row) else None
         role = row[role_at] if isinstance(row, list) and role_at < len(row) else None
-        if tag in _ACTIONABLE_TAGS or role in _ACTIONABLE_ROLES:
-            first.append(index)
-        else:
-            rest.append(index)
-    covered = len(first) + len(rest)
-    return first + rest + list(range(covered, count))
+        if tag in _WIDGET_TAGS or role in _WIDGET_ROLES:
+            widgets.append(index)
+            continue
+        if tag == "a" or role == "link":
+            links.append(index)
+    return widgets + links
 
 
 def _accessibility_overlay(
@@ -414,14 +421,13 @@ def _accessibility_overlay(
     budget_s: float,
     order: list[int],
 ) -> dict[str, _AxHit]:
-    """Role and name for as many elements as the budget allows.
+    """Role and name for widgets, then links, until the budget runs out.
 
-    ``order`` visits actionable controls before the rest. One partial tree per
-    element avoids building Chromium's full tree, which is the slow step on
-    tables. A failed partial tree stops the overlay; later elements keep the
-    HTML role.
+    One partial tree per element avoids building Chromium's full tree, which
+    is the slow step on tables. Running out of budget keeps the HTML name.
+    Losing the node or the document does not.
     """
-    if budget_s <= 0 or not object_ids:
+    if budget_s <= 0 or not object_ids or not order:
         return {}
     session.send("Accessibility.enable")
     started = time.perf_counter()
@@ -436,8 +442,10 @@ def _accessibility_overlay(
                 "Accessibility.getPartialAXTree",
                 {"objectId": object_ids[index], "fetchRelatives": False},
             )
-        except PlaywrightError:
-            break
+        except PlaywrightError as exc:
+            if _is_document_lost(exc):
+                raise FactCollectionError("fact collection lost the document") from exc
+            raise
         hit = _hit_from_partial(tree)
         if hit is not None:
             resolved[str(index)] = hit
@@ -458,15 +466,59 @@ def _hit_from_partial(tree: object) -> _AxHit | None:
     return None
 
 
-def _frame_id(tree: object) -> str:
+def _main_frame(tree: object) -> dict[str, Any]:
     if not isinstance(tree, dict):
         raise TypeError("page has no frame")
     frame_tree = tree.get("frameTree")
     frame = frame_tree.get("frame") if isinstance(frame_tree, dict) else None
-    frame_id = frame.get("id") if isinstance(frame, dict) else None
+    if not isinstance(frame, dict):
+        raise TypeError("page has no frame")
+    return frame
+
+
+def _frame_id(tree: object) -> str:
+    frame_id = _main_frame(tree).get("id")
     if not isinstance(frame_id, str) or not frame_id:
         raise TypeError("page has no frame")
     return frame_id
+
+
+def _frame_stamp(session: CDPSession) -> tuple[str, str]:
+    """Main-frame URL and loader id for the document being collected."""
+    frame = _main_frame(session.send("Page.getFrameTree"))
+    url = frame.get("url")
+    loader = frame.get("loaderId")
+    if not isinstance(url, str) or not isinstance(loader, str) or not loader:
+        raise FactCollectionError("fact collection lost the document")
+    return url, loader
+
+
+def _require_frame_stamp(session: CDPSession) -> tuple[str, str]:
+    """The current document, or an error if the page navigated away."""
+    try:
+        return _frame_stamp(session)
+    except PlaywrightError as exc:
+        if _is_document_lost(exc):
+            raise FactCollectionError("fact collection lost the document") from exc
+        raise
+
+
+def _is_document_lost(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        part in text
+        for part in (
+            "navigat",
+            "stale",
+            "no longer valid",
+            "does not belong to the document",
+            "detached",
+            "destroyed",
+            "cannot find context",
+            "no node with given id",
+            "could not find node",
+        )
+    )
 
 
 def _remote_object(result: object) -> dict[str, Any]:
@@ -578,6 +630,7 @@ def _element_row(item: object, fields: list[str]) -> dict[str, Any]:
 def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
     role = _req(item, "role", str)
     name = _req(item, "name", str)
+    name_source: Literal["ax", "html"] = "html"
     if hit is not None:
         ax_role = hit.role or role
         # type=file is a button in Chromium's tree. Keep the HTML role so the
@@ -587,6 +640,7 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
         role = ax_role
         if hit.name is not None:
             name = hit.name
+            name_source = "ax"
     constraints = item.get("constraints")
     box = item.get("box")
     options = item.get("options")
@@ -651,7 +705,7 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
             minlength=_non_negative_int(constraints, "minlength"),
             maxlength=_non_negative_int(constraints, "maxlength"),
         ),
-        from_ax=hit is not None,
+        name_source=name_source,
     )
 
 

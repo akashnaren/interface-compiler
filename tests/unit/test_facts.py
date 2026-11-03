@@ -477,7 +477,13 @@ def test_facts_disclosure(facts_page: Page, fixture_base_url: str) -> None:
         covered=False,
     )
     assert "summary|button" in fabric.skeleton_path
-    _expect(_by_id(facts, "fabric-details"), role="group", name="", aria_expanded="false")
+    _expect(
+        _by_id(facts, "fabric-details"),
+        role="group",
+        name="Fabric Cotton",
+        aria_expanded="false",
+        name_source="html",
+    )
 
 
 def test_facts_menu(facts_page: Page, fixture_base_url: str) -> None:
@@ -943,8 +949,42 @@ def test_facts_input_roles_agree_when_the_overlay_stops(
     fallback = _by_id(collect_facts(facts_page), "c")
     assert overlaid.role == role
     assert overlaid.input_type == control_type
+    assert overlaid.name_source == "ax"
     assert fallback.role == role
-    assert fallback.from_ax is False
+    assert fallback.name_source == "html"
+
+
+@pytest.mark.parametrize(
+    ("html", "name"),
+    [
+        (
+            (
+                "<fieldset><legend>Search options</legend>"
+                "<input id='c' type='submit' value='Delete account'></fieldset>"
+            ),
+            "Delete account",
+        ),
+        (
+            "<button id='c'><img alt='Delete account'></button>",
+            "Delete account",
+        ),
+        (
+            "<button id='c'><span style='display:none'>Search</span>Pay now</button>",
+            "Pay now",
+        ),
+    ],
+)
+def test_facts_html_fallback_names_skip_legend_and_hidden_text(
+    html: str,
+    name: str,
+    facts_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("interface_compiler.browser.facts._OVERLAY_BUDGET_CAP_S", 0.0)
+    facts_page.set_content(f"<!doctype html><title>names</title>{html}")
+    element = _by_id(collect_facts(facts_page), "c")
+    assert element.name == name
+    assert element.name_source == "html"
 
 
 @pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table")])
@@ -997,17 +1037,16 @@ try:
     row = next(element for element in facts.elements if element.html_id == "r0")
     go = next(element for element in facts.elements if element.html_id == "go")
     headings = [element for element in facts.elements if element.tag == "h1"]
-    covered = [element for element in facts.elements if element.from_ax]
+    covered = [element for element in facts.elements if element.name_source == "ax"]
     actionable = {"a", "button", "input", "select", "textarea", "summary", "option"}
     if not (inputs == rows and links == rows and field.name == "Field 0" and row.name == "Row 0"):
         raise SystemExit(2)
     if last.disabled or last.role != "textbox":
         raise SystemExit(2)
-    # Headings come first in the document. Coverage still lands on the button,
-    # and it does not land on those headings while controls remain.
-    if go.role != "button" or go.name != "From AX" or not go.from_ax:
+    # Headings come first in the document and are not overlaid. The button is.
+    if go.role != "button" or go.name != "From AX" or go.name_source != "ax":
         raise SystemExit(2)
-    if not headings or any(element.from_ax for element in headings):
+    if not headings or any(element.name_source == "ax" for element in headings):
         raise SystemExit(2)
     if not covered or any(element.tag not in actionable for element in covered):
         raise SystemExit(2)

@@ -93,7 +93,8 @@ class Engine:
             raise RuntimeError("browser is already started")
         # Playwright rewrites the browser's own root failure to the same text as
         # a namespace failure, so the process id has to be checked first.
-        if os.geteuid() == 0:
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None and geteuid() == 0:
             raise RuntimeError(_SANDBOX_ROOT)
         playwright = sync_playwright().start()
         self._playwright = playwright

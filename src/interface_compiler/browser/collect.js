@@ -47,6 +47,17 @@
     return String(value || "").replace(/\s+/g, " ").trim();
   }
 
+  function hidesText(el) {
+    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") {
+      return true;
+    }
+    const known = displayNone.get(el);
+    if (known !== undefined) {
+      return known === true;
+    }
+    return getComputedStyle(el).display === "none";
+  }
+
   function ownText(el) {
     let text = "";
     for (const node of el.childNodes) {
@@ -55,6 +66,13 @@
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         const tag = node.tagName;
         if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") {
+          continue;
+        }
+        if (hidesText(node)) {
+          continue;
+        }
+        if (tag === "IMG") {
+          text += ` ${node.getAttribute("alt") || ""}`;
           continue;
         }
         text += ` ${ownText(node)}`;
@@ -100,6 +118,7 @@
   let flagInert = new Map();
   let flagAriaDisabled = new Map();
   let styleHidden = new Map();
+  let displayNone = new Map();
 
   function labelFor(el) {
     const id = elementId(el);
@@ -141,6 +160,22 @@
     const placeholder = clean(el.getAttribute("placeholder"));
     if (placeholder) {
       return placeholder;
+    }
+    // A submit value is its name. The fieldset legend must not replace it.
+    if (el.tagName === "INPUT") {
+      const type = (el.getAttribute("type") || "").toLowerCase();
+      if (type === "submit" || type === "reset" || type === "button") {
+        const value = clean(el.value);
+        if (value) {
+          return value;
+        }
+      }
+      if (type === "image") {
+        const alt = clean(el.getAttribute("alt"));
+        if (alt) {
+          return alt;
+        }
+      }
     }
     const fieldset = el.closest("fieldset");
     if (fieldset) {
@@ -517,6 +552,7 @@
     flagInert = new Map();
     flagAriaDisabled = new Map();
     styleHidden = new Map();
+    displayNone = new Map();
     for (const node of document.querySelectorAll("[id]")) {
       const id = elementId(node);
       if (!id) {
@@ -566,6 +602,7 @@
     flagInert.set(el, inert);
     flagAriaDisabled.set(el, ariaDisabled);
     styleHidden.set(el, visuallyHidden);
+    displayNone.set(el, style.display === "none");
     if (el.tagName === "FIELDSET") {
       let text = "";
       for (const child of el.children) {
