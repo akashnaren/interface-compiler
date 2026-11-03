@@ -1179,6 +1179,124 @@ def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: P
             assert host.options[0].disabled is True
 
 
+def _text_at(page: Page, css: str) -> str:
+    text = page.evaluate(
+        "(css) => { const node = document.querySelector(css); return node ? node.textContent : ''; }",
+        css,
+    )
+    assert isinstance(text, str)
+    return text
+
+
+def _require_selector(page: Page, facts: PageFacts, label: str, *, required: bool) -> None:
+    # A duplicate id or name must not select the earlier control. An unfinished
+    # count drops the later row instead of emitting #id or tag[name].
+    found = [element for element in facts.elements if element.name == label]
+    assert len(found) <= 1, label
+    if not found:
+        assert required is False
+        assert facts.truncated is True
+        return
+    element = found[0]
+    assert element.css not in {"#dup", 'button[name="same"]'}
+    assert _text_at(page, element.css) == label
+
+
+@pytest.mark.parametrize(
+    ("case", "disabled", "aria_disabled"),
+    [
+        (
+            "legend",
+            {
+                "leg": False,
+                "legin": False,
+                "legta": False,
+                "legsel": False,
+                "legopt": False,
+                "out": True,
+                "leg2": True,
+            },
+            {},
+        ),
+        ("aria", {}, {"own": False, "bare": False, "yes": True}),
+        ("dup-id", {}, {}),
+        ("dup-name", {}, {}),
+    ],
+)
+def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
+    case: str,
+    disabled: dict[str, bool],
+    aria_disabled: dict[str, bool],
+    facts_page: Page,
+) -> None:
+    if case == "legend":
+        html = (
+            "<fieldset disabled><legend>"
+            "<button id='leg' type='button'>Leg</button>"
+            "<input id='legin'>"
+            "<textarea id='legta'></textarea>"
+            "<select id='legsel'><option id='legopt'>A</option></select>"
+            "</legend><button id='out' type='button'>Out</button></fieldset>"
+            "<fieldset disabled><legend>First</legend>"
+            "<legend><button id='leg2' type='button'>Second</button></legend>"
+            "</fieldset>"
+        )
+    elif case == "aria":
+        html = (
+            "<div aria-disabled='true'>"
+            "<button id='own' type='button' aria-disabled='false'>No</button>"
+            "<button id='bare' type='button'>Bare</button>"
+            "</div>"
+            "<button id='yes' type='button' aria-disabled='true'>Yes</button>"
+        )
+    elif case == "dup-id":
+        html = (
+            "<button id='dup' type='button'>Keep my data</button>"
+            + "".join(f"<i id='i{index}'>x</i>" for index in range(1_000_000))
+            + "<button id='dup' type='button'>Delete everything</button>"
+        )
+    elif case == "dup-name":
+        html = (
+            "<button type='button' name='same'>One</button>"
+            + "<div name='n'></div>" * 100_000
+            + "<button type='button' name='same'>Two</button>"
+        )
+    else:
+        raise AssertionError(case)
+    session = None
+    try:
+        facts_page.set_content(
+            f"<!doctype html><title>{case}</title>{html}",
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        if case == "dup-name":
+            session = facts_page.context.new_cdp_session(facts_page)
+            session.send("Emulation.setCPUThrottlingRate", {"rate": 4})
+            facts = collect_facts(facts_page, deadline_s=2)
+        else:
+            facts = collect_facts(facts_page)
+        for html_id, expect in disabled.items():
+            assert _by_id(facts, html_id).disabled == expect
+        for html_id, expect in aria_disabled.items():
+            assert _by_id(facts, html_id).aria_disabled == expect
+        if case == "legend":
+            assert _by_id(facts, "legsel").options[0].disabled is False
+        elif case == "dup-id":
+            _require_selector(facts_page, facts, "Keep my data", required=True)
+            _require_selector(facts_page, facts, "Delete everything", required=False)
+        elif case == "dup-name":
+            _require_selector(facts_page, facts, "One", required=True)
+            _require_selector(facts_page, facts, "Two", required=False)
+    finally:
+        if session is not None:
+            session.send("Emulation.setCPUThrottlingRate", {"rate": 1})
+        facts_page.set_content(
+            "<!doctype html><title>empty</title>",
+            wait_until="domcontentloaded",
+        )
+
+
 def test_facts_ancestor_flags_do_not_wait_for_the_document_walk(facts_page: Page) -> None:
     # A million inlines would exhaust the document walk. Flags still come from
     # each control's own ancestors, or the control is absent.

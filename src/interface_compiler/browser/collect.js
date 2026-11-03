@@ -284,7 +284,9 @@
   let styleHidden = new Map();
   let displayNone = new Map();
   let visibilityHidden = new Map();
-  let flagFieldsetDisabled = new Map();
+  // Partial id and name scans count the first duplicate and miss the rest.
+  let idsFinished = false;
+  let namesFinished = false;
 
   function labelFor(el) {
     const id = elementId(el);
@@ -658,10 +660,20 @@
     return null;
   }
 
-  function cssOf(el) {
+  function idShortcut(el) {
+    if (!idsFinished) {
+      return "";
+    }
     const id = elementId(el);
     if (id && idCounts.get(id) === 1) {
       return `#${CSS.escape(id)}`;
+    }
+    return "";
+  }
+
+  function nameShortcut(el) {
+    if (!namesFinished) {
+      return "";
     }
     const name = getAttribute(el, "name");
     if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
@@ -669,6 +681,14 @@
       if (nameCounts.get(key) === 1) {
         return `${localName(el)}[name="${name}"]`;
       }
+    }
+    return "";
+  }
+
+  function cssOf(el) {
+    const shortcut = idShortcut(el) || nameShortcut(el);
+    if (shortcut) {
+      return shortcut;
     }
     const parts = [];
     let node = el;
@@ -766,8 +786,9 @@
     const hidden = closest(el, "[hidden]") !== null;
     const ariaHidden = closest(el, "[aria-hidden='true']") !== null;
     const inert = closest(el, "[inert]") !== null;
-    const ariaDisabled = closest(el, "[aria-disabled='true']") !== null;
-    const fieldsetDisabled = closest(el, "fieldset[disabled]") !== null;
+    // aria-disabled does not inherit. The element's own value matches the AX tree,
+    // including aria-disabled="false" under an aria-disabled ancestor.
+    const ariaDisabled = getAttribute(el, "aria-disabled") === "true";
     let displayHidden = hidden;
     let visibilityIsHidden = false;
     if (typeof readCheckVisibility === "function") {
@@ -786,7 +807,6 @@
     flagAriaHidden.set(el, ariaHidden);
     flagInert.set(el, inert);
     flagAriaDisabled.set(el, ariaDisabled);
-    flagFieldsetDisabled.set(el, fieldsetDisabled);
     displayNone.set(el, displayHidden);
     visibilityHidden.set(el, visibilityIsHidden);
     styleHidden.set(el, displayHidden || visibilityIsHidden);
@@ -982,7 +1002,8 @@
     styleHidden = new Map();
     displayNone = new Map();
     visibilityHidden = new Map();
-    flagFieldsetDisabled = new Map();
+    idsFinished = false;
+    namesFinished = false;
     const ids = document.querySelectorAll("[id]");
     for (let index = 0; index < ids.length; index += 1) {
       if (!withinBudget()) {
@@ -994,6 +1015,7 @@
       }
       idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
+    idsFinished = true;
     const named = document.querySelectorAll("[name]");
     for (let index = 0; index < named.length; index += 1) {
       if (!withinBudget()) {
@@ -1006,6 +1028,7 @@
       const key = `${localName(named[index])}\n${name}`;
       nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
     }
+    namesFinished = true;
     const labels = document.querySelectorAll("label[for]");
     for (let index = 0; index < labels.length; index += 1) {
       if (!withinBudget()) {
@@ -1109,21 +1132,10 @@
     return true;
   }
 
-  // An id or name selector does not use nth-of-type. Skipping the sibling
-  // scan keeps the flag budget for the rows that still need one.
+  // A finished id or name count can skip nth-of-type. An unfinished count
+  // has only seen the first duplicate, so the row keeps the positional path.
   function selectorWithoutNth(el) {
-    const id = elementId(el);
-    if (id && idCounts.get(id) === 1) {
-      return true;
-    }
-    const name = getAttribute(el, "name");
-    if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
-      const key = `${localName(el)}\n${name}`;
-      if (nameCounts.get(key) === 1) {
-        return true;
-      }
-    }
-    return false;
+    return idShortcut(el) !== "" || nameShortcut(el) !== "";
   }
 
   function elementRow(el, rect, coveredFlag) {
@@ -1141,14 +1153,7 @@
       formIndex(el),
       binding.form_method,
       binding.form_action,
-      role === "option"
-        ? optionDisabled(el) || flagFieldsetDisabled.get(el) === true
-        : elementMatches(el, ":disabled") ||
-          (flagFieldsetDisabled.get(el) === true &&
-            (tagName(el) === "BUTTON" ||
-              tagName(el) === "INPUT" ||
-              tagName(el) === "SELECT" ||
-              tagName(el) === "TEXTAREA")),
+      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
       el.readOnly === true,
       flagAriaDisabled.get(el) === true,
       flagInert.get(el) === true,
