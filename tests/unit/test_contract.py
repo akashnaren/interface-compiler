@@ -626,22 +626,93 @@ def test_contract_items_nesting_limit(tmp_path: Path) -> None:
     with pytest.raises(ContractError) as doc_error:
         validate_doc(doc)
     assert where in str(doc_error.value)
-    assert "nesting exceeds 32" in str(doc_error.value)
+    assert "nesting exceeds 32 (max 32)" in str(doc_error.value)
 
     with pytest.raises(ValidationError) as model_error:
         ViewDoc.model_validate(doc)
-    assert "nesting exceeds 32" in str(model_error.value)
+    assert "nesting exceeds 32 (max 32)" in str(model_error.value)
 
     with pytest.raises(ContractError) as args_error:
         validate_args(doc["affordances"][1], {"size": []})
-    assert "nesting exceeds 32" in str(args_error.value)
+    assert "nesting exceeds 32 (max 32)" in str(args_error.value)
 
     result = _cli_validate(doc, tmp_path)
     assert result.exit_code != 0
     assert isinstance(result.exception, SystemExit)
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
-    assert "nesting exceeds 32" in result.stderr
+    assert "nesting exceeds 32 (max 32)" in result.stderr
+
+
+def test_contract_items_nesting_boundary() -> None:
+    allowed = _paper()
+    allowed["affordances"][1]["input"]["properties"]["size"] = _items_chain(32)
+    validate_doc(allowed)
+    ViewDoc.model_validate(allowed)
+
+    rejected = _paper()
+    rejected["affordances"][1]["input"]["properties"]["size"] = _items_chain(33)
+    with pytest.raises(ContractError) as exc:
+        validate_doc(rejected)
+    assert "nesting exceeds 32 (max 32)" in str(exc.value)
+    with pytest.raises(ValidationError) as model_error:
+        ViewDoc.model_validate(rejected)
+    assert "nesting exceeds 32 (max 32)" in str(model_error.value)
+
+
+def _deep_object(depth: int) -> dict:
+    node: dict = {"leaf": True}
+    for _ in range(depth):
+        node = {"n": node}
+    return node
+
+
+def _assert_deep_object(value: object, depth: int) -> None:
+    node = value
+    for _ in range(depth):
+        assert isinstance(node, dict)
+        node = node["n"]
+    assert node == {"leaf": True}
+
+
+def test_contract_model_validate_deep_values_are_not_recursion_errors() -> None:
+    items = _paper()
+    items["affordances"][1]["input"]["properties"]["size"] = _items_chain(3000)
+    with pytest.raises(ValidationError) as view_items:
+        ViewDoc.model_validate(items)
+    assert "nesting exceeds 32 (max 32)" in str(view_items.value)
+
+    act = _act_result()
+    act["doc"]["affordances"][1]["input"]["properties"]["size"] = _items_chain(3000)
+    with pytest.raises(ValidationError) as act_items:
+        ActResult.model_validate(act)
+    assert "nesting exceeds 32 (max 32)" in str(act_items.value)
+
+    located = _paper()
+    located["affordances"][0]["x"] = {"locator": {"kind": "ax", "extra": _deep_object(3000)}}
+    parsed = ViewDoc.model_validate(located)
+    affordance_x = parsed.affordances[0].x
+    assert affordance_x is not None and affordance_x.locator is not None
+    extras = affordance_x.locator.model_extra or {}
+    _assert_deep_object(extras["extra"], 3000)
+
+    detailed = _act_result()
+    detailed["effect"]["predicted"]["detail"] = _deep_object(3000)
+    parsed_act = ActResult.model_validate(detailed)
+    assert parsed_act.effect is not None
+    _assert_deep_object(parsed_act.effect.predicted.detail, 3000)
+
+
+def test_contract_validate_args_lets_memory_error_propagate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise MemoryError("nope")
+
+    monkeypatch.setattr("interface_compiler.contract.validate.Draft202012Validator", _boom)
+    affordance = {"id": "go", "enabled": True, "input": {"type": "object", "properties": {}}}
+    with pytest.raises(MemoryError):
+        validate_args(affordance, {})
 
 
 def test_contract_duplicate_affordance_ids_rejected() -> None:

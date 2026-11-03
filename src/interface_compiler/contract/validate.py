@@ -97,6 +97,8 @@ def validate_args(affordance: object, args: object) -> None:
             message = f"input: invalid regular expression ({exc})"
             errors = [message]
         raise ContractError(errors[0], errors=errors) from exc
+    except MemoryError:
+        raise
     except Exception as exc:
         message = f"input: {type(exc).__name__}: {exc}"
         raise ContractError(message, errors=[message]) from exc
@@ -260,10 +262,16 @@ def _echo_pattern(pattern: str) -> str:
 
 def nesting_too_deep(where: str) -> str:
     """Contract message for an items or properties chain past the nesting limit."""
-    return f"{where}: nesting exceeds {_MAX_SCHEMA_DEPTH}"
+    return f"{where}: nesting exceeds {_MAX_SCHEMA_DEPTH} (max {_MAX_SCHEMA_DEPTH})"
 
 
 def _schema_nesting_errors(node: object, where: str, *, depth: int = 0) -> list[str]:
+    """Reject a schema node more than ``_MAX_SCHEMA_DEPTH`` edges below its property.
+
+    ``depth`` is the number of ``items`` or nested ``properties`` edges followed
+    to reach ``node``. Depth 32 is allowed. Depth 33 is not. The input object's
+    own ``properties`` map is not an edge; callers pass each property at depth 0.
+    """
     if depth > _MAX_SCHEMA_DEPTH:
         return [nesting_too_deep(where)]
     if not isinstance(node, Mapping):
@@ -280,6 +288,18 @@ def _schema_nesting_errors(node: object, where: str, *, depth: int = 0) -> list[
     return errors
 
 
+def _input_nesting_errors(schema: object, where: str) -> list[str]:
+    if not isinstance(schema, Mapping):
+        return []
+    errors: list[str] = []
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        for key, child in properties.items():
+            child_where = f"{where}/properties/{key}"
+            errors.extend(_schema_nesting_errors(child, child_where, depth=0))
+    return errors
+
+
 def _document_nesting_errors(instance: object, *, prefix: str = "") -> list[str]:
     if not isinstance(instance, Mapping):
         return []
@@ -290,7 +310,7 @@ def _document_nesting_errors(instance: object, *, prefix: str = "") -> list[str]
             if not isinstance(item, Mapping):
                 continue
             where = f"{prefix}affordances/{index}/input"
-            errors.extend(_schema_nesting_errors(item.get("input"), where))
+            errors.extend(_input_nesting_errors(item.get("input"), where))
     doc = instance.get("doc")
     if isinstance(doc, Mapping):
         errors.extend(_document_nesting_errors(doc, prefix=f"{prefix}doc/"))
@@ -299,7 +319,7 @@ def _document_nesting_errors(instance: object, *, prefix: str = "") -> list[str]
 
 def _ensure_input_schema(schema: object, where: str) -> None:
     """Reject an affordance input that the frozen input schema would reject."""
-    depth_errors = _schema_nesting_errors(schema, where)
+    depth_errors = _input_nesting_errors(schema, where)
     if depth_errors:
         raise ContractError(depth_errors[0], errors=depth_errors)
     if not isinstance(schema, Mapping):
@@ -334,7 +354,7 @@ def _input_schema_validator() -> Draft202012Validator:
     return Draft202012Validator(schema, format_checker=_format_checker())
 
 
-def _prop_errors(prop: object, where: str, depth: int = 1) -> list[str]:
+def _prop_errors(prop: object, where: str, depth: int = 0) -> list[str]:
     if depth > _MAX_SCHEMA_DEPTH:
         return [nesting_too_deep(where)]
     if not isinstance(prop, Mapping):
