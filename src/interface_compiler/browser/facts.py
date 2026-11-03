@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -77,6 +78,8 @@ _DOCUMENT_CHECK_S = 0.2
 _ROW_BUILD_S = 0.002
 # releaseObjectGroup and session detach after the facts are built.
 _CLEANUP_S = 0.4
+# HTML fallback names collapse whitespace and trim. AX names use the same rule.
+_AX_NAME_SPACE = re.compile(r"\s+")
 # Absolute perf_counter deadline for the collection in progress. Unset when
 # overlay tests call the helper on their own.
 _ax_deadline: ContextVar[float | None] = ContextVar("ax_deadline", default=None)
@@ -156,6 +159,7 @@ class ElementFact:
     group_key: str | None
     constraints: Constraints
     name_source: Literal["ax", "html"]
+    in_dialog: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +187,10 @@ class PageFacts:
     forms: tuple[FormFact, ...]
     modals: tuple[ModalFact, ...]
     truncated: bool = False
+    # Checks that did not run. "title" and "identity" are the document pair.
+    # An empty tuple means both ran. The cap on object ids is ``ax_capped``.
+    skipped_checks: tuple[str, ...] = ()
+    ax_capped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,9 +217,10 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     overlays role and name for on-screen widgets, then other widgets, then
     visible links, then the remaining links. Each element is joined by the
     object id returned from that world, not by an attribute the page can see.
-    Shadow controls (a date input's spinbuttons, for example) are not separate
-    facts. Headings keep the HTML name. The overlay budget is whatever remains
-    of the deadline after the walk, minus one second, and at most 2.5s. When
+    Open shadow roots are collected. Closed roots, and any root that cannot
+    be read, are omitted. Headings keep the HTML name. The overlay budget is
+    whatever remains of the deadline after the walk, minus one second, and at
+    most 2.5s. When
     it runs out, the remaining controls keep the HTML name and ``name_source``
     is ``html``. The walk itself keeps that same second in reserve for the
     read-back and the overlay. Coverage samples the center of each visible
@@ -226,7 +235,9 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     from each chosen row, so they do not wait on the rest of the document.
     Chunk reads (including the first), fact construction, and the title and
     loader checks all stop on the same clock, with ``truncated`` set, while
-    there is still time to release the session. A walk that is given no time,
+    there is still time to release the session. A skipped title or identity
+    check is listed on ``skipped_checks`` as well as ``truncated``. A walk
+    that is given no time,
     or that ships no rows from a page that has controls, raises instead of
     returning an empty document. Truncation does not turn that empty result
     into a success. Collection also raises when the browser driver cannot be
@@ -346,11 +357,14 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
         # Title and loader checks are on the clock. Skipping them keeps the
         # URL and title the walk already stored and marks the facts truncated.
         document_checked = False
+        skipped: list[str] = []
         if _ax_call_fits(_DOCUMENT_CHECK_S):
             _page_title(page)
             if _require_frame_stamp(session)[1] != started_loader:
                 raise FactCollectionError("fact collection lost the document")
             document_checked = True
+        else:
+            skipped.extend(("title", "identity"))
         payload = _collected_payload(session, root_id)
         if isinstance(payload, dict) and payload.get("deadline") is True:
             raise FactCollectionError("fact collection exceeded the deadline")
@@ -359,18 +373,28 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
         # Node ids exist only to feed the overlay. A cold partial tree is one
         # uninterruptible call, so skip both unless that call fits. A huge
         # document is skipped outright: the tree cost follows the DOM, not
-        # how many rows the read-back kept.
+        # how many rows the read-back kept. The 160 cap keeps the priority
+        # widgets, not the first 160 rows in document order.
         object_ids: list[str] = []
         overlay: dict[str, _AxHit] = {}
         controls = payload.get("controls") if isinstance(payload, dict) else None
         if not isinstance(controls, int):
             raw_rows = payload.get("elements") if isinstance(payload, dict) else None
             controls = len(raw_rows) if isinstance(raw_rows, list) else 0
+        indexes = payload.get("node_indexes") if isinstance(payload, dict) else None
+        row_count = 0
+        raw_rows = payload.get("elements") if isinstance(payload, dict) else None
+        if isinstance(raw_rows, list):
+            row_count = len(raw_rows)
         # An unfinished index means the DOM is larger than the walk budget.
         # A cold accessibility tree on that document can outlast the deadline.
         indexed = payload.get("indexed") is not False if isinstance(payload, dict) else False
         if indexed and controls < _AX_LARGE_PAGE_ROWS and _ax_call_fits(_AX_COLD_CALL_S):
-            object_ids = _node_object_ids(session, root_id)
+            object_ids = _expand_object_ids(
+                _node_object_ids(session, root_id),
+                indexes,
+                row_count,
+            )
         if object_ids and _ax_call_fits(_AX_COLD_CALL_S):
             overlay = _accessibility_overlay(
                 session,
@@ -380,17 +404,27 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             )
         # The overlay can be the thing that navigates. Check the loader again
         # after it returns; the check before the read-back is too early.
-        if (
-            document_checked
-            and _ax_call_fits(_DOCUMENT_CHECK_S)
-            and _require_frame_stamp(session)[1] != started_loader
-        ):
-            raise FactCollectionError("fact collection lost the document")
+        # Skipping that check is recorded. It used to leave no trace.
+        if document_checked:
+            if _ax_call_fits(_DOCUMENT_CHECK_S):
+                if _require_frame_stamp(session)[1] != started_loader:
+                    raise FactCollectionError("fact collection lost the document")
+            else:
+                skipped.append("identity")
+                if isinstance(payload, dict):
+                    payload["truncated"] = True
         if not isinstance(payload, dict):
             raise TypeError("fact collector must return an object")
         page_url, title, truncated = _walked_document(payload)
         # Evaluated before session cleanup, while the deadline is still set.
-        facts = _page_facts(page_url, title, payload, overlay, truncated)
+        facts = _page_facts(
+            page_url,
+            title,
+            payload,
+            overlay,
+            truncated,
+            skipped_checks=tuple(dict.fromkeys(skipped)),
+        )
         # Row construction can drop every transferred row. That is still an
         # empty document from a page that has controls.
         if not facts.elements and isinstance(controls, int) and controls > 0:
@@ -483,6 +517,31 @@ def _object_id(result: object) -> str:
     if isinstance(object_id, str) and object_id:
         return object_id
     raise TypeError("fact collector returned no object")
+
+
+def _expand_object_ids(object_ids: list[str], indexes: object, row_count: int) -> list[str]:
+    """Line object ids up with element rows.
+
+    ``indexes`` is the priority subset chosen in the page. A missing list
+    means the ids are already in row order. A length mismatch is not joined:
+    the overlay is skipped rather than naming the wrong control.
+    """
+    if not object_ids:
+        return []
+    if not isinstance(indexes, list):
+        return object_ids
+    if len(indexes) != len(object_ids):
+        return []
+    width = row_count
+    for index in indexes:
+        if isinstance(index, int) and index + 1 > width:
+            width = index + 1
+    expanded = [""] * width
+    for index, object_id in zip(indexes, object_ids, strict=True):
+        if not isinstance(index, int) or not object_id or index < 0 or index >= width:
+            return []
+        expanded[index] = object_id
+    return expanded
 
 
 def _node_object_ids(session: CDPSession, root_id: str) -> list[str]:
@@ -598,12 +657,15 @@ def _accessibility_overlay(
             break
         if index < 0 or index >= len(object_ids):
             continue
+        object_id = object_ids[index]
+        if not object_id:
+            continue
         if not _ax_call_fits(needed):
             break
         try:
             tree = session.send(
                 "Accessibility.getPartialAXTree",
-                {"objectId": object_ids[index], "fetchRelatives": False},
+                {"objectId": object_id, "fetchRelatives": False},
             )
         except PlaywrightError as exc:
             if _is_document_lost(exc):
@@ -787,15 +849,20 @@ def _ax_role(node: dict[str, Any]) -> str | None:
     return None
 
 
+def _clean_ax_name(value: str) -> str:
+    """Collapse whitespace the way the HTML fallback name does."""
+    return _AX_NAME_SPACE.sub(" ", value).strip()
+
+
 def _ax_name(node: dict[str, Any]) -> str | None:
     if "name" not in node:
         return None
     raw = node["name"]
     if isinstance(raw, str):
-        return raw
+        return _clean_ax_name(raw)
     if isinstance(raw, dict):
         value = raw.get("value")
-        return value if isinstance(value, str) else ""
+        return _clean_ax_name(value) if isinstance(value, str) else ""
     return ""
 
 
@@ -805,6 +872,7 @@ def _page_facts(
     payload: dict[str, Any],
     overlay: dict[str, _AxHit],
     truncated: bool = False,
+    skipped_checks: tuple[str, ...] = (),
 ) -> PageFacts:
     try:
         raw_elements = payload.get("elements")
@@ -837,6 +905,8 @@ def _page_facts(
         forms=forms,
         modals=modals,
         truncated=truncated,
+        skipped_checks=skipped_checks,
+        ax_capped=payload.get("ax_capped") is True,
     )
 
 
@@ -858,7 +928,7 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
             ax_role = role
         role = ax_role
         if hit.name is not None:
-            name = hit.name
+            name = _clean_ax_name(hit.name)
             name_source = "ax"
     constraints = item.get("constraints")
     box = item.get("box")
@@ -925,6 +995,7 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
             maxlength=_non_negative_int(constraints, "maxlength"),
         ),
         name_source=name_source,
+        in_dialog=_req(item, "in_dialog", bool),
     )
 
 

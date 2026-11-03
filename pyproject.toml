@@ -45,6 +45,7 @@ extend-exclude = ["*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "live: real public pages; skipped unless --live is passed",

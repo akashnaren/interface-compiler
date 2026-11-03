@@ -1,0 +1,238 @@
+"""Form grain versus field grain."""
+
+from __future__ import annotations
+
+from interface_compiler.browser.facts import ElementFact, FormFact
+from interface_compiler.contract.models import Locator
+from interface_compiler.extract.naming import field_name, slug
+from interface_compiler.mapping.enabled import element_enabled
+from interface_compiler.mapping.input_schema import named_property
+from interface_compiler.mapping.select import map_select
+from interface_compiler.mapping.toggle import map_checkbox
+from interface_compiler.mapping.types import (
+    MapContext,
+    MapResult,
+    affordance,
+    apply_hard_block,
+    ax_locator,
+    input_schema,
+    login_gated,
+    merge_results,
+    stable_signature,
+)
+
+_FREE = frozenset(
+    {"text", "search", "password", "tel", "email", "url", "date", "time", "datetime-local"}
+)
+
+
+def map_form(form: FormFact, fields: list[ElementFact], ctx: MapContext) -> MapResult:
+    controls = [element for element in fields if _is_control(element)]
+    submits = [element for element in fields if _is_submit(element)]
+    submit = submits[-1] if submits else None
+    verb = ctx.lexicon.verb(submit.name) if submit else None
+    if _field_grain(controls, verb):
+        return _field_grain_result(form, controls, submit, verb, ctx)
+    return _form_grain_result(form, controls, submit, verb, ctx)
+
+
+def fill_missing(result: MapResult, filled: set[str]) -> MapResult:
+    """Enable a submit whose only reason is fields the caller just set."""
+    updated: list = []
+    for item in result.affordances:
+        reason = item.x.reason if item.x else None
+        if reason and reason.startswith("missing: "):
+            names = {part.strip() for part in reason.removeprefix("missing: ").split(",")}
+            if names <= filled:
+                extra = item.x.model_copy(update={"reason": None}) if item.x else None
+                updated.append(item.model_copy(update={"enabled": True, "x": extra}))
+                continue
+        updated.append(item)
+    result.affordances = updated
+    return result
+
+
+def _field_grain_result(
+    form: FormFact,
+    controls: list[ElementFact],
+    submit: ElementFact | None,
+    verb: str | None,
+    ctx: MapContext,
+) -> MapResult:
+    parts: list[MapResult] = []
+    missing = _missing(form, controls)
+    for element in controls:
+        if element.tag == "select" or element.role in {"combobox", "listbox"}:
+            parts.append(map_select(element, ctx))
+        elif element.role in {"checkbox", "switch", "radio"}:
+            parts.append(map_checkbox(element, ctx))
+    if submit is not None and verb:
+        enabled = not missing
+        reason = "missing: " + ", ".join(missing) if missing else None
+        gated = login_gated(submit, ctx, verb) or ctx.lexicon.login_target(form.action)
+        if gated:
+            enabled, reason = False, "requires sign-in"
+        enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
+        parts.append(
+            MapResult(
+                affordances=[
+                    affordance(
+                        verb,
+                        enabled=enabled,
+                        label=submit.name,
+                        locator=ax_locator(submit, kind="form", method=form.method),
+                        grain="field",
+                        tag=ctx.lexicon.tag(verb, method=form.method),
+                        reason=reason,
+                        signature=stable_signature("form-field", verb, submit.landmark),
+                    )
+                ]
+            )
+        )
+    merged = merge_results(parts)
+    for item in merged.affordances:
+        if item.x is not None:
+            item.x.grain = "field"
+    return merged
+
+
+def _form_grain_result(
+    form: FormFact,
+    controls: list[ElementFact],
+    submit: ElementFact | None,
+    verb: str | None,
+    ctx: MapContext,
+) -> MapResult:
+    properties: dict[str, dict[str, object]] = {}
+    required: list[str] = []
+    state: dict[str, object] = {}
+    state_from: dict[str, str] = {}
+    for element in controls:
+        named = named_property(element)
+        if named is None:
+            continue
+        name, prop = named
+        properties[name] = prop
+        if element.constraints.required:
+            required.append(name)
+        if element.value is not None and element.role not in {"button"}:
+            state[name] = "<redacted>" if element.input_type == "password" else element.value
+            state_from[name] = "control"
+    search = _is_search(form, controls, properties)
+    if search:
+        affordance_id = "search"
+        verb = "search"
+    elif verb:
+        affordance_id = verb
+    else:
+        affordance_id = "submit_" + (_form_slug(form, controls) or "form")
+    label = submit.name if submit else affordance_id
+    enabled = True
+    reason = None
+    if submit is not None:
+        enabled, reason = element_enabled(submit)
+    gated = ctx.lexicon.login_target(form.action) or (
+        submit is not None and login_gated(submit, ctx, affordance_id)
+    )
+    if affordance_id != "go_sign_in" and gated:
+        enabled, reason = False, "requires sign-in"
+    enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
+    if any(element.input_type == "file" for element in controls):
+        enabled, reason = False, "hard-blocked in v1: upload"
+        verb = "upload"
+    tag = "safe" if search else ctx.lexicon.tag(verb, method=form.method)
+    locator = (
+        ax_locator(
+            submit or controls[0],
+            kind="form",
+            method=form.method,
+            fields={name: name for name in properties},
+        )
+        if submit or controls
+        else ax_locator_fallback(form)
+    )
+    return MapResult(
+        affordances=[
+            affordance(
+                affordance_id,
+                enabled=enabled,
+                schema=input_schema(properties, required or None),
+                label=label,
+                locator=locator,
+                grain="form",
+                tag=tag,
+                reason=reason,
+                signature=stable_signature("form", affordance_id, form.action),
+            )
+        ],
+        state=state,
+        state_from=state_from,
+    )
+
+
+def ax_locator_fallback(form: FormFact) -> Locator:
+    return Locator.model_validate(
+        {"kind": "form", "method": form.method, "named_by": "rule", "html_id": form.html_id}
+    )
+
+
+def _field_grain(controls: list[ElementFact], verb: str | None) -> bool:
+    if verb is None:
+        return False
+    return not any(_free_text(element) for element in controls)
+
+
+def _free_text(element: ElementFact) -> bool:
+    if element.tag == "textarea":
+        return True
+    return element.input_type in _FREE or element.role in {"textbox", "searchbox"}
+
+
+def _missing(form: FormFact, controls: list[ElementFact]) -> list[str]:
+    if form.valid:
+        return []
+    missing: list[str] = []
+    for element in controls:
+        if element.validation_message:
+            missing.append(field_name(element))
+    return missing
+
+
+def _is_control(element: ElementFact) -> bool:
+    if element.tag == "option" or element.role == "option":
+        return False
+    if _is_submit(element):
+        return False
+    return element.tag in {"input", "select", "textarea"} or element.role in {
+        "textbox",
+        "searchbox",
+        "combobox",
+        "listbox",
+        "checkbox",
+        "radio",
+        "switch",
+        "slider",
+        "spinbutton",
+    }
+
+
+def _is_submit(element: ElementFact) -> bool:
+    if element.tag == "button":
+        return True
+    return element.input_type in {"submit", "image"}
+
+
+def _is_search(
+    form: FormFact, controls: list[ElementFact], properties: dict[str, dict[str, object]]
+) -> bool:
+    if any(element.role == "searchbox" or element.input_type == "search" for element in controls):
+        return True
+    return "query" in properties and form.method == "get"
+
+
+def _form_slug(form: FormFact, controls: list[ElementFact]) -> str:
+    if form.html_id:
+        return slug(form.html_id)
+    if controls:
+        return slug(controls[0].landmark) or "form"
+    return "form"

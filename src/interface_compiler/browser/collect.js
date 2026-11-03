@@ -93,6 +93,31 @@
   const readQuery = Element.prototype.querySelector;
   const readQueryAll = Element.prototype.querySelectorAll;
   const readElementFromPoint = Document.prototype.elementFromPoint;
+  const readGetRootNode = Node.prototype.getRootNode;
+  const readDocGetElementById = Document.prototype.getElementById;
+  const readShadowGetElementById = ShadowRoot.prototype.getElementById;
+  const readDocQueryAll = Document.prototype.querySelectorAll;
+  const readShadowQueryAll = ShadowRoot.prototype.querySelectorAll;
+
+  // Mixin getters (ParentNode.children) are not own properties of ShadowRoot.
+  function prototypeGetter(object, name) {
+    let current = object;
+    while (current) {
+      const found = Object.getOwnPropertyDescriptor(current, name);
+      if (found && found.get) {
+        return found.get;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  }
+
+  const readShadowRoot = prototypeGetter(Element.prototype, "shadowRoot");
+  const readShadowHost = prototypeGetter(ShadowRoot.prototype, "host");
+  const readShadowChildren = prototypeGetter(ShadowRoot.prototype, "children");
+  // Piercing every node on a huge page costs more than the walk budget.
+  // Above this, shadow content is omitted (fail closed) instead of scanned.
+  const pierceLimit = 8000;
   // A control named willValidate hides the IDL getter on its form. Each
   // element type has its own getter; calling the wrong one throws.
   const readWillValidate = {
@@ -182,6 +207,166 @@
     return read.call(el) === true;
   }
 
+  // Closed shadow roots and unreadable roots are null. Callers omit them.
+  function openShadow(el) {
+    if (!el || nodeType(el) !== 1 || !readShadowRoot) {
+      return null;
+    }
+    try {
+      const root = readShadowRoot.call(el);
+      if (!root || nodeType(root) !== 11) {
+        return null;
+      }
+      if (root.mode && root.mode !== "open") {
+        return null;
+      }
+      return root;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function shadowHostOf(el) {
+    try {
+      const root = readGetRootNode.call(el);
+      if (!root || nodeType(root) !== 11) {
+        return null;
+      }
+      return readShadowHost.call(root) || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function shadowChildren(el) {
+    const root = openShadow(el);
+    if (!root || !readShadowChildren) {
+      return [];
+    }
+    try {
+      return Array.from(readShadowChildren.call(root));
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function parentNodeAcross(node) {
+    const parent = parentElement(node);
+    if (parent) {
+      return parent;
+    }
+    return shadowHostOf(node);
+  }
+
+  function elementById(id, hint) {
+    if (!id) {
+      return null;
+    }
+    if (hint) {
+      try {
+        const root = readGetRootNode.call(hint);
+        if (root && nodeType(root) === 11) {
+          const found = readShadowGetElementById.call(root, id);
+          if (found) {
+            return found;
+          }
+        }
+      } catch (error) {
+        return null;
+      }
+    }
+    try {
+      return readDocGetElementById.call(document, id);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function canPierceShadows() {
+    return document.getElementsByTagName("*").length <= pierceLimit;
+  }
+
+  // Light DOM plus open shadow roots. A closed root or a thrown read is skipped.
+  function collectMatching(selector) {
+    let nodes;
+    try {
+      nodes = readDocQueryAll.call(document, selector);
+    } catch (error) {
+      return [];
+    }
+    const found = [];
+    for (let index = 0; index < nodes.length; index += 1) {
+      found.push(nodes[index]);
+    }
+    if (!canPierceShadows()) {
+      return found;
+    }
+    const seen = new Set(found);
+    const stack = [];
+    let hosts;
+    try {
+      hosts = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return found;
+    }
+    for (let index = 0; index < hosts.length; index += 1) {
+      const shadow = openShadow(hosts[index]);
+      if (shadow) {
+        stack.push(shadow);
+      }
+    }
+    while (stack.length) {
+      const root = stack.pop();
+      let inner;
+      let innerHosts;
+      try {
+        inner = readShadowQueryAll.call(root, selector);
+        innerHosts = readShadowQueryAll.call(root, "*");
+      } catch (error) {
+        continue;
+      }
+      for (let index = 0; index < inner.length; index += 1) {
+        const el = inner[index];
+        if (!seen.has(el)) {
+          seen.add(el);
+          found.push(el);
+        }
+      }
+      for (let index = 0; index < innerHosts.length; index += 1) {
+        const shadow = openShadow(innerHosts[index]);
+        if (shadow) {
+          stack.push(shadow);
+        }
+      }
+    }
+    return found;
+  }
+
+  function closestAcross(el, selector) {
+    const found = closest(el, selector);
+    if (found) {
+      return found;
+    }
+    let node = el;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      seen.add(node);
+      const host = shadowHostOf(node);
+      if (!host || seen.has(host)) {
+        return null;
+      }
+      if (elementMatches(host, selector)) {
+        return host;
+      }
+      const outer = closest(host, selector);
+      if (outer) {
+        return outer;
+      }
+      node = host;
+    }
+    return null;
+  }
+
   function clean(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
   }
@@ -262,7 +447,7 @@
         if (!id) {
           continue;
         }
-        const target = document.getElementById(id);
+        const target = elementById(id, el);
         if (target) {
           parts.push(ownText(target) || clean(textContent(target)));
         }
@@ -282,6 +467,7 @@
   let nthOfType = new Map();
   let legendText = new Map();
   let formIndexes = new Map();
+  let indexedForms = [];
   let flagHidden = new Map();
   let flagAriaHidden = new Map();
   let flagInert = new Map();
@@ -328,7 +514,7 @@
     if (labelledBy) {
       const parts = [];
       for (const id of labelledBy.split(/\s+/)) {
-        const target = id ? document.getElementById(id) : null;
+        const target = id ? elementById(id, el) : null;
         if (target) {
           parts.push(ownText(target) || clean(textContent(target)));
         }
@@ -475,14 +661,14 @@
   }
 
   function landmarkOf(el) {
-    let node = parentElement(el);
+    let node = parentNodeAcross(el);
     while (node && node !== document.documentElement) {
       const role = landmarkRole(node);
       if (role) {
         const name = accName(node);
         return name ? `${role} ${name}` : role;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return "";
   }
@@ -497,7 +683,7 @@
       if (!id) {
         continue;
       }
-      const target = document.getElementById(id);
+      const target = elementById(id, el);
       if (target) {
         parts.push(ownText(target) || clean(textContent(target)));
       }
@@ -666,7 +852,8 @@
   }
 
   function idShortcut(el) {
-    if (!idsFinished) {
+    // #id does not reach into a shadow tree. The positional path does.
+    if (!idsFinished || shadowHostOf(el)) {
       return "";
     }
     const id = elementId(el);
@@ -677,7 +864,7 @@
   }
 
   function nameShortcut(el) {
-    if (!namesFinished) {
+    if (!namesFinished || shadowHostOf(el)) {
       return "";
     }
     const name = getAttribute(el, "name");
@@ -691,15 +878,23 @@
   }
 
   function cssOf(el) {
-    const shortcut = idShortcut(el) || nameShortcut(el);
-    if (shortcut) {
-      return shortcut;
+    if (!shadowHostOf(el)) {
+      const shortcut = idShortcut(el) || nameShortcut(el);
+      if (shortcut) {
+        return shortcut;
+      }
     }
-    const parts = [];
+    const segments = [];
+    let current = [];
     let node = el;
+    const seen = new Set();
     while (node && nodeType(node) === 1 && tagName(node) !== "HTML") {
+      if (seen.has(node)) {
+        return "";
+      }
+      seen.add(node);
       if (tagName(node) === "BODY") {
-        parts.unshift("body");
+        current.unshift("body");
         break;
       }
       // A missing nth-of-type must not become 1. That selector names an
@@ -708,10 +903,24 @@
       if (typeof nth !== "number" || nth < 1) {
         return "";
       }
-      parts.unshift(`${localName(node)}:nth-of-type(${nth})`);
-      node = parentElement(node);
+      current.unshift(`${localName(node)}:nth-of-type(${nth})`);
+      const parent = parentElement(node);
+      if (parent) {
+        node = parent;
+        continue;
+      }
+      const host = shadowHostOf(node);
+      if (!host) {
+        return "";
+      }
+      segments.unshift(current.join(" > "));
+      current = [];
+      node = host;
     }
-    return parts.join(" > ");
+    if (current.length) {
+      segments.unshift(current.join(" > "));
+    }
+    return segments.join(" >>> ");
   }
 
   function skeletonOf(el) {
@@ -719,7 +928,7 @@
     let node = el;
     while (node && nodeType(node) === 1 && node !== document.body && node !== document.documentElement) {
       chain.unshift(node);
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     const parts = [];
     if (document.body) {
@@ -757,7 +966,7 @@
     if (!box) {
       const controls = getAttribute(el, "aria-controls");
       const id = controls ? controls.split(/\s+/).find(Boolean) : "";
-      const target = id ? document.getElementById(id) : null;
+      const target = id ? elementById(id, el) : null;
       if (target && (getAttribute(target, "role") === "listbox" || query(target, "[role='option']"))) {
         box = target;
       }
@@ -802,7 +1011,7 @@
       if (value !== null && value !== "") {
         return asciiLower(value) !== "false";
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return false;
   }
@@ -816,7 +1025,7 @@
       if (value !== null && asciiLower(value.trim()) === "true") {
         return true;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return false;
   }
@@ -825,9 +1034,9 @@
   // One closest() per condition so an inner inert node does not hide an outer
   // hidden ancestor. visibility:hidden still has a box, so it is a second check.
   function applyRowFlags(el) {
-    const hidden = closest(el, "[hidden]") !== null;
+    const hidden = closestAcross(el, "[hidden]") !== null;
     const ariaHidden = ariaHiddenState(el);
-    const inert = closest(el, "[inert]") !== null;
+    const inert = closestAcross(el, "[inert]") !== null;
     const ariaDisabled = ariaDisabledState(el);
     let displayHidden = hidden;
     let visibilityIsHidden = false;
@@ -899,12 +1108,30 @@
     return { x: (left + right) / 2, y: (top + bottom) / 2 };
   }
 
-  // One elementFromPoint on a long inline line walks every fragment. The cap
-  // bounds that loop. A call is counted after it returns, so one slow hit can
-  // pass the cap and still keep its real result. Every queued sample the loop
-  // does not reach is covered, and the walk is truncated. Nothing here writes
-  // the page.
+  // One elementFromPoint walks every inline box, so a long line is quadratic.
+  // A call is counted after it returns. Samples the loop does not reach are
+  // covered, and the walk is truncated. Nothing here writes the page.
   const hitCapMs = 300;
+  const longRunCount = 40;
+  const longRunHits = 12;
+  const longRunMs = 40;
+  const slowHitMs = 80;
+
+  function hugeHitTarget() {
+    // 30k inline spans make one hit outlast the engine deadline. Fail closed
+    // before that call. A 4000-row table stays under the element ceiling.
+    return (
+      document.getElementsByTagName("span").length > 12000 ||
+      document.getElementsByTagName("*").length > 60000
+    );
+  }
+
+  function failClosedHits(flags, points, from) {
+    truncated = true;
+    for (let index = from; index < points.length; index += 1) {
+      flags[points[index].index] = true;
+    }
+  }
 
   function coverageOf(els, rects) {
     const flags = [];
@@ -921,24 +1148,68 @@
       }
       viewport.push({ index, x: point.x, y: point.y });
     }
-    const hitStarted = performance.now();
-    let seen = 0;
-    for (; seen < viewport.length; seen += 1) {
-      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
-        break;
+    if (hugeHitTarget()) {
+      failClosedHits(flags, viewport, 0);
+      return flags;
+    }
+    const normal = [];
+    const longRuns = [];
+    let run = [];
+    function flushRun() {
+      if (run.length >= longRunCount) {
+        longRuns.push(run);
+      } else {
+        for (const point of run) {
+          normal.push(point);
+        }
       }
-      const point = viewport[seen];
-      flags[point.index] = coveredBy(els[point.index], elementFromPoint(point.x, point.y));
-      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
-        seen += 1;
-        break;
+      run = [];
+    }
+    for (const point of viewport) {
+      if (run.length && Math.abs(point.y - run[0].y) > 2) {
+        flushRun();
+      }
+      run.push(point);
+    }
+    flushRun();
+    const hitStarted = performance.now();
+    function sample(list, maxCount, maxMs) {
+      let seen = 0;
+      const started = performance.now();
+      for (; seen < list.length; seen += 1) {
+        if (seen >= maxCount) {
+          break;
+        }
+        if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
+          break;
+        }
+        if (performance.now() - started > maxMs) {
+          break;
+        }
+        const used = performance.now() - walkStarted;
+        if (
+          typeof WALK_BUDGET_MS === "number" &&
+          WALK_BUDGET_MS > 0 &&
+          WALK_BUDGET_MS - used < 250
+        ) {
+          break;
+        }
+        const point = list[seen];
+        const callStarted = performance.now();
+        flags[point.index] = coveredBy(els[point.index], elementFromPoint(point.x, point.y));
+        if (performance.now() - callStarted > slowHitMs) {
+          seen += 1;
+          break;
+        }
+      }
+      if (seen < list.length) {
+        failClosedHits(flags, list, seen);
       }
     }
-    if (seen < viewport.length) {
-      truncated = true;
-      for (; seen < viewport.length; seen += 1) {
-        flags[viewport[seen].index] = true;
-      }
+    // Short targets first, so a long line cannot fail-close the rest of the page.
+    sample(normal, Infinity, hitCapMs);
+    for (const line of longRuns) {
+      sample(line, longRunHits, longRunMs);
     }
     return flags;
   }
@@ -1044,7 +1315,7 @@
     visibilityHidden = new Map();
     idsFinished = false;
     namesFinished = false;
-    const ids = document.querySelectorAll("[id]");
+    const ids = collectMatching("[id]");
     for (let index = 0; index < ids.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1056,7 +1327,7 @@
       idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
     idsFinished = true;
-    const named = document.querySelectorAll("[name]");
+    const named = collectMatching("[name]");
     for (let index = 0; index < named.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1069,7 +1340,7 @@
       nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
     }
     namesFinished = true;
-    const labels = document.querySelectorAll("label[for]");
+    const labels = collectMatching("label[for]");
     for (let index = 0; index < labels.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1079,7 +1350,18 @@
         labelsByFor.set(id, labels[index]);
       }
     }
-    const forms = document.forms;
+    const forms = [];
+    for (let index = 0; index < document.forms.length; index += 1) {
+      forms.push(document.forms[index]);
+    }
+    if (canPierceShadows()) {
+      for (const form of collectMatching("form")) {
+        if (!forms.includes(form)) {
+          forms.push(form);
+        }
+      }
+    }
+    indexedForms = forms;
     for (let index = 0; index < forms.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1114,6 +1396,18 @@
       const seen = (counts.get(tagName(child)) || 0) + 1;
       counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
+      if (!walkTree(child)) {
+        return false;
+      }
+    }
+    const shadowCounts = new Map();
+    for (const child of shadowChildren(el)) {
+      if (!withinBudget()) {
+        return false;
+      }
+      const seenCount = (shadowCounts.get(tagName(child)) || 0) + 1;
+      shadowCounts.set(tagName(child), seenCount);
+      nthOfType.set(child, seenCount);
       if (!walkTree(child)) {
         return false;
       }
@@ -1167,7 +1461,7 @@
       if (!recordNth(node)) {
         return false;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return true;
   }
@@ -1224,6 +1518,10 @@
       labelText(el),
       groupKey(el),
       constraintsOf(el),
+      closestAcross(
+        el,
+        "dialog[open], [role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
+      ) !== null,
     ];
   }
 
@@ -1246,7 +1544,7 @@
   }
 
   if (typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS <= 0) {
-    if (document.querySelectorAll(SELECTOR).length > 0) {
+    if (collectMatching(SELECTOR).length > 0) {
       return deadlinePayload();
     }
   }
@@ -1254,7 +1552,7 @@
   // Selection and the index each stop on a share of the walk budget. Flags
   // then take half of the time still left before read-back, and emission
   // keeps the rest, so a throttled table still ships a prefix.
-  const matched = document.querySelectorAll(SELECTOR);
+  const matched = collectMatching(SELECTOR);
   phaseLimitMs = shareLimit(0.3);
   const chosen = [];
   const rects = [];
@@ -1349,9 +1647,10 @@
     "label_text",
     "group_key",
     "constraints",
+    "in_dialog",
   ];
   const covered = coverageOf(kept, keptRects);
-  const forms = Array.from(document.forms).map((form, index) => ({
+  const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map((form, index) => ({
     index,
     method: (getAttribute(form, "method") || "get").toLowerCase(),
     action: readFormAction.call(form),
@@ -1375,12 +1674,12 @@
       open: true,
     });
   }
-  for (const dialog of document.querySelectorAll("dialog[open]")) {
+  for (const dialog of collectMatching("dialog[open]")) {
     if (elementMatches(dialog, ":modal")) {
       pushModal(dialog, "dialog");
     }
   }
-  for (const dialog of document.querySelectorAll(
+  for (const dialog of collectMatching(
     "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
   )) {
     pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
@@ -1392,10 +1691,59 @@
   const chunks = [];
   let batch = [];
   const chunkRows = 800;
-  // Object ids are one CDP call, then one accessibility read each until the
-  // overlay budget runs out. The head of the document covers the on-screen
-  // widgets; a longer list spends that whole budget on a table.
+  // Object ids feed the accessibility overlay. The cap stays, but the slots
+  // go to on-screen widgets first so a long link list cannot crowd them out.
   const nodeCap = 160;
+  const widgetTags = new Set(["button", "input", "select", "textarea", "summary", "option"]);
+  const widgetRoles = new Set([
+    "button",
+    "checkbox",
+    "combobox",
+    "gridcell",
+    "listbox",
+    "menu",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "textbox",
+    "treeitem",
+  ]);
+  const ranked = [];
+  for (let index = 0; index < kept.length; index += 1) {
+    const el = kept[index];
+    const tag = localName(el);
+    const role = elementRole(el);
+    const widget = widgetTags.has(tag) || widgetRoles.has(role);
+    const link = tag === "a" || role === "link";
+    if (!widget && !link) {
+      continue;
+    }
+    const visible = isVisible(el, keptRects[index]);
+    let rank = 3;
+    if (widget && visible && inViewport(keptRects[index])) {
+      rank = 0;
+    } else if (widget) {
+      rank = 1;
+    } else if (visible) {
+      rank = 2;
+    }
+    ranked.push({ index, rank });
+  }
+  ranked.sort((left, right) => left.rank - right.rank || left.index - right.index);
+  const nodeIndexes = [];
+  for (let index = 0; index < ranked.length && nodeIndexes.length < nodeCap; index += 1) {
+    const at = ranked[index].index;
+    nodeIndexes.push(at);
+    nodes.push(kept[at]);
+  }
+  const axCapped = ranked.length > nodeCap;
   for (let index = 0; index < kept.length; index += 1) {
     if (index > 0 && pastReadback()) {
       truncated = true;
@@ -1404,9 +1752,6 @@
     if (!cssOf(kept[index])) {
       truncated = true;
       break;
-    }
-    if (nodes.length < nodeCap) {
-      nodes.push(kept[index]);
     }
     batch.push(elementRow(kept[index], keptRects[index], covered[index]));
     if (batch.length === chunkRows) {
@@ -1439,6 +1784,8 @@
       chunks: chunks.length,
       controls: matched.length,
       indexed: indexFinished,
+      node_indexes: nodeIndexes,
+      ax_capped: axCapped,
     }),
     chunks,
     nodes,

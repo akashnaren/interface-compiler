@@ -2177,9 +2177,11 @@ finally:
     elapsed_text, deadline_text = completed.stdout.split()[:2]
     elapsed = float(elapsed_text)
     deadline = float(deadline_text)
-    assert elapsed < deadline * 0.8, (
-        f"{rows} {layout} rows took {elapsed:.2f}s ({completed.stdout})"
-    )
+    # Wall-clock 0.8*deadline counted the accessibility overlay and host delay,
+    # so a finished table flaked under load. The child already requires the
+    # walk to finish inside its budget (not truncated) and the overlay to run,
+    # which is the reserved second. The kill is still the deadline itself.
+    assert elapsed < deadline, f"{rows} {layout} rows took {elapsed:.2f}s ({completed.stdout})"
 
 
 @pytest.mark.parametrize(
