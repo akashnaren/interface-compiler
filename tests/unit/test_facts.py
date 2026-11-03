@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -272,6 +273,54 @@ def test_facts_buttons(facts_page: Page, fixture_base_url: str) -> None:
         _by_id(facts, "pressed"), role="button", name="Filter", aria_pressed="true", visible=True
     )
     _expect(_by_id(facts, "under"), role="button", name="Under", visible=True, covered=True)
+
+
+def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
+    # 40px links on one line. C is covered and . is not. The rows are the full
+    # bar, the first of a pair, a solo mask, the middle link, and partial bars.
+    cases = (
+        ("full", 10, 0, 10, "CCCCCCCCCC", False),
+        ("pair", 2, 0, 1, "C.", False),
+        ("solo", 1, 0, 1, "C", False),
+        ("mid", 3, 1, 2, ".C.", False),
+        ("tail", 10, 5, 10, ".....CCCCC", False),
+        ("one", 10, 4, 5, "....C.....", False),
+        ("right", 10, 7, 10, ".......CCC", True),
+        ("head", 10, 0, 3, "CCC.......", False),
+    )
+    parts = [
+        "<!doctype html><title>cover</title><style>",
+        "body{margin:0}",
+        ".row{position:absolute;left:0;height:20px;margin:0;white-space:nowrap}",
+        ".mask{position:fixed;height:20px}",
+        "</style>",
+    ]
+    for slot, (prefix, count, start, end, _expected, plain) in enumerate(cases):
+        top = slot * 40
+        links: list[str] = []
+        for index in range(count):
+            if plain:
+                links.append(
+                    f'<a id="{prefix}{index}" href="/{index}">'
+                    '<span style="display:inline-block;width:40px;height:20px">x</span></a>'
+                )
+            else:
+                links.append(
+                    f'<a id="{prefix}{index}" href="/{index}" '
+                    'style="display:inline-block;width:40px;height:20px">x</a>'
+                )
+        parts.append(f'<div class="row" style="top:{top}px">{"".join(links)}</div>')
+        parts.append(
+            f'<div class="mask" style="top:{top}px;left:{start * 40}px;'
+            f'width:{(end - start) * 40}px"></div>'
+        )
+    facts_page.set_content("".join(parts), wait_until="domcontentloaded")
+    facts = collect_facts(facts_page)
+    for prefix, count, _start, _end, expected, _plain in cases:
+        flags = [
+            "C" if _by_id(facts, f"{prefix}{index}").covered else "." for index in range(count)
+        ]
+        assert "".join(flags) == expected, prefix
 
 
 def test_facts_choice_group(facts_page: Page, fixture_base_url: str) -> None:
@@ -1057,21 +1106,43 @@ def test_facts_html_fallback_names_skip_legend_and_hidden_text(
         ("<input id='c' type='image' alt='Delete account' title='Search'>", "Delete account"),
         ("<input id='c' type='file' title='Search'>", "Choose File"),
         (
+            "<label for='c'>Upload</label><input id='c' type='file' title='Search'>",
+            "Upload",
+        ),
+        ("<label>Upload<input id='c' type='file'></label>", "Upload"),
+        (
             "<button id='c'><span style='visibility:hidden'>Search</span>Pay now</button>",
             "Pay now",
         ),
+        ("<button id='c' title='Save'>Delete</button>", "Delete"),
+        (
+            "<span id='by'>Remove</span><button id='c' aria-labelledby='by'>Delete</button>",
+            "Remove",
+        ),
+        ("<button id='c' aria-label='Remove'>Delete</button>", "Remove"),
+        ("<label for='c'>Save</label><button id='c' title='Go'></button>", "Save"),
+        (
+            (
+                "<button id='c'>Go <span style='visibility:hidden'>NO "
+                "<span style='visibility:visible'>VIS</span></span></button>"
+            ),
+            "Go VIS",
+        ),
+        ("<label>Save<input id='c' type='submit' value='Go'></label>", "Save"),
+        ("<input id='c' type='image' alt=''>", "Submit"),
+        ("<input id='c' type='image' title='Search'>", "Search"),
         ("<form id='c'><button type='submit'>Go</button></form>", ""),
         (
             (
                 "<fieldset><legend>Search options</legend>"
                 "<input id='c' type='image' alt='' title='Search'></fieldset>"
             ),
-            "Submit",
+            "Search",
         ),
         ("<h1 id='c'>Hello <span style='visibility:hidden'>Secret</span></h1>", "Hello"),
         (
             "<h1 id='c' style='visibility:hidden'><span style='visibility:visible'>Secret</span></h1>",
-            "",
+            "Secret",
         ),
     ],
 )
@@ -1122,25 +1193,73 @@ def test_facts_loader_id_is_the_document(
             collect_facts(facts_page)
         return
     facts = collect_facts(facts_page)
-    assert facts.url.endswith("/shifted?x=1#section")
+    assert facts.url.endswith("/link.html")
+    assert "shifted" not in facts.url
     assert facts.title == "Links"
     assert any(element.html_id == "cart" for element in facts.elements)
 
 
-def test_facts_title_navigation_error_loses_the_document(
+def test_facts_push_state_keeps_the_walked_document(
+    facts_page: Page,
+    fixture_base_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+    facts_page.set_content(
+        "<!doctype html><title>Catalog</title>"
+        "<main><a id='catalog' href='/p'>Catalog item</a></main>",
+        wait_until="domcontentloaded",
+    )
+
+    def slow_overlay(
+        session: object,
+        object_ids: list[str],
+        budget_s: float,
+        order: list[int],
+    ) -> dict[str, object]:
+        time.sleep(0.9)
+        return _accessibility_overlay(session, object_ids, budget_s, order)
+
+    monkeypatch.setattr(
+        "interface_compiler.browser.facts._accessibility_overlay",
+        slow_overlay,
+    )
+    facts_page.evaluate(
+        """() => setTimeout(() => {
+          history.pushState(null, "", "/checkout");
+          document.title = "Checkout";
+          document.body.innerHTML = "<main><button id='pay'>Pay</button></main>";
+        }, 400)"""
+    )
+    facts = collect_facts(facts_page)
+    assert facts.title == "Catalog"
+    assert "/checkout" not in facts.url
+    assert facts.truncated is False
+    assert any(element.html_id == "catalog" for element in facts.elements)
+    assert all(element.html_id != "pay" for element in facts.elements)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Execution context was destroyed, most likely because of a navigation",
+        "Target page, context or browser has been closed",
+    ],
+)
+def test_facts_title_failure_loses_the_document(
+    message: str,
     facts_page: Page,
     fixture_base_url: str,
 ) -> None:
     facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
 
     def lost() -> str:
-        raise PlaywrightError(
-            "Execution context was destroyed, most likely because of a navigation"
-        )
+        raise PlaywrightError(message)
 
     facts_page.title = lost
-    with pytest.raises(FactCollectionError, match="fact collection lost the document"):
+    with pytest.raises(FactCollectionError, match="fact collection lost the document") as exc:
         collect_facts(facts_page)
+    assert "deadline" not in str(exc.value)
 
 
 @pytest.mark.parametrize(
@@ -1307,6 +1426,52 @@ finally:
     elapsed = float(elapsed_text)
     deadline = float(deadline_text)
     assert elapsed < deadline * 0.8, f"{rows} {layout} rows took {elapsed:.2f}s"
+
+
+def test_facts_huge_table_is_truncated_instead_of_killed() -> None:
+    script = """
+import sys
+from interface_compiler.browser.engine import Engine
+from interface_compiler.browser.facts import FactCollectionError, collect_facts
+
+engine = Engine()
+engine.start()
+page = engine.new_page()
+try:
+    parts = ["<!doctype html><title>wide</title><table><tbody>"]
+    for index in range(12000):
+        parts.append(
+            "<tr><td><label for='f%d'>Field %d</label>"
+            "<input id='f%d' name='f%d'></td>"
+            "<td><a id='r%d' href='/r%d'>Row %d</a></td></tr>"
+            % (index, index, index, index, index, index, index)
+        )
+    parts.append("</tbody></table>")
+    page.set_content("".join(parts), wait_until="domcontentloaded")
+    try:
+        facts = collect_facts(page, deadline_s=2)
+    except FactCollectionError as exc:
+        sys.stderr.write(str(exc))
+        raise SystemExit(2)
+    if not facts.truncated:
+        sys.stderr.write("elements=%s" % len(facts.elements))
+        raise SystemExit(3)
+    if engine.dead:
+        raise SystemExit(4)
+    if not isinstance(facts.url, str) or not isinstance(facts.title, str):
+        raise SystemExit(5)
+    print(len(facts.elements))
+finally:
+    engine.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

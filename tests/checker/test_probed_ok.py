@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pydantic_core
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from interface_compiler.browser.facts import normalized_page_url
 from interface_compiler.contract import (
@@ -383,10 +383,19 @@ def _dump_probe(model: ViewDoc | ActResult, dump: str) -> None:
     if dump == "to_json":
         pydantic_core.to_json(model)
         return
+    if dump == "dump_json":
+        TypeAdapter(type(model)).dump_json(model)
+        return
+    if dump == "dump_python":
+        TypeAdapter(type(model)).dump_python(model)
+        return
     raise AssertionError(dump)
 
 
-@pytest.mark.parametrize("dump", ["model_dump", "model_dump_json", "to_json"])
+@pytest.mark.parametrize(
+    "dump",
+    ["model_dump", "model_dump_json", "to_json", "dump_json", "dump_python"],
+)
 def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
     doc = _public_probe_bypassing_the_url_guard()
     with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
@@ -409,6 +418,47 @@ def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
     result.doc = doc
     with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
         _dump_probe(result, dump)
+
+
+@pytest.mark.parametrize(
+    ("url", "tag", "accepted"),
+    [
+        ("https://example.com/p", "mutating", False),
+        ("https://example.com/p", "safe", True),
+        ("http://127.0.0.1/x", "mutating", True),
+    ],
+)
+def test_checker_later_affordance_x_keeps_the_document_url(
+    url: str,
+    tag: str,
+    accepted: bool,
+) -> None:
+    doc = ViewDoc.model_validate(_with_probe(url, tag="safe", verified="unverified"))
+    bare = doc.affordances[0]
+    assert bare.x is None
+    row = AffordanceX(tag=tag, verified="unverified")
+    if tag == "mutating":
+        row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+    else:
+        row.verified = "probed_ok"
+    assert row.verified == "probed_ok"
+    if not accepted:
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            bare.x = row
+        assert bare.x is None
+        assert row.verified == "probed_ok"
+        bare.x = AffordanceX(tag="mutating")
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            bare.x.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+        assert bare.x is not None
+        assert bare.x.verified is None
+        return
+    bare.x = row
+    assert bare.x is row
+    assert row.verified == "probed_ok"
+    with pytest.raises(ContractError, match="page_url does not match"):
+        row.set_verified("probed_ok", page_url="https://example.com/other")
+    assert row.verified == "probed_ok"
 
 
 def test_checker_setter_allows_loopback_and_safe() -> None:

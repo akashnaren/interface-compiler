@@ -4,6 +4,33 @@
 // recorded here are the HTML ones, which the skeleton path must keep (a summary
 // stays button even when Chromium later reports DisclosureTriangle).
 (() => {
+  // Captured before any later task can pushState or swap the body. The walk
+  // itself is synchronous, so these stay the document the rows describe.
+  const pageUrl = location.href;
+  const pageTitle = document.title;
+  const walkStarted = performance.now();
+  let truncated = false;
+
+  // Reading every node back is the slow step after the walk. The cap scales
+  // with the time left so a short deadline returns a partial row instead of
+  // being killed while those nodes are copied out.
+  const elementCap =
+    typeof WALK_BUDGET_MS === "number" ? Math.max(1, Math.floor(WALK_BUDGET_MS * 3)) : Infinity;
+
+  function budgetSpent() {
+    if (truncated) {
+      return true;
+    }
+    if (typeof WALK_BUDGET_MS !== "number") {
+      return false;
+    }
+    if (performance.now() - walkStarted > WALK_BUDGET_MS) {
+      truncated = true;
+      return true;
+    }
+    return false;
+  }
+
   const SELECTOR = [
     "a[href]",
     "button",
@@ -139,36 +166,49 @@
     return String(value || "").replace(/\s+/g, " ").trim();
   }
 
-  function hidesText(el) {
+  // display:none, hidden, and aria-hidden drop the subtree. visibility:hidden
+  // drops only that element's own text; a visibility:visible descendant stays.
+  function hidesSubtree(el) {
+    if (flagHidden.get(el) === true || flagAriaHidden.get(el) === true) {
+      return true;
+    }
     if (hasAttribute(el, "hidden") || getAttribute(el, "aria-hidden") === "true") {
       return true;
     }
-    // Inherited visibility:hidden and display:none from the walk, including
-    // text inside a heading. A child that sets visibility:visible stays hidden
-    // when an ancestor was already hidden.
-    if (styleHidden.get(el) === true) {
+    if (displayNone.get(el) === true) {
       return true;
     }
-    const display = displayNone.get(el);
-    const visibility = visibilityHidden.get(el);
-    if (display !== undefined || visibility !== undefined) {
-      return display === true || visibility === true;
+    if (displayNone.get(el) === undefined && getComputedStyle(el).display === "none") {
+      return true;
     }
-    const style = getComputedStyle(el);
-    return style.display === "none" || style.visibility === "hidden";
+    return false;
+  }
+
+  function skipsOwnText(el) {
+    const hidden = visibilityHidden.get(el);
+    if (hidden !== undefined) {
+      return hidden === true;
+    }
+    return getComputedStyle(el).visibility === "hidden";
   }
 
   function ownText(el) {
+    // The element's own text is its name even when this element is hidden.
+    // hidesSubtree prunes descendants only; visibility:hidden still skips
+    // direct text below and keeps a visibility:visible descendant.
     let text = "";
+    const skipDirect = skipsOwnText(el);
     for (const node of childNodes(el)) {
       if (nodeType(node) === Node.TEXT_NODE) {
-        text += ` ${textContent(node)}`;
+        if (!skipDirect) {
+          text += ` ${textContent(node)}`;
+        }
       } else if (nodeType(node) === Node.ELEMENT_NODE) {
         const tag = tagName(node);
         if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA" || tag === "BUTTON") {
           continue;
         }
-        if (hidesText(node)) {
+        if (hidesSubtree(node)) {
           continue;
         }
         if (tag === "IMG") {
@@ -229,7 +269,7 @@
     return labelsByFor.get(id) || null;
   }
 
-  function labelText(el) {
+  function associatedLabel(el) {
     const explicit = labelFor(el);
     if (explicit) {
       const text = ownText(explicit);
@@ -243,6 +283,14 @@
       if (text) {
         return text;
       }
+    }
+    return "";
+  }
+
+  function labelText(el) {
+    const fromLabel = associatedLabel(el);
+    if (fromLabel) {
+      return fromLabel;
     }
     const labelledBy = getAttribute(el, "aria-labelledby");
     if (labelledBy) {
@@ -425,8 +473,8 @@
     return clean(parts.join(" "));
   }
 
-  // Submit value beats title. Title is only the last resort, after the
-  // browser's default Submit or Reset label.
+  // Label text beats the value and the default Submit label. Title is last,
+  // except an image uses title when alt is empty and Submit only when both are.
   function controlName(el) {
     if (localName(el) !== "input") {
       return null;
@@ -449,6 +497,10 @@
     if (aria) {
       return aria;
     }
+    const label = associatedLabel(el);
+    if (label) {
+      return label;
+    }
     if (type === "file") {
       return "Choose File";
     }
@@ -457,7 +509,10 @@
       if (alt) {
         return alt;
       }
-      // Empty alt is the default Submit label. Title and the legend come after.
+      const title = clean(getAttribute(el, "title"));
+      if (title) {
+        return title;
+      }
       return "Submit";
     }
     const value = clean(el.value);
@@ -473,6 +528,26 @@
     return clean(getAttribute(el, "title"));
   }
 
+  function buttonName(el) {
+    const by = labelledByText(el);
+    if (by) {
+      return by;
+    }
+    const aria = clean(getAttribute(el, "aria-label"));
+    if (aria) {
+      return aria;
+    }
+    const text = ownText(el);
+    if (text) {
+      return text;
+    }
+    const label = associatedLabel(el);
+    if (label) {
+      return label;
+    }
+    return clean(getAttribute(el, "title"));
+  }
+
   function fallbackName(el) {
     const control = controlName(el);
     if (control !== null) {
@@ -481,6 +556,9 @@
     // Chromium leaves an unlabelled form unnamed. Child text is not its name.
     if (tagName(el) === "FORM") {
       return accName(el);
+    }
+    if (tagName(el) === "BUTTON") {
+      return buttonName(el);
     }
     const named = accName(el);
     if (named) {
@@ -615,15 +693,48 @@
     return rect.width > 0 && rect.height > 0;
   }
 
-  // One sample per line box. Hit-testing every inline link walks that line's
-  // fragments again, which is quadratic on a single line of links.
-  const lineCovered = new Map();
+  // A same-line miss must not be reused: a mask can cover one sibling only.
+  // Hit-testing every inline link is quadratic on a long line, so the point is
+  // tested only when a positioned box or a modal backdrop can actually cover it.
+  let positioned = [];
+  let coverBoxes = null;
+  let modalDialog = undefined;
 
   function coveredBy(el, hit) {
     if (!hit) {
       return true;
     }
     return hit !== el && !contains(el, hit);
+  }
+
+  function centerInRect(box, cx, cy) {
+    return Boolean(
+      box && cx >= box.left && cx < box.right && cy >= box.top && cy < box.bottom,
+    );
+  }
+
+  function topModal() {
+    if (modalDialog !== undefined) {
+      return modalDialog;
+    }
+    modalDialog = null;
+    for (const dialog of document.querySelectorAll("dialog[open]")) {
+      if (elementMatches(dialog, ":modal")) {
+        modalDialog = dialog;
+      }
+    }
+    return modalDialog;
+  }
+
+  function boxesThatCover() {
+    if (coverBoxes) {
+      return coverBoxes;
+    }
+    coverBoxes = [];
+    for (const mask of positioned) {
+      coverBoxes.push({ mask, rect: boundingRect(mask) });
+    }
+    return coverBoxes;
   }
 
   function isCovered(el, rect, visible) {
@@ -635,37 +746,21 @@
     if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) {
       return false;
     }
-    const top = Math.round(rect.top);
-    const height = Math.round(rect.height);
-    const key = `${top}:${height}`;
-    let sample = lineCovered.get(key);
-    if (sample === undefined) {
-      const hit = elementFromPoint(cx, cy);
-      sample = { hit, hitRect: hit ? boundingRect(hit) : null, cx, cy };
-      lineCovered.set(key, sample);
+    const modal = topModal();
+    if (modal && el !== modal && !contains(modal, el)) {
+      return true;
     }
-    // The element we sampled is decided from that hit, including an overlay
-    // with the same box. Other fragments on the line reuse it only when the
-    // hit is a same-line sibling that does not paint this center.
-    if (Math.abs(cx - sample.cx) < 0.5 && Math.abs(cy - sample.cy) < 0.5) {
-      return coveredBy(el, sample.hit);
+    for (const item of boxesThatCover()) {
+      const mask = item.mask;
+      if (mask === el || contains(el, mask) || contains(mask, el)) {
+        continue;
+      }
+      if (!centerInRect(item.rect, cx, cy)) {
+        continue;
+      }
+      return coveredBy(el, elementFromPoint(cx, cy));
     }
-    const hitRect = sample.hitRect;
-    const paintsHere =
-      hitRect &&
-      cx >= hitRect.left &&
-      cx < hitRect.right &&
-      cy >= hitRect.top &&
-      cy < hitRect.bottom;
-    const sameLine =
-      hitRect && Math.round(hitRect.top) === top && Math.round(hitRect.height) === height;
-    if (sample.hit && (sample.hit === el || contains(el, sample.hit))) {
-      return false;
-    }
-    if (!paintsHere && sameLine) {
-      return false;
-    }
-    return coveredBy(el, elementFromPoint(cx, cy));
+    return false;
   }
 
   function inViewport(rect) {
@@ -796,25 +891,33 @@
         inert: false,
         ariaDisabled: false,
         visuallyHidden: false,
+        displayHidden: false,
       });
     }
   }
 
   function walkTree(el, inherited) {
+    if (budgetSpent()) {
+      return;
+    }
     const hidden = inherited.hidden || hasAttribute(el, "hidden");
     const ariaHidden = inherited.ariaHidden || getAttribute(el, "aria-hidden") === "true";
     const inert = inherited.inert || el.inert === true || hasAttribute(el, "inert");
     const ariaDisabled = inherited.ariaDisabled || getAttribute(el, "aria-disabled") === "true";
     const style = getComputedStyle(el);
-    const visuallyHidden =
-      inherited.visuallyHidden || style.display === "none" || style.visibility === "hidden";
+    const displayHidden = inherited.displayHidden || style.display === "none";
+    const visibilityIsHidden = style.visibility === "hidden";
+    const visuallyHidden = displayHidden || visibilityIsHidden;
     flagHidden.set(el, hidden);
     flagAriaHidden.set(el, ariaHidden);
     flagInert.set(el, inert);
     flagAriaDisabled.set(el, ariaDisabled);
     styleHidden.set(el, visuallyHidden);
-    displayNone.set(el, style.display === "none");
-    visibilityHidden.set(el, style.visibility === "hidden");
+    displayNone.set(el, displayHidden);
+    visibilityHidden.set(el, visibilityIsHidden);
+    if (style.position !== "static") {
+      positioned.push(el);
+    }
     if (tagName(el) === "FIELDSET") {
       let text = "";
       for (const child of children(el)) {
@@ -826,8 +929,11 @@
       legendText.set(el, text);
     }
     const counts = new Map();
-    const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden };
+    const next = { hidden, ariaHidden, inert, ariaDisabled, visuallyHidden, displayHidden };
     for (const child of children(el)) {
+      if (budgetSpent()) {
+        return;
+      }
       const seen = (counts.get(tagName(child)) || 0) + 1;
       counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
@@ -880,13 +986,23 @@
     "group_key",
     "constraints",
   ];
-  const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el) => {
+  const elements = [];
+  const matched = document.querySelectorAll(SELECTOR);
+  for (let index = 0; index < matched.length; index += 1) {
+    if (elements.length >= elementCap) {
+      truncated = true;
+      break;
+    }
+    if (budgetSpent()) {
+      break;
+    }
+    const el = matched[index];
     nodes.push(el);
     const rect = boundingRect(el);
     const visible = isVisible(el, rect);
     const role = elementRole(el);
     const binding = submitBinding(el);
-    return [
+    elements.push([
       localName(el),
       role,
       fallbackName(el),
@@ -928,8 +1044,8 @@
       labelText(el),
       groupKey(el),
       constraintsOf(el),
-    ];
-  });
+    ]);
+  }
 
   const forms = Array.from(document.forms).map((form, index) => ({
     index,
@@ -966,5 +1082,14 @@
     pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
   }
 
-  return { fields, elements, forms, modals, nodes };
+  return {
+    fields,
+    elements,
+    forms,
+    modals,
+    nodes,
+    url: pageUrl,
+    title: pageTitle,
+    truncated,
+  };
 })()

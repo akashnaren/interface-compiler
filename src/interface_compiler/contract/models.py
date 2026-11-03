@@ -14,6 +14,7 @@ from pydantic import (
     PrivateAttr,
     StrictBool,
     StrictInt,
+    TypeAdapter,
     field_validator,
     model_serializer,
     model_validator,
@@ -45,8 +46,9 @@ _VERIFIED_STATES = (
 # still construct a mutating probed_ok affordance. Direct construction has none.
 _affordance_page_url: ContextVar[object] = ContextVar("affordance_page_url", default=None)
 # The wrap serializer raises ContractError, and pydantic-core wraps that in
-# PydanticSerializationError before model_dump, model_dump_json, or to_json
-# returns. The original error is stashed here so those callers still see it.
+# PydanticSerializationError before model_dump, model_dump_json, to_json, or
+# TypeAdapter.dump_json / dump_python returns. The original error is stashed
+# here so those callers still see ContractError.
 _pending_probe: ContextVar[ContractError | None] = ContextVar("pending_probe", default=None)
 
 
@@ -294,16 +296,35 @@ class Affordance(BaseModel):
     enabled: StrictBool
     input: InputSchema
     x: AffordanceX | None = None
+    # Set while x is still missing, so an AffordanceX assigned later is checked
+    # against this document URL instead of whatever page_url the caller passes.
+    _page_bound: bool = PrivateAttr(default=False)
+    _bound_page_url: object = PrivateAttr(default=None)
 
     def __setattr__(self, name: str, value: object) -> None:
         # Replacing x used to drop the document binding, so set_verified would
         # trust a loopback page_url on a public document.
         if name == "x" and isinstance(value, AffordanceX):
-            previous = self.__dict__.get("x")
-            if isinstance(previous, AffordanceX) and previous is not value:
-                value._page_bound = bool(getattr(previous, "_page_bound", False))
-                value._bound_page_url = getattr(previous, "_bound_page_url", None)
+            self._copy_probe_binding(value)
         super().__setattr__(name, value)
+
+    def _copy_probe_binding(self, value: AffordanceX) -> None:
+        previous = self.__dict__.get("x")
+        bound = False
+        bound_url: object = None
+        if getattr(self, "_page_bound", False):
+            bound = True
+            bound_url = getattr(self, "_bound_page_url", None)
+        elif isinstance(previous, AffordanceX) and previous is not value:
+            bound = bool(getattr(previous, "_page_bound", False))
+            bound_url = getattr(previous, "_bound_page_url", None)
+        if not bound:
+            return
+        message = probed_ok_refusal(value.tag, value.verified, page_url=bound_url)
+        if message is not None:
+            raise ContractError(message, errors=[message])
+        value._page_bound = True
+        value._bound_page_url = bound_url
 
     @model_validator(mode="before")
     @classmethod
@@ -483,6 +504,8 @@ class ViewDoc(BaseModel):
 
     def _bind_probe_url(self, url: object) -> None:
         for item in self.affordances:
+            item._page_bound = True
+            item._bound_page_url = url
             extra = item.x
             if extra is None:
                 continue
@@ -684,6 +707,8 @@ def _dump_refusing_probe(dump: Callable[[], Any]) -> Any:
         return dump()
     except PydanticSerializationError as exc:
         _reraise_probe(exc)
+    finally:
+        _pending_probe.set(None)
 
 
 def _reraise_probe(exc: PydanticSerializationError) -> NoReturn:
@@ -700,14 +725,23 @@ def _reraise_probe(exc: PydanticSerializationError) -> NoReturn:
 
 
 def _to_json_refusing_probe(value: object, *args: object, **kwargs: object) -> Any:
-    try:
-        return _PYDANTIC_TO_JSON(value, *args, **kwargs)
-    except PydanticSerializationError as exc:
-        _reraise_probe(exc)
+    return _dump_refusing_probe(lambda: _PYDANTIC_TO_JSON(value, *args, **kwargs))
+
+
+def _type_adapter_dump_json(self: Any, instance: Any, /, **kwargs: Any) -> Any:
+    return _dump_refusing_probe(lambda: _TYPE_ADAPTER_DUMP_JSON(self, instance, **kwargs))
+
+
+def _type_adapter_dump_python(self: Any, instance: Any, /, **kwargs: Any) -> Any:
+    return _dump_refusing_probe(lambda: _TYPE_ADAPTER_DUMP_PYTHON(self, instance, **kwargs))
 
 
 _PYDANTIC_TO_JSON = pydantic_core.to_json
 pydantic_core.to_json = _to_json_refusing_probe
+_TYPE_ADAPTER_DUMP_JSON = TypeAdapter.dump_json
+_TYPE_ADAPTER_DUMP_PYTHON = TypeAdapter.dump_python
+TypeAdapter.dump_json = _type_adapter_dump_json  # type: ignore[method-assign]
+TypeAdapter.dump_python = _type_adapter_dump_python  # type: ignore[method-assign]
 
 
 def _refuse_dumped_probe(doc: ViewDoc | dict[str, Any]) -> None:

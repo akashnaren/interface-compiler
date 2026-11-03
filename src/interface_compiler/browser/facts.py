@@ -61,7 +61,8 @@ _OVERLAY_MARGIN_S = 1.0
 _OVERLAY_BUDGET_CAP_S = 2.5
 _READ_PAYLOAD = (
     "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
-    "forms:this.forms,modals:this.modals});}"
+    "forms:this.forms,modals:this.modals,url:this.url,title:this.title,"
+    "truncated:this.truncated});}"
 )
 
 
@@ -165,6 +166,7 @@ class PageFacts:
     elements: tuple[ElementFact, ...]
     forms: tuple[FormFact, ...]
     modals: tuple[ModalFact, ...]
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,8 +198,10 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     of the deadline after the walk, minus one second, and at most 2.5s. When
     it runs out, the remaining controls keep the HTML name and ``name_source``
     is ``html``. A new document loader or a stale node raises instead of mixing
-    two documents. ``history.replaceState`` keeps the loader, and the facts URL
-    is ``page.url``, including its fragment.
+    two documents. The URL and title are the ones read at the start of the
+    walk, so a later ``pushState`` cannot relabel those facts. When the walk
+    runs out of time it returns the elements collected so far with
+    ``truncated`` set.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -286,7 +290,7 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
         evaluated = session.send(
             "Runtime.evaluate",
             {
-                "expression": _COLLECT_SOURCE,
+                "expression": _collect_source(deadline_s, started),
                 "contextId": context_id,
                 "returnByValue": False,
                 "timeout": _EVAL_TIMEOUT_MS,
@@ -312,12 +316,16 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             _overlay_budget(deadline_s, time.perf_counter() - started),
             _overlay_order(payload, len(object_ids)),
         )
-        # Title before the second stamp: a navigation here is a lost document,
-        # not a deadline failure. replaceState changes the URL and not the loader.
-        title = _page_title(page)
+        # A closed page here is a lost document, not a deadline failure. The
+        # URL and title already captured in the walk are the ones returned.
+        _page_title(page)
         if _require_frame_stamp(session)[1] != started_loader:
             raise FactCollectionError("fact collection lost the document")
-        page_url = page.url
+        if not isinstance(payload, dict):
+            raise TypeError("fact collector must return an object")
+        page_url, title, truncated = _walked_document(payload)
+    except FactCollectionError:
+        raise
     except Exception as exc:
         if _is_collection_abort(exc):
             raise FactCollectionError("fact collection exceeded the deadline") from exc
@@ -328,11 +336,7 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             session.detach()
         except PlaywrightError:
             pass
-    if not isinstance(payload, dict):
-        raise TypeError("fact collector must return an object")
-    # page.url is read only after the loader id matches, so a fragment from
-    # replaceState is kept and a later document cannot relabel these facts.
-    return _page_facts(page_url, title, payload, overlay)
+    return _page_facts(page_url, title, payload, overlay, truncated)
 
 
 def _isolated_context(session: CDPSession) -> int:
@@ -529,14 +533,40 @@ def _require_frame_stamp(session: CDPSession) -> tuple[str, str]:
         raise
 
 
+def _collect_source(deadline_s: float, started: float) -> str:
+    """The collector, with the walk's remaining time bound in milliseconds."""
+    remaining_ms = int((deadline_s - (time.perf_counter() - started)) * 1000)
+    budget_ms = max(0, remaining_ms - int(_OVERLAY_MARGIN_S * 1000))
+    # var, not const: the isolated world persists, and a second collect
+    # redeclares this binding.
+    return f"var WALK_BUDGET_MS = {budget_ms};\n{_COLLECT_SOURCE}"
+
+
+def _walked_document(payload: dict[str, Any]) -> tuple[str, str, bool]:
+    url = payload.get("url")
+    title = payload.get("title")
+    if not isinstance(url, str) or not isinstance(title, str):
+        raise TypeError("fact collector must return the document url and title")
+    return url, title, payload.get("truncated") is True
+
+
 def _page_title(page: Page) -> str:
-    """The document title, or a lost-document error if the page navigated."""
+    """The document title, or a lost-document error if the page went away.
+
+    A closed page used to match the deadline check (``has been closed``) and
+    was reported as an exceeded deadline.
+    """
     try:
         return page.title()
     except PlaywrightError as exc:
-        if _is_document_lost(exc):
+        if _is_document_lost(exc) or _is_closed_page(exc):
             raise FactCollectionError("fact collection lost the document") from exc
         raise
+
+
+def _is_closed_page(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "has been closed" in text or "target closed" in text
 
 
 def _is_document_lost(exc: Exception) -> bool:
@@ -632,6 +662,7 @@ def _page_facts(
     title: str,
     payload: dict[str, Any],
     overlay: dict[str, _AxHit],
+    truncated: bool = False,
 ) -> PageFacts:
     try:
         raw_elements = payload.get("elements")
@@ -654,7 +685,14 @@ def _page_facts(
         modals = tuple(_modal(item) for item in raw_modals)
     except TypeError as exc:
         raise FactCollectionError("fact collector returned a value of the wrong type") from exc
-    return PageFacts(url=url, title=title, elements=tuple(elements), forms=forms, modals=modals)
+    return PageFacts(
+        url=url,
+        title=title,
+        elements=tuple(elements),
+        forms=forms,
+        modals=modals,
+        truncated=truncated,
+    )
 
 
 def _element_row(item: object, fields: list[str]) -> dict[str, Any]:
