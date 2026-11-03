@@ -655,7 +655,9 @@ def test_contract_items_nesting_limit(tmp_path: Path) -> None:
     wide["affordances"][1]["input"]["properties"]["size"] = node
     with pytest.raises(ContractError) as wide_error:
         validate_doc(wide)
-    assert len(str(wide_error.value)) <= 400
+    wide_message = str(wide_error.value)
+    assert wide_message.startswith("nesting exceeds max 32")
+    assert len(wide_message) <= 400
 
 
 def test_contract_items_nesting_boundary() -> None:

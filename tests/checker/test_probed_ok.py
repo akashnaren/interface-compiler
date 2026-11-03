@@ -8,9 +8,11 @@ from pydantic import ValidationError
 
 from interface_compiler.browser.facts import normalized_page_url
 from interface_compiler.contract import (
+    ActResult,
     ContractError,
     DocX,
     ViewDoc,
+    dump_act_result,
     dump_view_doc,
     validate_doc,
     validate_effect,
@@ -262,10 +264,10 @@ def test_checker_document_probe_follows_the_document_url(path: str) -> None:
         )
         row = doc.affordances[2].x
         assert row is not None
-        row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
         with pytest.raises(ContractError) as exc:
-            dump_view_doc(doc)
+            row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
         assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert row.verified == "unverified"
         return
     doc = ViewDoc.model_validate(_with_probe("http://127.0.0.1/x", tag="mutating"))
     assert doc.x is not None
@@ -282,6 +284,68 @@ def test_checker_document_probe_follows_the_document_url(path: str) -> None:
         assert "mutating affordance cannot be probed_ok" in str(exc.value)
         assert doc.x.url == "http://127.0.0.1/x"
         dump_view_doc(doc)
+        return
+    raise AssertionError(path)
+
+
+def _public_probe_bypassing_the_url_guard() -> ViewDoc:
+    """A probed loopback document whose URL was replaced without the guard."""
+    doc = ViewDoc.model_validate(_with_probe("http://127.0.0.1/x", tag="mutating"))
+    assert doc.x is not None
+    doc.x._guard_url = None
+    doc.x.url = "https://example.com/p"
+    return doc
+
+
+@pytest.mark.parametrize("path", ["setter", "model_dump", "act_dump"])
+def test_checker_serialized_probe_matches_the_document_url(path: str) -> None:
+    if path == "setter":
+        legal = ViewDoc.model_validate(
+            _with_probe("http://127.0.0.1/x", tag="mutating", verified="unverified")
+        )
+        legal_row = legal.affordances[2].x
+        assert legal_row is not None
+        legal_row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+        assert legal_row.verified == "probed_ok"
+        dump_view_doc(legal)
+        public = ViewDoc.model_validate(
+            _with_probe("https://example.com/p", tag="mutating", verified="unverified")
+        )
+        row = public.affordances[2].x
+        assert row is not None
+        with pytest.raises(ContractError) as exc:
+            row.set_verified("probed_ok", page_url="http://127.0.0.1/x")
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert row.verified == "unverified"
+        return
+    doc = _public_probe_bypassing_the_url_guard()
+    if path == "model_dump":
+        with pytest.raises(ContractError) as exc:
+            doc.model_dump()
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        return
+    if path == "act_dump":
+        result = ActResult.model_validate(
+            {
+                "status": "ok",
+                "doc_rev": 1,
+                "doc": _with_probe("http://127.0.0.1/x", tag="mutating"),
+                "counters": {
+                    "illegal": 0,
+                    "malformed": 0,
+                    "ignored": 0,
+                    "stale": 0,
+                    "blocked": 0,
+                    "acts": 1,
+                },
+            }
+        )
+        result.doc = doc
+        with pytest.raises(ContractError) as exc:
+            dump_act_result(result)
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        with pytest.raises(ContractError):
+            result.model_dump()
         return
     raise AssertionError(path)
 

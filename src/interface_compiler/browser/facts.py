@@ -27,14 +27,43 @@ _COLLECT_SOURCE = Path(__file__).with_name("collect.js").read_text(encoding="utf
 _SKIP_AX_ROLES = frozenset({"none", "InlineTextBox", "StaticText", "ignored"})
 # Chromium's internal names for controls whose ARIA role is the one below.
 _AX_ROLE_ALIASES = {"Date": "textbox", "DisclosureTriangle": "button"}
+# Overlay visits these before landmarks and headings. The budget then runs out
+# on controls instead of on the content that already has an HTML role.
+_ACTIONABLE_TAGS = frozenset({"a", "button", "input", "select", "textarea", "summary", "option"})
+_ACTIONABLE_ROLES = frozenset(
+    {
+        "button",
+        "checkbox",
+        "combobox",
+        "link",
+        "listbox",
+        "menu",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "searchbox",
+        "slider",
+        "spinbutton",
+        "switch",
+        "tab",
+        "textbox",
+    }
+)
 _ISOLATED_WORLD = "interface-compiler"
 _NODE_GROUP = "interface-compiler-nodes"
 _EVAL_TIMEOUT_MS = 5_000
 _DEADLINE_S = 5.0
 # Stop overlaying once this much of the deadline is gone and keep HTML roles.
+# A partial tree is about a millisecond per node, so the cap is what keeps a
+# table of thousands of controls inside the deadline.
 _OVERLAY_BUDGET_FRACTION = 0.25
-_OVERLAY_BUDGET_CAP_S = 0.75
-_READ_PAYLOAD = "function(){return JSON.stringify({elements:this.elements,forms:this.forms,modals:this.modals});}"
+_OVERLAY_BUDGET_CAP_S = 0.35
+_READ_PAYLOAD = (
+    "function(){return JSON.stringify({fields:this.fields,elements:this.elements,"
+    "forms:this.forms,modals:this.modals});}"
+)
 
 
 class FactCollectionError(RuntimeError):
@@ -110,6 +139,7 @@ class ElementFact:
     label_text: str
     group_key: str | None
     constraints: Constraints
+    from_ax: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,11 +188,12 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
 
     The DOM walk in `collect.js` is the source of the element list. It runs in
     an isolated world, so a page that replaces ``querySelectorAll`` or
-    ``Array.from`` cannot change the walk. Chromium's accessibility tree
-    overlays role and name. Each element is joined by the object id returned
-    from that world, not by an attribute the page can see. Shadow controls (a
-    date input's spinbuttons, for example) are not separate facts. When the
-    overlay budget runs out, the remaining controls keep the HTML role.
+    ``Array.from`` cannot change the walk.     Chromium's accessibility tree
+    overlays role and name, actionable controls first. Each element is joined
+    by the object id returned from that world, not by an attribute the page
+    can see. Shadow controls (a date input's spinbuttons, for example) are not
+    separate facts. When the overlay budget runs out, or a partial tree fails,
+    the remaining controls keep the HTML role.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -186,6 +217,8 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     except FactCollectionError:
         _note_if_killed(killed, pid)
         raise
+    except TypeError as exc:
+        raise FactCollectionError("fact collector returned a value of the wrong type") from exc
     except Exception as exc:
         if _is_collection_abort(exc):
             _note_if_killed(killed, pid)
@@ -264,7 +297,12 @@ def _collect_within(page: Page, deadline_s: float) -> PageFacts:
         )
         payload = json.loads(raw_payload) if isinstance(raw_payload, str) else None
         object_ids = _node_object_ids(session, root_id)
-        overlay = _accessibility_overlay(session, object_ids, _overlay_budget(deadline_s))
+        overlay = _accessibility_overlay(
+            session,
+            object_ids,
+            _overlay_budget(deadline_s),
+            _actionable_first(payload, len(object_ids)),
+        )
     except Exception as exc:
         if _is_collection_abort(exc):
             raise FactCollectionError("fact collection exceeded the deadline") from exc
@@ -344,28 +382,59 @@ def _release_nodes(session: CDPSession) -> None:
         pass
 
 
+def _actionable_first(payload: object, count: int) -> list[int]:
+    """Indexes of actionable controls, then everything else, in document order."""
+    if count <= 0:
+        return []
+    rows = payload.get("elements") if isinstance(payload, dict) else None
+    fields = payload.get("fields") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not isinstance(fields, list):
+        return list(range(count))
+    tag_at = fields.index("tag") if "tag" in fields else None
+    role_at = fields.index("role") if "role" in fields else None
+    if not isinstance(tag_at, int) or not isinstance(role_at, int):
+        return list(range(count))
+    first: list[int] = []
+    rest: list[int] = []
+    for index in range(min(count, len(rows))):
+        row = rows[index]
+        tag = row[tag_at] if isinstance(row, list) and tag_at < len(row) else None
+        role = row[role_at] if isinstance(row, list) and role_at < len(row) else None
+        if tag in _ACTIONABLE_TAGS or role in _ACTIONABLE_ROLES:
+            first.append(index)
+        else:
+            rest.append(index)
+    covered = len(first) + len(rest)
+    return first + rest + list(range(covered, count))
+
+
 def _accessibility_overlay(
     session: CDPSession,
     object_ids: list[str],
     budget_s: float,
+    order: list[int],
 ) -> dict[str, _AxHit]:
     """Role and name for as many elements as the budget allows.
 
-    The rest keep the HTML role from the walk. One partial tree per element
-    avoids building Chromium's full tree, which is the slow step on tables.
+    ``order`` visits actionable controls before the rest. One partial tree per
+    element avoids building Chromium's full tree, which is the slow step on
+    tables. A failed partial tree stops the overlay; later elements keep the
+    HTML role.
     """
     if budget_s <= 0 or not object_ids:
         return {}
     session.send("Accessibility.enable")
     started = time.perf_counter()
     resolved: dict[str, _AxHit] = {}
-    for index, object_id in enumerate(object_ids):
+    for index in order:
         if time.perf_counter() - started >= budget_s:
             break
+        if index < 0 or index >= len(object_ids):
+            continue
         try:
             tree = session.send(
                 "Accessibility.getPartialAXTree",
-                {"objectId": object_id, "fetchRelatives": False},
+                {"objectId": object_ids[index], "fetchRelatives": False},
             )
         except PlaywrightError:
             break
@@ -476,28 +545,46 @@ def _page_facts(
     payload: dict[str, Any],
     overlay: dict[str, _AxHit],
 ) -> PageFacts:
-    raw_elements = payload.get("elements")
-    raw_forms = payload.get("forms")
-    raw_modals = payload.get("modals")
-    if not isinstance(raw_elements, list) or not isinstance(raw_forms, list):
-        raise TypeError("fact collector must return elements and forms")
-    if not isinstance(raw_modals, list):
-        raise TypeError("fact collector must return modals")
-    elements: list[ElementFact] = []
-    for item in raw_elements:
-        if not isinstance(item, dict):
-            raise TypeError("element fact must be an object")
-        elements.append(_element(item, overlay.get(_req(item, "marker", str))))
-    forms = tuple(_form(item) for item in raw_forms)
-    modals = tuple(_modal(item) for item in raw_modals)
+    try:
+        raw_elements = payload.get("elements")
+        raw_forms = payload.get("forms")
+        raw_modals = payload.get("modals")
+        raw_fields = payload.get("fields")
+        if not isinstance(raw_elements, list) or not isinstance(raw_forms, list):
+            raise TypeError("fact collector must return elements and forms")
+        if not isinstance(raw_modals, list):
+            raise TypeError("fact collector must return modals")
+        if not isinstance(raw_fields, list) or any(
+            not isinstance(name, str) for name in raw_fields
+        ):
+            raise TypeError("fact collector must return field names")
+        elements: list[ElementFact] = []
+        field_names = [name for name in raw_fields if isinstance(name, str)]
+        for index, item in enumerate(raw_elements):
+            elements.append(_element(_element_row(item, field_names), overlay.get(str(index))))
+        forms = tuple(_form(item) for item in raw_forms)
+        modals = tuple(_modal(item) for item in raw_modals)
+    except TypeError as exc:
+        raise FactCollectionError("fact collector returned a value of the wrong type") from exc
     return PageFacts(url=url, title=title, elements=tuple(elements), forms=forms, modals=modals)
+
+
+def _element_row(item: object, fields: list[str]) -> dict[str, Any]:
+    if not isinstance(item, list) or len(item) != len(fields):
+        raise TypeError("element fact must be a row")
+    return dict(zip(fields, item, strict=True))
 
 
 def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
     role = _req(item, "role", str)
     name = _req(item, "name", str)
     if hit is not None:
-        role = hit.role or role
+        ax_role = hit.role or role
+        # type=file is a button in Chromium's tree. Keep the HTML role so the
+        # overlay and the post-budget fallback agree.
+        if _opt(item, "input_type", str) == "file" and ax_role == "button":
+            ax_role = role
+        role = ax_role
         if hit.name is not None:
             name = hit.name
     constraints = item.get("constraints")
@@ -564,6 +651,7 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
             minlength=_non_negative_int(constraints, "minlength"),
             maxlength=_non_negative_int(constraints, "maxlength"),
         ),
+        from_ax=hit is not None,
     )
 
 

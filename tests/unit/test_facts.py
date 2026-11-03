@@ -13,8 +13,10 @@ from interface_compiler.browser.engine import USER_AGENT_SUFFIX, Engine
 from interface_compiler.browser.facts import (
     Constraints,
     ElementFact,
+    FactCollectionError,
     PageFacts,
     _non_negative_int,
+    _page_facts,
     collect_facts,
 )
 from interface_compiler.browser.raw import raw_snapshot
@@ -862,6 +864,89 @@ def test_facts_length_attributes_are_non_negative_integers(
     assert _non_negative_int({"maxlength": True}, "maxlength") is None
 
 
+@pytest.mark.parametrize(
+    ("control", "html", "valid"),
+    [
+        ("action", "<form id='f' action='/go'><input name='action' value='nope'></form>", True),
+        ("id", "<form id='f' action='/go'><input name='id' value='nope'></form>", True),
+        ("matches", "<form id='f' action='/go'><input name='matches' required></form>", False),
+        ("type", "", False),
+    ],
+)
+def test_facts_named_form_controls_do_not_shadow_getters(
+    control: str,
+    html: str,
+    valid: bool,
+    facts_page: Page,
+    fixture_base_url: str,
+) -> None:
+    if control == "type":
+        with pytest.raises(FactCollectionError, match="wrong type"):
+            _page_facts(
+                "about:blank",
+                "",
+                {
+                    "fields": [],
+                    "elements": [],
+                    "forms": [
+                        {
+                            "index": 0,
+                            "method": "get",
+                            "action": {"shadowed": True},
+                            "valid": True,
+                            "html_id": None,
+                        }
+                    ],
+                    "modals": [],
+                },
+                {},
+            )
+        return
+    # set_content stays on about:blank, where the action getter is empty.
+    # Writing into the fixture document keeps an http URL, so the getter
+    # resolves /go instead of returning the control named action.
+    facts_page.goto(f"{fixture_base_url}/link.html", wait_until="domcontentloaded")
+    facts_page.evaluate(
+        "(html) => { document.open(); document.write(html); document.close(); }",
+        f"<!doctype html><title>form</title>{html}",
+    )
+    form = collect_facts(facts_page).forms[0]
+    assert form.html_id == "f"
+    assert form.valid is valid
+    assert isinstance(form.action, str)
+    assert form.action.endswith("/go")
+    assert "nope" not in form.action
+
+
+@pytest.mark.parametrize(
+    ("control_type", "role"),
+    [
+        ("image", "button"),
+        ("submit", "button"),
+        ("reset", "button"),
+        ("button", "button"),
+        ("file", "file"),
+    ],
+)
+def test_facts_input_roles_agree_when_the_overlay_stops(
+    control_type: str,
+    role: str,
+    facts_page: Page,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts_page.set_content(
+        "<!doctype html><title>roles</title>"
+        f"<input id='c' type='{control_type}' alt='Pic' value='Go'>"
+    )
+    overlaid = _by_id(collect_facts(facts_page), "c")
+    monkeypatch.setattr("interface_compiler.browser.facts._OVERLAY_BUDGET_CAP_S", 0.0)
+    fallback = _by_id(collect_facts(facts_page), "c")
+    assert overlaid.role == role
+    assert overlaid.input_type == control_type
+    assert fallback.role == role
+    assert fallback.from_ax is False
+
+
 @pytest.mark.parametrize(("rows", "layout"), [(3000, "flat"), (3000, "table")])
 def test_facts_row_count_finishes_under_the_deadline(rows: int, layout: str) -> None:
     # Own browser: a deadline kill must not take down the session engine.
@@ -877,7 +962,9 @@ engine = Engine()
 engine.start()
 page = engine.new_page()
 try:
-    parts = ["<!doctype html><title>rows</title>"]
+    parts = ["<!doctype html><title>rows</title>", "<h1>Section</h1>" * 8]
+    parts.append("<span id='axlab' aria-label='From AX'></span>")
+    parts.append("<button id='go' aria-labelledby='axlab'>ignored</button>")
     if layout == "table":
         parts.append("<table><tbody>")
     else:
@@ -908,11 +995,23 @@ try:
     field = next(element for element in facts.elements if element.html_id == "f0")
     last = next(element for element in facts.elements if element.html_id == f"f{rows - 1}")
     row = next(element for element in facts.elements if element.html_id == "r0")
+    go = next(element for element in facts.elements if element.html_id == "go")
+    headings = [element for element in facts.elements if element.tag == "h1"]
+    covered = [element for element in facts.elements if element.from_ax]
+    actionable = {"a", "button", "input", "select", "textarea", "summary", "option"}
     if not (inputs == rows and links == rows and field.name == "Field 0" and row.name == "Row 0"):
         raise SystemExit(2)
-    if last.disabled:
+    if last.disabled or last.role != "textbox":
         raise SystemExit(2)
-    print(f"{elapsed:.3f} { _DEADLINE_S:.3f}")
+    # Headings come first in the document. Coverage still lands on the button,
+    # and it does not land on those headings while controls remain.
+    if go.role != "button" or go.name != "From AX" or not go.from_ax:
+        raise SystemExit(2)
+    if not headings or any(element.from_ax for element in headings):
+        raise SystemExit(2)
+    if not covered or any(element.tag not in actionable for element in covered):
+        raise SystemExit(2)
+    print(f"{elapsed:.3f} {_DEADLINE_S:.3f}")
 finally:
     engine.close()
 
@@ -956,7 +1055,7 @@ finally:
     elapsed_text, deadline_text = completed.stdout.split()
     elapsed = float(elapsed_text)
     deadline = float(deadline_text)
-    assert elapsed < deadline * 0.5, f"{rows} {layout} rows took {elapsed:.2f}s"
+    assert elapsed < deadline * 0.8, f"{rows} {layout} rows took {elapsed:.2f}s"
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

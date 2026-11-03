@@ -1,7 +1,8 @@
 // In-page facts for one document. facts.py evaluates this file and reads the
-// returned JSON. Accessibility roles are overlaid in Python; the roles recorded
-// here are the HTML ones, which the skeleton path must keep (a summary stays
-// button even when Chromium later reports DisclosureTriangle).
+// returned JSON. Elements are rows aligned with `fields` so a large page does
+// not repeat every key. Accessibility roles are overlaid in Python; the roles
+// recorded here are the HTML ones, which the skeleton path must keep (a summary
+// stays button even when Chromium later reports DisclosureTriangle).
 (() => {
   const SELECTOR = [
     "a[href]",
@@ -29,6 +30,18 @@
     "[aria-label]",
     "[aria-labelledby]",
   ].join(",");
+
+  // Form controls are exposed as named properties and hide these.
+  const readId = Object.getOwnPropertyDescriptor(Element.prototype, "id").get;
+  const readFormAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action").get;
+
+  function elementId(el) {
+    return readId.call(el) || "";
+  }
+
+  function elementMatches(el, selector) {
+    return Element.prototype.matches.call(el, selector);
+  }
 
   function clean(value) {
     return String(value || "").replace(/\s+/g, " ").trim();
@@ -89,10 +102,11 @@
   let styleHidden = new Map();
 
   function labelFor(el) {
-    if (!el.id) {
+    const id = elementId(el);
+    if (!id) {
       return null;
     }
-    return labelsByFor.get(el.id) || null;
+    return labelsByFor.get(id) || null;
   }
 
   function labelText(el) {
@@ -206,8 +220,15 @@
       if (type === "search") {
         return "searchbox";
       }
-      if (type === "button" || type === "submit" || type === "reset") {
+      // Chromium reports these as button. The HTML role matches, so the tail
+      // kept after the overlay stops is not relabeled.
+      if (type === "button" || type === "submit" || type === "reset" || type === "image") {
         return "button";
+      }
+      // Chromium's node role is button (the chooser). The fact keeps file so
+      // an upload is not stored as a button when the overlay does run.
+      if (type === "file") {
+        return "file";
       }
       return "textbox";
     }
@@ -272,7 +293,7 @@
     }
     const radioGroup = el.closest("[role='radiogroup']");
     if (radioGroup) {
-      const name = accName(radioGroup) || radioGroup.id;
+      const name = accName(radioGroup) || elementId(radioGroup);
       if (name) {
         return name;
       }
@@ -287,15 +308,16 @@
     if (el.hasAttribute("aria-pressed")) {
       const toolbar = el.closest("[role='toolbar']");
       if (toolbar) {
-        return accName(toolbar) || toolbar.id || null;
+        return accName(toolbar) || elementId(toolbar) || null;
       }
     }
     return null;
   }
 
   function cssOf(el) {
-    if (el.id && idCounts.get(el.id) === 1) {
-      return `#${CSS.escape(el.id)}`;
+    const id = elementId(el);
+    if (id && idCounts.get(id) === 1) {
+      return `#${CSS.escape(id)}`;
     }
     const name = el.getAttribute("name");
     if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
@@ -442,7 +464,7 @@
   }
 
   function optionDisabled(opt) {
-    return opt.matches(":disabled") || flagAriaDisabled.get(opt) === true;
+    return elementMatches(opt, ":disabled") || flagAriaDisabled.get(opt) === true;
   }
 
   function submitBinding(el) {
@@ -496,10 +518,11 @@
     flagAriaDisabled = new Map();
     styleHidden = new Map();
     for (const node of document.querySelectorAll("[id]")) {
-      if (!node.id) {
+      const id = elementId(node);
+      if (!id) {
         continue;
       }
-      idCounts.set(node.id, (idCounts.get(node.id) || 0) + 1);
+      idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
     for (const node of document.querySelectorAll("[name]")) {
       const name = node.getAttribute("name");
@@ -565,66 +588,108 @@
 
   indexDocument();
   const nodes = [];
-  const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el, index) => {
+  const fields = [
+    "tag",
+    "role",
+    "name",
+    "html_id",
+    "field_name",
+    "input_type",
+    "href",
+    "form_index",
+    "form_method",
+    "form_action",
+    "disabled",
+    "readonly",
+    "aria_disabled",
+    "inert",
+    "hidden",
+    "aria_hidden",
+    "value",
+    "checked",
+    "selected",
+    "options",
+    "aria_expanded",
+    "aria_selected",
+    "aria_checked",
+    "aria_pressed",
+    "aria_current",
+    "aria_valuemin",
+    "aria_valuemax",
+    "aria_valuenow",
+    "aria_haspopup",
+    "aria_controls",
+    "box",
+    "visible",
+    "covered",
+    "in_viewport",
+    "validation_message",
+    "landmark",
+    "css",
+    "skeleton_path",
+    "label_text",
+    "group_key",
+    "constraints",
+  ];
+  const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el) => {
     nodes.push(el);
     const rect = el.getBoundingClientRect();
     const visible = isVisible(el, rect);
     const role = elementRole(el);
     const binding = submitBinding(el);
-    return {
-      marker: String(index),
-      tag: el.tagName.toLowerCase(),
+    return [
+      el.tagName.toLowerCase(),
       role,
-      name: fallbackName(el),
-      html_id: el.id || null,
-      field_name: el.getAttribute("name"),
-      input_type: el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
-      href: el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
-      form_index: formIndex(el),
-      form_method: binding.form_method,
-      form_action: binding.form_action,
-      disabled: role === "option" ? optionDisabled(el) : el.matches(":disabled"),
-      readonly: el.readOnly === true,
-      aria_disabled: flagAriaDisabled.get(el) === true,
-      inert: flagInert.get(el) === true,
-      hidden: flagHidden.get(el) === true,
-      aria_hidden: flagAriaHidden.get(el) === true,
-      value: controlValue(el),
-      checked: checkedState(el),
-      selected: el.tagName === "OPTION" ? el.selected === true : null,
-      options: optionsOf(el),
-      aria_expanded: expanded(el),
-      aria_selected: el.getAttribute("aria-selected"),
-      aria_checked: el.getAttribute("aria-checked"),
-      aria_pressed: el.getAttribute("aria-pressed"),
-      aria_current: el.getAttribute("aria-current"),
-      aria_valuemin: el.getAttribute("aria-valuemin"),
-      aria_valuemax: el.getAttribute("aria-valuemax"),
-      aria_valuenow: el.getAttribute("aria-valuenow"),
-      aria_haspopup: el.getAttribute("aria-haspopup"),
-      aria_controls: el.getAttribute("aria-controls"),
-      box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      fallbackName(el),
+      elementId(el) || null,
+      el.getAttribute("name"),
+      el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
+      el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
+      formIndex(el),
+      binding.form_method,
+      binding.form_action,
+      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
+      el.readOnly === true,
+      flagAriaDisabled.get(el) === true,
+      flagInert.get(el) === true,
+      flagHidden.get(el) === true,
+      flagAriaHidden.get(el) === true,
+      controlValue(el),
+      checkedState(el),
+      el.tagName === "OPTION" ? el.selected === true : null,
+      optionsOf(el),
+      expanded(el),
+      el.getAttribute("aria-selected"),
+      el.getAttribute("aria-checked"),
+      el.getAttribute("aria-pressed"),
+      el.getAttribute("aria-current"),
+      el.getAttribute("aria-valuemin"),
+      el.getAttribute("aria-valuemax"),
+      el.getAttribute("aria-valuenow"),
+      el.getAttribute("aria-haspopup"),
+      el.getAttribute("aria-controls"),
+      { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
       visible,
-      covered: isCovered(el, rect, visible),
-      in_viewport: inViewport(rect),
-      validation_message: el.willValidate ? el.validationMessage : "",
-      landmark: landmarkOf(el),
-      css: cssOf(el),
-      skeleton_path: skeletonOf(el),
-      label_text: labelText(el),
-      group_key: groupKey(el),
-      constraints: constraintsOf(el),
-    };
+      isCovered(el, rect, visible),
+      inViewport(rect),
+      el.willValidate ? el.validationMessage : "",
+      landmarkOf(el),
+      cssOf(el),
+      skeletonOf(el),
+      labelText(el),
+      groupKey(el),
+      constraintsOf(el),
+    ];
   });
 
   const forms = Array.from(document.forms).map((form, index) => ({
     index,
     method: (form.getAttribute("method") || "get").toLowerCase(),
-    action: form.action,
+    action: readFormAction.call(form),
     // :invalid does not fire invalid listeners. form.checkValidity is skipped
     // because a control named checkValidity replaces the method.
-    valid: !form.matches(":invalid"),
-    html_id: form.id || null,
+    valid: !elementMatches(form, ":invalid"),
+    html_id: elementId(form) || null,
   }));
 
   const modals = [];
@@ -635,14 +700,14 @@
     }
     seen.add(el);
     modals.push({
-      html_id: el.id || null,
+      html_id: elementId(el) || null,
       role,
       name: accName(el),
       open: true,
     });
   }
   for (const dialog of document.querySelectorAll("dialog[open]")) {
-    if (dialog.matches(":modal")) {
+    if (elementMatches(dialog, ":modal")) {
       pushModal(dialog, "dialog");
     }
   }
@@ -652,5 +717,5 @@
     pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
   }
 
-  return { elements, forms, modals, nodes };
+  return { fields, elements, forms, modals, nodes };
 })()

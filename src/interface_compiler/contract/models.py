@@ -199,8 +199,11 @@ class AffordanceX(BaseModel):
     ) = None
     verified_at: str | None = None
     # Direct assignment has no page URL, so probed_ok is refused unless the
-    # tag is safe. set_verified passes its own page-URL check.
+    # tag is safe. set_verified passes its own page-URL check. Once a view
+    # document owns this row, that document's x.url wins over the argument.
     _verified_locked: bool = PrivateAttr(default=False)
+    _page_bound: bool = PrivateAttr(default=False)
+    _bound_page_url: object = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _lock_verified(self) -> Self:
@@ -227,15 +230,24 @@ class AffordanceX(BaseModel):
         """Record a probe outcome for this affordance.
 
         ``probed_ok`` is refused when the tag is missing or ``mutating`` and
-        ``page_url`` is not a loopback fixture host. The field is left unchanged
-        when the outcome is refused. Assigning ``verified`` directly has the
-        same refusal, with no page URL, so a loopback outcome has to go through
-        this method.
+        the page is not a loopback fixture host. On a row owned by a view
+        document, ``page_url`` has to be that document's ``x.url``; a different
+        argument is not trusted. The field is left unchanged when the outcome
+        is refused. Assigning ``verified`` directly has the same refusal, with
+        no page URL, so a loopback outcome has to go through this method.
         """
         if status not in _VERIFIED_STATES:
             message = f"verified {_echo_value(status)} is not a probe outcome"
             raise ContractError(message, errors=[message])
-        message = probed_ok_refusal(self.tag, status, page_url=page_url)
+        check_url: object = page_url
+        document_url = getattr(self, "_bound_page_url", None)
+        if getattr(self, "_page_bound", False) and page_url != document_url:
+            check_url = document_url
+            message = probed_ok_refusal(self.tag, status, page_url=check_url)
+            if message is None:
+                message = "page_url does not match x.url"
+            raise ContractError(message, errors=[message])
+        message = probed_ok_refusal(self.tag, status, page_url=check_url)
         if message is not None:
             raise ContractError(message, errors=[message])
         self._assign_verified(status)
@@ -382,9 +394,20 @@ class ViewDoc(BaseModel):
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         copied = super().model_copy(update=update, deep=deep)
         _refuse_dumped_probe(copied)
-        if copied.x is not None and (deep or copied.x is not self.x):
-            copied._arm_url_guard()
+        if copied.x is None or not (deep or copied.x is not self.x):
+            return copied
+        # A shallow copy shares affordance rows. Rebinding those rows would
+        # point the original document's probes at this copy's URL.
+        copied._url_locked = True
+        copied.x._guard_url = copied._refuse_url
+        if deep or copied.affordances is not self.affordances:
+            copied._bind_probe_url(copied.x.url)
         return copied
+
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        dumped = super().model_dump(**kwargs)
+        _refuse_dumped_probe(dumped)
+        return dumped
 
     @model_validator(mode="wrap")
     @classmethod
@@ -434,6 +457,15 @@ class ViewDoc(BaseModel):
         extra = self.x
         if extra is not None:
             extra._guard_url = self._refuse_url
+        self._bind_probe_url(extra.url if extra is not None else None)
+
+    def _bind_probe_url(self, url: object) -> None:
+        for item in self.affordances:
+            extra = item.x
+            if extra is None:
+                continue
+            extra._page_bound = True
+            extra._bound_page_url = url
 
     def _refuse_url(self, url: object) -> None:
         for index, item in enumerate(self.affordances):
@@ -445,6 +477,7 @@ class ViewDoc(BaseModel):
                 continue
             text = f"affordances/{index}/x/verified: {message}"
             raise ContractError(text, errors=[text])
+        self._bind_probe_url(url)
 
 
 class Predicted(BaseModel):
@@ -590,6 +623,11 @@ class ActResult(BaseModel):
         validate_effect(dump_act_result(self))
         return self
 
+    def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+        dumped = super().model_dump(**kwargs)
+        _refuse_dumped_probe(dumped)
+        return dumped
+
 
 def dump_view_doc(doc: ViewDoc) -> dict[str, Any]:
     """Serialize a compiled view document, omitting unset optional fields.
@@ -613,11 +651,13 @@ def dump_act_result(result: ActResult, *, echo_errors: bool = True) -> dict[str,
     """Serialize an act response.
 
     ``echo_errors`` defaults to true. When it is false, the ``error`` key is
-    omitted, which is the paper-replication loop. Counters stay.
+    omitted, which is the paper-replication loop. Counters stay. A mutating
+    ``probed_ok`` affordance on a public page URL is not serialized.
     """
     dumped = _dump_model(result)
     if not echo_errors:
         dumped.pop("error", None)
+    _refuse_dumped_probe(dumped)
     return dumped
 
 

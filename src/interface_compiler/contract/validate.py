@@ -355,8 +355,12 @@ def _truncate_repr(rendered: str) -> str:
 
 
 def nesting_too_deep(where: str) -> str:
-    """Contract message for an items or properties chain past the nesting limit."""
-    return _cap_text(f"{where}: nesting exceeds max {_MAX_SCHEMA_DEPTH}", _MESSAGE_LIMIT)
+    """Contract message for an items or properties chain past the nesting limit.
+
+    The reason is first. ``_cap_text`` keeps the start of the string, so a long
+    property path is what gets cut.
+    """
+    return _cap_text(f"nesting exceeds max {_MAX_SCHEMA_DEPTH}: {where}", _MESSAGE_LIMIT)
 
 
 def _guard_json_document(instance: object) -> None:
