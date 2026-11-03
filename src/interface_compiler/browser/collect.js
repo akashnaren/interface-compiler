@@ -538,7 +538,11 @@
       role === "option" ||
       role === "treeitem" ||
       role === "checkbox" ||
-      role === "radio"
+      role === "radio" ||
+      role === "switch" ||
+      role === "menuitemcheckbox" ||
+      role === "menuitemradio" ||
+      role === "gridcell"
     );
   }
 
@@ -733,10 +737,19 @@
     return cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight;
   }
 
-  // Hit-test every visible in-viewport center. Boxes fully to the right or
-  // below the viewport are display:none for that pass so a long inline line
-  // does not make each elementFromPoint walk every fragment. Masks that are
-  // not collected elements stay in the tree. The inline styles are restored.
+  function pastBudget() {
+    return (
+      typeof WALK_BUDGET_MS === "number" &&
+      WALK_BUDGET_MS > 0 &&
+      performance.now() - walkStarted > WALK_BUDGET_MS
+    );
+  }
+
+  // One elementFromPoint on a long inline line walks every fragment. Keep a
+  // short slice of the budget for that loop. A center it does not reach stays
+  // uncovered. Offscreen centers are not hit-tested. Nothing here writes the page.
+  const hitCapMs = 300;
+
   function coverageOf(els, rects) {
     const flags = [];
     const viewport = [];
@@ -748,37 +761,17 @@
       }
       viewport.push(index);
     }
-    const keep = new Set();
-    for (const index of viewport) {
-      let node = els[index];
-      while (node) {
-        keep.add(node);
-        node = parentElement(node);
+    const hitStarted = performance.now();
+    for (let seen = 0; seen < viewport.length; seen += 1) {
+      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
+        break;
       }
-    }
-    const hidden = [];
-    for (let index = 0; index < els.length; index += 1) {
+      const index = viewport[seen];
       const rect = rects[index];
-      const el = els[index];
-      const outside = rect.top >= window.innerHeight || rect.left >= window.innerWidth;
-      if (!outside || keep.has(el)) {
-        continue;
-      }
-      hidden.push({ el, display: el.style.display });
-      el.style.display = "none";
-    }
-    try {
-      for (const index of viewport) {
-        const rect = rects[index];
-        flags[index] = coveredBy(
-          els[index],
-          elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2),
-        );
-      }
-    } finally {
-      for (const item of hidden) {
-        item.el.style.display = item.display;
-      }
+      flags[index] = coveredBy(
+        els[index],
+        elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2),
+      );
     }
     return flags;
   }
@@ -1023,16 +1016,33 @@
   const matched = document.querySelectorAll(SELECTOR);
   const chosen = [];
   const rects = [];
-  // Shipping one kept row takes a fraction of a millisecond. Stop while
-  // the deadline can still carry the rows already kept.
+  // Shipping one kept row takes a fraction of a millisecond, and that copy
+  // has to finish inside the reserved second. A slow walk (a throttled CPU)
+  // keeps fewer rows. The rows chosen here are emitted below even if this
+  // loop stops, so a cut still returns the elements already kept.
   const rowCopyMs = 0.2;
+  const fastCopyMs = 0.07;
+  const reserveMs = typeof WALK_RESERVE_MS === "number" ? WALK_RESERVE_MS : 1000;
+  const selectStarted = performance.now();
   for (let index = 0; index < matched.length; index += 1) {
     if (budgetSpent()) {
       break;
     }
+    const taken = chosen.length;
+    if (taken >= 200) {
+      const perRow = (performance.now() - selectStarted) / taken;
+      let copyMs = fastCopyMs;
+      if (perRow >= 0.003) {
+        copyMs = fastCopyMs * (perRow / 0.001);
+      }
+      if (taken * copyMs > reserveMs) {
+        truncated = true;
+        break;
+      }
+    }
     if (
       typeof WALK_BUDGET_MS === "number" &&
-      performance.now() - walkStarted + chosen.length * rowCopyMs > WALK_BUDGET_MS
+      performance.now() - walkStarted + taken * rowCopyMs > WALK_BUDGET_MS
     ) {
       truncated = true;
       break;

@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
+from pydantic_core import PydanticSerializationError
 
 from interface_compiler.browser.facts import normalized_page_url
 from interface_compiler.contract import (
@@ -17,7 +18,11 @@ from interface_compiler.contract import (
     validate_doc,
     validate_effect,
 )
-from interface_compiler.contract.models import AffordanceX
+from interface_compiler.contract.models import (
+    AffordanceX,
+    _checked_serialize,
+    _dump_refusing_probe,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 PAPER_PATH = ROOT / "tests" / "fixtures" / "paper_example.json"
@@ -416,6 +421,21 @@ def test_checker_serializers_refuse_a_public_probe(dump: str) -> None:
         _dump_probe(doc, dump)
     with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
         _dump_probe(result, dump)
+
+
+def test_checker_type_adapter_refusal_does_not_stick() -> None:
+    public = _public_probe_bypassing_the_url_guard()
+    with pytest.raises(PydanticSerializationError):
+        TypeAdapter(ViewDoc).dump_python(public)
+
+    def dump() -> None:
+        def handler(_model: object) -> None:
+            raise PydanticSerializationError("unrelated")
+
+        _checked_serialize(public, handler)
+
+    with pytest.raises(PydanticSerializationError, match="unrelated"):
+        _dump_refusing_probe(dump)
 
 
 @pytest.mark.parametrize(

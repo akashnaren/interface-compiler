@@ -55,8 +55,8 @@ _ISOLATED_WORLD = "interface-compiler"
 _NODE_GROUP = "interface-compiler-nodes"
 _EVAL_TIMEOUT_MS = 5_000
 _DEADLINE_S = 5.0
-# Leave a second for the walk's tail and for returning facts. The cap is how
-# long a fast page may spend on accessible names.
+# Leave a second for read-back and the overlay. The cap is how long a fast
+# page may spend on accessible names.
 _OVERLAY_MARGIN_S = 1.0
 _OVERLAY_BUDGET_CAP_S = 2.5
 _READ_PAYLOAD = (
@@ -197,13 +197,17 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     facts. Headings keep the HTML name. The overlay budget is whatever remains
     of the deadline after the walk, minus one second, and at most 2.5s. When
     it runs out, the remaining controls keep the HTML name and ``name_source``
-    is ``html``. A new document loader or a stale node raises instead of mixing
-    two documents. The URL and title are the ones read at the start of the
-    walk, so a later ``pushState`` cannot relabel those facts. When the walk
-    runs out of time it returns the elements collected so far with
-    ``truncated`` set. A walk that is given no time, on a page that has
-    controls, raises instead of returning no elements. Collection also raises
-    when the browser driver cannot be found, so the deadline is never skipped.
+    is ``html``. The walk itself keeps that same second in reserve for the
+    read-back and the overlay. Coverage hit-tests in-viewport centers only,
+    stops when its time is gone, and does not write the page. A center it does
+    not reach stays uncovered. A new document loader or a stale node raises
+    instead of mixing two documents. The URL and title are the ones read at
+    the start of the walk, so a later ``pushState`` cannot relabel those
+    facts. When the deadline cuts the walk it returns the elements collected
+    so far with ``truncated`` set. A walk that is given no time, on a page
+    that has controls, raises instead of returning no elements. Collection
+    also raises when the browser driver cannot be found, so the deadline is
+    never skipped.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -315,13 +319,19 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
         payload = json.loads(raw_payload) if isinstance(raw_payload, str) else None
         if isinstance(payload, dict) and payload.get("deadline") is True:
             raise FactCollectionError("fact collection exceeded the deadline")
-        object_ids = _node_object_ids(session, root_id)
-        overlay = _accessibility_overlay(
-            session,
-            object_ids,
-            _overlay_budget(deadline_s, time.perf_counter() - started),
-            _overlay_order(payload, len(object_ids)),
-        )
+        # Read-back and the overlay share the reserved second. Past that, keep
+        # the HTML names rather than starting work the deadline cannot finish.
+        if time.perf_counter() - started >= deadline_s - _OVERLAY_MARGIN_S:
+            object_ids = []
+            overlay = {}
+        else:
+            object_ids = _node_object_ids(session, root_id)
+            overlay = _accessibility_overlay(
+                session,
+                object_ids,
+                _overlay_budget(deadline_s, time.perf_counter() - started),
+                _overlay_order(payload, len(object_ids)),
+            )
         # A closed page here is a lost document, not a deadline failure. The
         # URL and title already captured in the walk are the ones returned.
         _page_title(page)
@@ -467,9 +477,11 @@ def _accessibility_overlay(
         return {}
     session.send("Accessibility.enable")
     started = time.perf_counter()
+    # The title read and the loader check still run after this loop.
+    limit = max(0.0, budget_s - 0.1)
     resolved: dict[str, _AxHit] = {}
     for index in order:
-        if time.perf_counter() - started >= budget_s:
+        if time.perf_counter() - started >= limit:
             break
         if index < 0 or index >= len(object_ids):
             continue
@@ -542,14 +554,18 @@ def _require_frame_stamp(session: CDPSession) -> tuple[str, str]:
 def _collect_source(deadline_s: float, started: float) -> str:
     """The collector, with the walk's remaining time bound in milliseconds.
 
-    The walk gets the whole remaining deadline, which is the time it had
-    before a reserved overlay second could shrink that budget to zero.
+    One second stays reserved for read-back and the overlay. The walk budget
+    is what remains after that. A budget of zero, on a page with controls,
+    raises instead of returning an empty document.
     """
     remaining_ms = int((deadline_s - (time.perf_counter() - started)) * 1000)
-    budget_ms = max(0, remaining_ms)
+    reserve_ms = int(_OVERLAY_MARGIN_S * 1000)
+    budget_ms = max(0, remaining_ms - reserve_ms)
     # var, not const: the isolated world persists, and a second collect
-    # redeclares this binding.
-    return f"var WALK_BUDGET_MS = {budget_ms};\n{_COLLECT_SOURCE}"
+    # redeclares these bindings.
+    return (
+        f"var WALK_BUDGET_MS = {budget_ms};\nvar WALK_RESERVE_MS = {reserve_ms};\n{_COLLECT_SOURCE}"
+    )
 
 
 def _walked_document(payload: dict[str, Any]) -> tuple[str, str, bool]:

@@ -294,6 +294,7 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
         ("flex", "flex", 3, 0, 3, "CCC"),
         ("over", "overflow", 1, 0, 1, "C"),
         ("before", "before", 3, 1, 3, ".CC"),
+        ("center", "center", 14, 0, 14, "." * 14),
     )
     parts = [
         "<!doctype html><title>cover</title><style>",
@@ -302,6 +303,9 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
         ".mask{position:fixed;height:20px}",
         "#before0{position:relative;z-index:1}",
         "#before0::before{content:'';position:absolute;left:100%;top:0;width:120px;height:20px}",
+        "@keyframes icspin { from { opacity: 1 } to { opacity: .2 } }",
+        "#mover{position:absolute;left:1200px;top:760px;width:10px;height:10px;",
+        "animation:icspin 8s linear infinite}",
         "</style>",
     ]
 
@@ -371,15 +375,190 @@ def test_facts_line_coverage_follows_the_mask(facts_page: Page) -> None:
             )
         elif kind == "before":
             parts.append(f'<div class="row" style="top:{top}px">{links}</div>')
+        elif kind == "center":
+            parts.append(
+                f'<div class="row" style="top:{top}px;width:1280px;display:flex;'
+                f'justify-content:center">{links}</div>'
+            )
         else:
             raise AssertionError(kind)
+    parts.append('<div id="mover"></div>')
+    parts.append(
+        "<script>window.__icStarts=0;"
+        "document.getElementById('mover').addEventListener('animationstart',"
+        "() => { window.__icStarts += 1; });</script>"
+    )
     facts_page.set_content("".join(parts), wait_until="domcontentloaded")
+    facts_page.wait_for_function(
+        """() => {
+          const anim = document.getElementById('mover').getAnimations()[0];
+          const time = anim && anim.currentTime;
+          const ms = typeof time === 'number' ? time : time && time.value;
+          return window.__icStarts === 1 && ms > 0;
+        }"""
+    )
+    started_ms, starts = _animation_clock(facts_page)
+    before = _watch_dom(facts_page)
     facts = collect_facts(facts_page)
+    _assert_dom_unchanged(facts_page, before)
+    later_ms, later_starts = _animation_clock(facts_page)
+    assert later_starts == starts == 1
+    assert later_ms >= started_ms
     for prefix, _kind, count, _start, _end, expected in cases:
         flags = [
             "C" if _by_id(facts, f"{prefix}{index}").covered else "." for index in range(count)
         ]
         assert "".join(flags) == expected, prefix
+    _assert_solo_covers(facts_page)
+
+
+def _animation_clock(page: Page) -> tuple[float, int]:
+    ms, starts = page.evaluate(
+        """() => {
+          const anim = document.getElementById('mover').getAnimations()[0];
+          const time = anim.currentTime;
+          const ms = typeof time === 'number' ? time : time.value;
+          return [ms, window.__icStarts];
+        }"""
+    )
+    return float(ms), int(starts)
+
+
+def _watch_dom(page: Page) -> list[str | None]:
+    return page.evaluate(
+        """() => {
+          window.__icMutations = 0;
+          const observer = new MutationObserver((records) => {
+            window.__icMutations += records.length;
+          });
+          observer.observe(document.documentElement, {
+            subtree: true,
+            attributes: true,
+            childList: true,
+            characterData: true,
+          });
+          window.__icStopObs = () => observer.disconnect();
+          return [...document.querySelectorAll('*')].map((el) => el.getAttribute('style'));
+        }"""
+    )
+
+
+def _assert_dom_unchanged(page: Page, before: list[str | None]) -> None:
+    after, mutations = page.evaluate(
+        """() => new Promise((resolve) => {
+          setTimeout(() => {
+            if (window.__icStopObs) window.__icStopObs();
+            resolve([
+              [...document.querySelectorAll('*')].map((el) => el.getAttribute('style')),
+              window.__icMutations,
+            ]);
+          }, 0);
+        })"""
+    )
+    assert after == before
+    assert mutations == 0
+
+
+def _hit_covers(page: Page, selector: str) -> list[bool]:
+    return page.evaluate(
+        """(selector) => [...document.querySelectorAll(selector)].map((el) => {
+          const rect = el.getBoundingClientRect();
+          const cx = rect.left + rect.width / 2;
+          const cy = rect.top + rect.height / 2;
+          const outside = rect.width <= 0 || rect.height <= 0 || cx < 0 || cy < 0
+            || cx >= innerWidth || cy >= innerHeight;
+          if (outside) return false;
+          const hit = document.elementFromPoint(cx, cy);
+          if (!hit) return true;
+          return hit !== el && !el.contains(hit);
+        })""",
+        selector,
+    )
+
+
+def _collect_watched(page: Page, html: str) -> PageFacts:
+    page.set_content(html, wait_until="domcontentloaded")
+    before = _watch_dom(page)
+    facts = collect_facts(page)
+    _assert_dom_unchanged(page, before)
+    return facts
+
+
+def _assert_solo_covers(page: Page) -> None:
+    footer = _collect_watched(
+        page,
+        "<!doctype html><title>footer</title><style>body{margin:0}</style>"
+        "<button id='foot0' style='width:80px;height:24px'>Go</button>"
+        "<footer style='position:absolute;top:3000px;height:40px'>"
+        "<div style='position:fixed;top:0;left:0;width:80px;height:24px'></div>"
+        "</footer>",
+    )
+    assert _by_id(footer, "foot0").covered is True
+    fixed = _collect_watched(
+        page,
+        "<!doctype html><title>fixed</title><style>body{margin:0}</style>"
+        "<button id='under0' style='width:80px;height:24px'>Go</button>"
+        "<a id='off0' href='/off' style='position:absolute;top:3000px'>"
+        "<span style='position:fixed;top:0;left:0;width:80px;height:24px;display:block'>"
+        "</span></a>",
+    )
+    assert _by_id(fixed, "under0").covered is True
+    assert _by_id(fixed, "off0").covered is False
+    links = "".join(
+        f"<a id='flex{index}' href='/{index}' style='display:block;height:20px;width:80px'>x</a>"
+        for index in range(60)
+    )
+    page.set_content(
+        "<!doctype html><title>flexend</title><style>body{margin:0}</style>"
+        "<div id='col' style='display:flex;flex-direction:column;justify-content:flex-end;"
+        "height:1200px;width:200px'>"
+        f"{links}</div>"
+        "<div id='bar' style='position:fixed;top:0;left:0;width:300px;height:300px'></div>",
+        wait_until="domcontentloaded",
+    )
+    expected = _hit_covers(page, "#col a")
+    flex = _collect_watched(
+        page,
+        "<!doctype html><title>flexend</title><style>body{margin:0}</style>"
+        "<div id='col' style='display:flex;flex-direction:column;justify-content:flex-end;"
+        "height:1200px;width:200px'>"
+        f"{links}</div>"
+        "<div id='bar' style='position:fixed;top:0;left:0;width:300px;height:300px'></div>",
+    )
+    # set_content above was only for the probe. Collect the same document again.
+    found = [_by_id(flex, f"flex{index}").covered for index in range(60)]
+    assert found == expected
+    assert any(found)
+    assert not all(found)
+    page.set_content(
+        "<!doctype html><title>important</title><style>a{display:none !important}"
+        "body{margin:0}</style>"
+        "<a id='imp0' href='/x' style='display:block !important;position:absolute;"
+        "top:3000px;height:24px;width:40px'>x</a>",
+        wait_until="domcontentloaded",
+    )
+    measured = page.evaluate(
+        """() => {
+          const style = getComputedStyle(document.getElementById('imp0'));
+          return {display: style.display, height: style.height};
+        }"""
+    )
+    important = _collect_watched(
+        page,
+        "<!doctype html><title>important</title><style>a{display:none !important}"
+        "body{margin:0}</style>"
+        "<a id='imp0' href='/x' style='display:block !important;position:absolute;"
+        "top:3000px;height:24px;width:40px'>x</a>",
+    )
+    again = page.evaluate(
+        """() => {
+          const style = getComputedStyle(document.getElementById('imp0'));
+          return {display: style.display, height: style.height};
+        }"""
+    )
+    assert measured == {"display": "block", "height": "24px"}
+    assert again == measured
+    assert _by_id(important, "imp0").covered is False
 
 
 def test_facts_choice_group(facts_page: Page, fixture_base_url: str) -> None:
@@ -1183,6 +1362,10 @@ def test_facts_html_fallback_names_skip_legend_and_hidden_text(
         ("<label for='c'>Save</label><button id='c'>Delete</button>", "Save"),
         ("<a id='c' href='/x' title='Home'>Delete account</a>", "Delete account"),
         ("<div id='c' role='button' tabindex='0' title='Save'>Delete</div>", "Delete"),
+        ("<div id='c' role='switch' title='Save'>Delete</div>", "Delete"),
+        ("<div id='c' role='menuitemcheckbox' title='Save'>Delete</div>", "Delete"),
+        ("<div id='c' role='menuitemradio' title='Save'>Delete</div>", "Delete"),
+        ("<div id='c' role='gridcell' title='Save'>Delete</div>", "Delete"),
         (
             (
                 "<button id='c'>Go <span style='visibility:hidden'>NO "
@@ -1332,11 +1515,12 @@ def test_facts_title_failure_loses_the_document(
     assert "deadline" not in str(exc.value)
 
 
-def test_facts_one_second_deadline_returns_the_control(facts_page: Page) -> None:
+def test_facts_one_second_deadline_raises_when_the_reserve_takes_the_budget(
+    facts_page: Page,
+) -> None:
     facts_page.set_content("<!doctype html><title>t</title><button id='c'>Go</button>")
-    facts = collect_facts(facts_page, deadline_s=1.0)
-    assert facts.truncated is False
-    assert _by_id(facts, "c").name == "Go"
+    with pytest.raises(FactCollectionError, match="fact collection exceeded the deadline"):
+        collect_facts(facts_page, deadline_s=1.0)
 
 
 def test_facts_zero_walk_budget_raises_the_deadline(
@@ -1534,28 +1718,59 @@ finally:
     )
 
 
-def test_facts_huge_table_is_truncated_instead_of_killed() -> None:
+@pytest.mark.parametrize(
+    ("kind", "count", "deadline", "throttle"),
+    [
+        ("table", 12000, 2.0, 1),
+        ("table", 20000, 5.0, 4),
+        ("nested", 12000, 5.0, 1),
+        ("nested", 14000, 5.0, 1),
+        ("table", 30000, 5.0, 1),
+    ],
+)
+def test_facts_huge_table_is_truncated_instead_of_killed(
+    kind: str,
+    count: int,
+    deadline: float,
+    throttle: int,
+) -> None:
     script = """
 import sys
 from interface_compiler.browser.engine import Engine
 from interface_compiler.browser.facts import FactCollectionError, collect_facts
 
+kind = sys.argv[1]
+count = int(sys.argv[2])
+deadline = float(sys.argv[3])
+throttle = int(sys.argv[4])
 engine = Engine()
 engine.start()
 page = engine.new_page()
 try:
-    parts = ["<!doctype html><title>wide</title><table><tbody>"]
-    for index in range(12000):
-        parts.append(
-            "<tr><td><label for='f%d'>Field %d</label>"
-            "<input id='f%d' name='f%d'></td>"
-            "<td><a id='r%d' href='/r%d'>Row %d</a></td></tr>"
-            % (index, index, index, index, index, index, index)
-        )
-    parts.append("</tbody></table>")
+    parts = ["<!doctype html><title>wide</title>"]
+    if kind == "nested":
+        opened = "<div>" * 30
+        closed = "</div>" * 30
+        for index in range(count):
+            parts.append("%s<a id='r%d' href='/r%d'>R</a>%s" % (opened, index, index, closed))
+    elif kind == "table":
+        parts.append("<table><tbody>")
+        for index in range(count):
+            parts.append(
+                "<tr><td><label for='f%d'>Field %d</label>"
+                "<input id='f%d' name='f%d'></td>"
+                "<td><a id='r%d' href='/r%d'>Row %d</a></td></tr>"
+                % (index, index, index, index, index, index, index)
+            )
+        parts.append("</tbody></table>")
+    else:
+        raise SystemExit(6)
     page.set_content("".join(parts), wait_until="domcontentloaded")
+    if throttle > 1:
+        session = page.context.new_cdp_session(page)
+        session.send("Emulation.setCPUThrottlingRate", {"rate": throttle})
     try:
-        facts = collect_facts(page, deadline_s=2)
+        facts = collect_facts(page, deadline_s=deadline)
     except FactCollectionError as exc:
         sys.stderr.write(str(exc))
         raise SystemExit(2)
@@ -1571,11 +1786,11 @@ finally:
     engine.close()
 """
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", script, kind, str(count), str(deadline), str(throttle)],
         check=False,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=180,
     )
     assert completed.returncode == 0, completed.stderr
     assert int(completed.stdout.strip()) > 0

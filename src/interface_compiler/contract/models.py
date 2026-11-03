@@ -688,7 +688,12 @@ def dump_view_doc(doc: ViewDoc) -> dict[str, Any]:
 
 
 def _checked_serialize(model: BaseModel, handler: Any) -> Any:
-    """Run the probe refusal for ``model_dump`` and ``model_dump_json``."""
+    """Run the probe refusal for ``model_dump`` and ``model_dump_json``.
+
+    A ``TypeAdapter`` dump stashes its refusal and does not clear it. Drop that
+    stash before ``handler`` so a later serialize cannot raise the stale error.
+    """
+    _pending_probe.set(None)
     dumped = handler(model)
     if isinstance(dumped, dict):
         try:
