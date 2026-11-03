@@ -3,6 +3,7 @@ name = "interface-compiler"
 version = "0.1.0"
 description = "Compile any website into an agent-usable interface with typed, checked actions."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "playwright>=1.64,<2",

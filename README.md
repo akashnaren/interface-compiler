@@ -337,4 +337,4 @@ uv run ruff check . && uv run ruff format --check .
 - The build plan is in [`PLAN.md`](PLAN.md); the binding field contract and mapping are in [`docs/PAPER-REQUIREMENTS.md`](docs/PAPER-REQUIREMENTS.md).
 - Tests run on local HTML fixtures, one per element kind. The live smoke uses real public pages only (never demo sites), and only safe actions.
 
-License: `TODO(owner): license`.
+This project is released under the [MIT License](LICENSE).
