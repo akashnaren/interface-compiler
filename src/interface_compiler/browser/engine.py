@@ -16,6 +16,8 @@ _SANDBOX_UNAVAILABLE = (
     "Chromium sandbox is unavailable. Enable unprivileged user namespaces "
     "(kernel.apparmor_restrict_unprivileged_userns=0) and start again."
 )
+_SANDBOX_ROOT = "Chromium sandbox is unavailable. Do not run the browser as root."
+_DRIVERS: dict[int, Engine] = {}
 
 
 def _pipe_closed(exc: BaseException) -> bool:
@@ -28,8 +30,30 @@ def _driver_already_stopped(exc: BaseException) -> bool:
     return _pipe_closed(exc) or "has been closed" in text or "target closed" in text
 
 
-def _sandbox_unavailable(exc: BaseException) -> bool:
-    return "sandbox" in str(exc).lower()
+def _sandbox_failure_message(exc: BaseException) -> str | None:
+    text = str(exc).lower()
+    # Root comes first: that failure text also contains the word "sandbox".
+    if "running as root" in text:
+        return _SANDBOX_ROOT
+    if "sandbox" in text:
+        return _SANDBOX_UNAVAILABLE
+    return None
+
+
+def _playwright_driver_pid(browser: Browser | None) -> int | None:
+    if browser is None:
+        return None
+    connection = getattr(getattr(browser, "_impl_obj", None), "_connection", None)
+    transport = getattr(connection, "_transport", None)
+    proc = getattr(transport, "_proc", None)
+    pid = getattr(proc, "pid", None)
+    return pid if isinstance(pid, int) else None
+
+
+def _note_driver_dead(pid: int) -> None:
+    engine = _DRIVERS.pop(pid, None)
+    if engine is not None:
+        engine._dead = True
 
 
 class Engine:
@@ -45,14 +69,24 @@ class Engine:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._user_agent: str | None = None
+        self._driver_pid: int | None = None
+        self._dead = False
+
+    @property
+    def dead(self) -> bool:
+        return self._dead
 
     @property
     def user_agent(self) -> str:
+        if self._dead:
+            raise RuntimeError("browser is dead")
         if self._user_agent is None:
             raise RuntimeError("browser is not started")
         return self._user_agent
 
     def start(self) -> None:
+        if self._dead:
+            raise RuntimeError("browser is dead")
         if self._browser is not None:
             raise RuntimeError("browser is already started")
         playwright = sync_playwright().start()
@@ -61,10 +95,14 @@ class Engine:
             browser = playwright.chromium.launch(headless=True, chromium_sandbox=True)
         except PlaywrightError as exc:
             self.close()
-            if _sandbox_unavailable(exc):
-                raise RuntimeError(_SANDBOX_UNAVAILABLE) from exc
+            message = _sandbox_failure_message(exc)
+            if message is not None:
+                raise RuntimeError(message) from exc
             raise
         self._browser = browser
+        self._driver_pid = _playwright_driver_pid(browser)
+        if self._driver_pid is not None:
+            _DRIVERS[self._driver_pid] = self
         session = browser.new_browser_cdp_session()
         try:
             version = session.send("Browser.getVersion")
@@ -77,6 +115,8 @@ class Engine:
         self._user_agent = f"{default_ua}{USER_AGENT_SUFFIX}"
 
     def new_page(self) -> Page:
+        if self._dead:
+            raise RuntimeError("browser is dead")
         if self._browser is None:
             raise RuntimeError("browser is not started")
         context = self._browser.new_context(
@@ -91,6 +131,9 @@ class Engine:
     def close(self) -> None:
         browser = self._browser
         playwright = self._playwright
+        if self._driver_pid is not None:
+            _DRIVERS.pop(self._driver_pid, None)
+            self._driver_pid = None
         self._browser = None
         self._playwright = None
         self._user_agent = None

@@ -10,7 +10,13 @@ import pytest
 from playwright.sync_api import Page
 
 from interface_compiler.browser.engine import USER_AGENT_SUFFIX, Engine
-from interface_compiler.browser.facts import Constraints, ElementFact, PageFacts, collect_facts
+from interface_compiler.browser.facts import (
+    Constraints,
+    ElementFact,
+    PageFacts,
+    _non_negative_int,
+    collect_facts,
+)
 from interface_compiler.browser.raw import raw_snapshot
 
 _HTML = Path(__file__).resolve().parents[1] / "fixtures" / "html"
@@ -712,6 +718,155 @@ def test_engine_launch_passes_chromium_sandbox(monkeypatch: pytest.MonkeyPatch) 
     engine.start()
     engine.close()
     assert launched.get("chromium_sandbox") is True
+
+
+@pytest.mark.parametrize(
+    ("html", "html_id", "role", "name"),
+    [
+        (
+            '<img alt="Search" data-ic-fact="0"><button id="go">Delete account</button>',
+            "go",
+            "button",
+            "Delete account",
+        ),
+    ],
+)
+def test_facts_preseeded_marker_cannot_relabel(
+    html: str, html_id: str, role: str, name: str, facts_page: Page
+) -> None:
+    facts_page.set_content(f"<!doctype html><title>marker</title>{html}")
+    facts = collect_facts(facts_page)
+    element = _by_id(facts, html_id)
+    assert element.role == role
+    assert element.name == name
+    assert all(item.name != "Search" for item in facts.elements)
+
+
+@pytest.mark.parametrize(
+    ("html", "html_id"),
+    [
+        ("<fieldset disabled><input id='field'></fieldset>", "field"),
+        ("<fieldset disabled><button id='go'>Go</button></fieldset>", "go"),
+        (
+            "<select id='s'><optgroup disabled><option id='sold' value='1'>One</option></optgroup></select>",
+            "sold",
+        ),
+    ],
+)
+def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: Page) -> None:
+    facts_page.set_content(f"<!doctype html><title>disabled</title>{html}")
+    facts = collect_facts(facts_page)
+    assert _by_id(facts, html_id).disabled is True
+    select = next((el for el in facts.elements if el.tag == "select"), None)
+    if select is not None:
+        assert select.options[0].disabled is True
+
+
+@pytest.mark.parametrize(
+    ("minlength", "maxlength", "expect_min", "expect_max"),
+    [
+        ("1.5", "2.5", None, None),
+        ("-1", "", None, None),
+        ("3", "8", 3, 8),
+        ("08", "0", 8, 0),
+    ],
+)
+def test_facts_length_attributes_are_non_negative_integers(
+    minlength: str,
+    maxlength: str,
+    expect_min: int | None,
+    expect_max: int | None,
+    facts_page: Page,
+) -> None:
+    facts_page.set_content(
+        "<!doctype html><title>length</title>"
+        f"<input id='q' minlength='{minlength}' maxlength='{maxlength}'>"
+    )
+    constraints = _by_id(collect_facts(facts_page), "q").constraints
+    assert constraints.minlength == expect_min
+    assert constraints.maxlength == expect_max
+    assert _non_negative_int({"minlength": 1.5}, "minlength") is None
+    assert _non_negative_int({"maxlength": True}, "maxlength") is None
+
+
+@pytest.mark.parametrize("rows", [3000])
+def test_facts_row_count_finishes_under_the_deadline(rows: int) -> None:
+    # Own browser: a deadline kill must not take down the session engine.
+    script = """
+import sys
+import time
+from interface_compiler.browser.engine import Engine
+from interface_compiler.browser.facts import FactCollectionError, collect_facts
+
+rows = int(sys.argv[1])
+engine = Engine()
+engine.start()
+page = engine.new_page()
+try:
+    parts = ["<!doctype html><title>rows</title><main>"]
+    for index in range(rows):
+        parts.append(
+            f'<label for="f{index}">Field {index}</label>'
+            f'<input id="f{index}" name="f{index}">'
+            f'<a id="r{index}" href="/r{index}">Row {index}</a>'
+        )
+    parts.append("</main>")
+    page.set_content("".join(parts), wait_until="domcontentloaded")
+    started = time.perf_counter()
+    facts = collect_facts(page)
+    elapsed = time.perf_counter() - started
+    inputs = sum(element.tag == "input" for element in facts.elements)
+    links = sum(element.tag == "a" for element in facts.elements)
+    field = next(element for element in facts.elements if element.html_id == "f0")
+    last = next(element for element in facts.elements if element.html_id == f"f{rows - 1}")
+    row = next(element for element in facts.elements if element.html_id == "r0")
+    if not (inputs == rows and links == rows and field.name == "Field 0" and row.name == "Row 0"):
+        raise SystemExit(2)
+    if last.disabled:
+        raise SystemExit(2)
+    print(f"{elapsed:.3f}")
+finally:
+    engine.close()
+
+engine = Engine()
+engine.start()
+page = engine.new_page()
+try:
+    page.set_content(
+        "<!doctype html><title>busy</title>"
+        "<script>setTimeout(function () { while (true) {} }, 0);</script>",
+        wait_until="domcontentloaded",
+        timeout=5000,
+    )
+    time.sleep(0.3)
+    try:
+        collect_facts(page, deadline_s=1)
+    except FactCollectionError:
+        pass
+    else:
+        raise SystemExit(3)
+    if not engine.dead:
+        raise SystemExit(4)
+    try:
+        engine.new_page()
+    except RuntimeError as exc:
+        if "dead" not in str(exc).lower():
+            raise SystemExit(5)
+    else:
+        raise SystemExit(5)
+finally:
+    engine.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(rows)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    elapsed = float(completed.stdout.strip())
+    assert elapsed < 5, f"{rows} rows took {elapsed:.2f}s"
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

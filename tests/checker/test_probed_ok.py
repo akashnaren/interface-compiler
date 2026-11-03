@@ -221,6 +221,32 @@ def test_checker_normalized_page_url_allows_a_loopback_probe(
         row.set_verified("probed_ok", page_url=spoof)
 
 
+@pytest.mark.parametrize("path", ["construct", "retag", "copy"])
+def test_checker_mutating_probed_ok_cannot_be_built(path: str) -> None:
+    if path == "construct":
+        with pytest.raises(ContractError) as exc:
+            AffordanceX(tag="mutating", verified="probed_ok")
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        return
+    if path == "retag":
+        row = AffordanceX(tag="safe")
+        row.verified = "probed_ok"
+        with pytest.raises(ContractError) as exc:
+            row.tag = "mutating"
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert row.tag == "safe"
+        assert row.verified == "probed_ok"
+        return
+    if path == "copy":
+        row = AffordanceX(tag="mutating", verified="unverified")
+        with pytest.raises(ContractError) as exc:
+            row.model_copy(update={"verified": "probed_ok"})
+        assert "mutating affordance cannot be probed_ok" in str(exc.value)
+        assert row.verified == "unverified"
+        return
+    raise AssertionError(path)
+
+
 def test_checker_setter_allows_loopback_and_safe() -> None:
     mutating = AffordanceX(tag="mutating")
     mutating.set_verified("probed_ok", page_url="http://127.0.0.1/fixture")

@@ -17,11 +17,11 @@ from typing import Any
 from playwright.sync_api import CDPSession, Page
 from playwright.sync_api import Error as PlaywrightError
 
+from interface_compiler.browser.engine import _note_driver_dead, _playwright_driver_pid
+
 _COLLECT_SOURCE = Path(__file__).with_name("collect.js").read_text(encoding="utf-8")
-_CLEAR_MARKERS = (
-    "(() => { document.querySelectorAll('[data-ic-fact]').forEach((el) => "
-    "el.removeAttribute('data-ic-fact')); })()"
-)
+_MARKER_PREFIX = "data-ic-"
+_MARKER_HEX = 32
 # Chromium reports these on text runs and on nodes it has dropped. They are not
 # the host control's role, so the HTML role from collect.js stands.
 _SKIP_AX_ROLES = frozenset({"none", "InlineTextBox", "StaticText", "ignored"})
@@ -162,32 +162,37 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     """
     if deadline_s <= 0:
         raise ValueError("deadline must be positive")
+    pid = _driver_pid(page)
     stop = threading.Event()
+    killed = threading.Event()
     watcher = threading.Thread(
         target=_abort_browser_after,
-        args=(_driver_pid(page), deadline_s, stop),
+        args=(pid, deadline_s, stop, killed),
         name="fact-deadline",
         daemon=True,
     )
     watcher.start()
     try:
         payload = _evaluate_isolated(page, _COLLECT_SOURCE)
+        attribute = _marker_attribute(payload)
         overlay: dict[str, _AxHit] = {}
         session: CDPSession | None = None
         try:
             session = page.context.new_cdp_session(page)
-            overlay = _accessibility_overlay(session)
+            overlay = _accessibility_overlay(session, attribute)
         finally:
             if session is not None:
                 try:
                     session.detach()
                 except PlaywrightError:
                     pass
-            _evaluate_isolated(page, _CLEAR_MARKERS)
+            _evaluate_isolated(page, _clear_markers(attribute))
     except FactCollectionError:
+        _note_if_killed(killed, pid)
         raise
     except Exception as exc:
         if _is_collection_abort(exc):
+            _note_if_killed(killed, pid)
             raise FactCollectionError("fact collection exceeded the deadline") from exc
         raise
     finally:
@@ -197,13 +202,26 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     return _page_facts(normalized_page_url(page), page.title(), payload, overlay)
 
 
-def _abort_browser_after(pid: int | None, deadline_s: float, stop: threading.Event) -> None:
+def _abort_browser_after(
+    pid: int | None,
+    deadline_s: float,
+    stop: threading.Event,
+    killed: threading.Event,
+) -> None:
     if pid is None or stop.wait(deadline_s):
         return
+    # Set the flag before the signal. The blocked call returns as soon as the
+    # driver dies, and the caller must already know this engine was killed.
+    killed.set()
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
-        return
+        killed.clear()
+
+
+def _note_if_killed(killed: threading.Event, pid: int | None) -> None:
+    if killed.is_set() and isinstance(pid, int):
+        _note_driver_dead(pid)
 
 
 def _driver_pid(page: Page) -> int | None:
@@ -213,14 +231,7 @@ def _driver_pid(page: Page) -> int | None:
     lookup stays on the calling thread. The deadline thread only signals
     this pid; it does not call Playwright.
     """
-    browser = page.context.browser
-    if browser is None:
-        return None
-    connection = getattr(getattr(browser, "_impl_obj", None), "_connection", None)
-    transport = getattr(connection, "_transport", None)
-    proc = getattr(transport, "_proc", None)
-    pid = getattr(proc, "pid", None)
-    return pid if isinstance(pid, int) else None
+    return _playwright_driver_pid(page.context.browser)
 
 
 def _evaluate_isolated(page: Page, expression: str) -> Any:
@@ -234,7 +245,6 @@ def _evaluate_isolated(page: Page, expression: str) -> Any:
             {
                 "frameId": frame_id,
                 "worldName": _ISOLATED_WORLD,
-                "grantUniveralAccess": True,
             },
         )
         context_id = world.get("executionContextId") if isinstance(world, dict) else None
@@ -315,42 +325,65 @@ def _is_collection_abort(exc: Exception) -> bool:
     )
 
 
-def _accessibility_overlay(session: CDPSession) -> dict[str, _AxHit]:
+def _marker_attribute(payload: object) -> str:
+    if not isinstance(payload, dict):
+        raise TypeError("fact collector must return an object")
+    attribute = payload.get("markerAttribute")
+    prefix = len(_MARKER_PREFIX)
+    hex_part = attribute[prefix:] if isinstance(attribute, str) else ""
+    if (
+        isinstance(attribute, str)
+        and attribute.startswith(_MARKER_PREFIX)
+        and len(hex_part) == _MARKER_HEX
+        and all(char in "0123456789abcdef" for char in hex_part)
+    ):
+        return attribute
+    raise TypeError("fact collector returned no marker attribute")
+
+
+def _clear_markers(attribute: str) -> str:
+    # attribute has already passed _marker_attribute, so it is safe to embed.
+    return (
+        "(() => {"
+        f" const name = '{attribute}';"
+        " document.querySelectorAll('[data-ic-fact]').forEach((el) =>"
+        " el.removeAttribute('data-ic-fact'));"
+        " document.querySelectorAll('[' + CSS.escape(name) + ']').forEach((el) =>"
+        " el.removeAttribute(name));"
+        "})()"
+    )
+
+
+def _accessibility_overlay(session: CDPSession, attribute: str) -> dict[str, _AxHit]:
     session.send("DOM.enable")
     session.send("Accessibility.enable")
     document = session.send("DOM.getDocument", {"depth": -1, "pierce": True})
     root = document.get("root") if isinstance(document, dict) else None
-    markers = _markers(root)
+    markers = _markers(root, attribute)
     tree = session.send("Accessibility.getFullAXTree")
     nodes = tree.get("nodes") if isinstance(tree, dict) else None
     if not isinstance(nodes, list):
         raise TypeError("accessibility tree has no nodes")
-    hits: dict[int, _AxHit] = {}
+    resolved: dict[str, _AxHit] = {}
     for node in nodes:
         if not isinstance(node, dict):
             continue
         backend_id = node.get("backendDOMNodeId")
-        if not isinstance(backend_id, int) or backend_id not in markers:
+        if not isinstance(backend_id, int):
+            continue
+        marker = markers.get(backend_id)
+        if marker is None or marker in resolved:
             continue
         role = _ax_role(node)
         if role is None or role in _SKIP_AX_ROLES:
             continue
-        hits.setdefault(backend_id, _AxHit(role=role, name=_ax_name(node)))
-    resolved: dict[str, _AxHit] = {}
-    for backend_id, marker in markers.items():
-        # The accessibility hit is applied only after describeNode and
-        # resolveNode both return this backend id. That is the join from the
-        # accessibility node to the element collect.js marked.
-        if not _backend_joined(session, backend_id):
-            continue
-        hit = hits.get(backend_id)
-        if hit is not None:
-            resolved[marker] = hit
+        resolved[marker] = _AxHit(role=role, name=_ax_name(node))
     return resolved
 
 
-def _markers(root: object) -> dict[int, str]:
+def _markers(root: object, attribute: str) -> dict[int, str]:
     found: dict[int, str] = {}
+    counts: dict[str, int] = {}
     stack: list[object] = [root]
     while stack:
         node = stack.pop()
@@ -361,9 +394,10 @@ def _markers(root: object) -> dict[int, str]:
         if isinstance(attributes, list) and isinstance(backend_id, int):
             pairs = [item for item in attributes if isinstance(item, str)]
             attr = dict(zip(pairs[0::2], pairs[1::2], strict=False))
-            marker = attr.get("data-ic-fact")
+            marker = attr.get(attribute)
             if isinstance(marker, str) and marker:
                 found[backend_id] = marker
+                counts[marker] = counts.get(marker, 0) + 1
         for key in ("children", "shadowRoots"):
             children = node.get(key)
             if isinstance(children, list):
@@ -371,21 +405,10 @@ def _markers(root: object) -> dict[int, str]:
         content = node.get("contentDocument")
         if isinstance(content, dict):
             stack.append(content)
-    return found
-
-
-def _backend_joined(session: CDPSession, backend_id: int) -> bool:
-    described = session.send("DOM.describeNode", {"backendNodeId": backend_id})
-    node = described.get("node") if isinstance(described, dict) else None
-    if not isinstance(node, dict) or not isinstance(node.get("nodeName"), str):
-        return False
-    resolved = session.send("DOM.resolveNode", {"backendNodeId": backend_id})
-    obj = resolved.get("object") if isinstance(resolved, dict) else None
-    object_id = obj.get("objectId") if isinstance(obj, dict) else None
-    if not isinstance(object_id, str) or not object_id:
-        return False
-    session.send("Runtime.releaseObject", {"objectId": object_id})
-    return True
+    ambiguous = {marker for marker, count in counts.items() if count != 1}
+    if not ambiguous:
+        return found
+    return {backend_id: marker for backend_id, marker in found.items() if marker not in ambiguous}
 
 
 def _ax_role(node: dict[str, Any]) -> str | None:
@@ -499,8 +522,8 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
             min=_opt(constraints, "min", str),
             max=_opt(constraints, "max", str),
             step=_opt(constraints, "step", str),
-            minlength=_opt(constraints, "minlength", int),
-            maxlength=_opt(constraints, "maxlength", int),
+            minlength=_non_negative_int(constraints, "minlength"),
+            maxlength=_non_negative_int(constraints, "maxlength"),
         ),
     )
 
@@ -543,6 +566,14 @@ def _req[T](item: dict[str, Any], key: str, kind: type[T]) -> T:
     if isinstance(value, kind) and not (kind is int and isinstance(value, bool)):
         return value
     raise TypeError(f"{key} has the wrong type")
+
+
+def _non_negative_int(item: dict[str, Any], key: str) -> int | None:
+    """A bad optional length is absent, not a collector failure."""
+    value = item.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _opt[T](item: dict[str, Any], key: str, kind: type[T]) -> T | None:

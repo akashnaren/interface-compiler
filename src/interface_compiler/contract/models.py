@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from typing import Any, Literal, Self
 
 from pydantic import (
@@ -37,6 +38,9 @@ _VERIFIED_STATES = (
     "probed_failed",
     "stopped_before_commit",
 )
+# Set only while a view document is being validated, so a loopback page may
+# still construct a mutating probed_ok affordance. Direct construction has none.
+_affordance_page_url: ContextVar[object] = ContextVar("affordance_page_url", default=None)
 
 
 def _is_scalar(value: object) -> bool:
@@ -195,19 +199,29 @@ class AffordanceX(BaseModel):
     ) = None
     verified_at: str | None = None
     # Direct assignment has no page URL, so probed_ok is refused unless the
-    # tag is safe. set_verified unlocks around its own page-URL check.
+    # tag is safe. set_verified passes its own page-URL check.
     _verified_locked: bool = PrivateAttr(default=False)
 
     @model_validator(mode="after")
     def _lock_verified(self) -> Self:
+        _refuse_unscoped_probe(self.tag, self.verified)
         self._verified_locked = True
         return self
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "verified" and getattr(self, "_verified_locked", False):
-            self._assign_verified(value)
+        if name in {"verified", "tag"} and getattr(self, "_verified_locked", False):
+            self._assign_guarded(name, value)
             return
         super().__setattr__(name, value)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        if update and ("tag" in update or "verified" in update):
+            tag = update.get("tag", self.tag)
+            verified = update.get("verified", self.verified)
+            _refuse_unscoped_probe(tag, verified)
+        copied = super().model_copy(update=update, deep=deep)
+        copied._verified_locked = True
+        return copied
 
     def set_verified(self, status: str, *, page_url: str | None) -> None:
         """Record a probe outcome for this affordance.
@@ -224,19 +238,30 @@ class AffordanceX(BaseModel):
         message = probed_ok_refusal(self.tag, status, page_url=page_url)
         if message is not None:
             raise ContractError(message, errors=[message])
-        self._assign_verified(status, checked=True)
+        self._assign_verified(status)
 
-    def _assign_verified(self, value: object, *, checked: bool = False) -> None:
-        if not checked:
-            if value is not None and value not in _VERIFIED_STATES:
-                message = f"verified {_echo_value(value)} is not a probe outcome"
-                raise ContractError(message, errors=[message])
-            refusal = probed_ok_refusal(self.tag, value, page_url=None)
-            if refusal is not None:
-                raise ContractError(refusal, errors=[refusal])
+    def _assign_guarded(self, name: str, value: object) -> None:
+        if name == "verified" and value is not None and value not in _VERIFIED_STATES:
+            message = f"verified {_echo_value(value)} is not a probe outcome"
+            raise ContractError(message, errors=[message])
+        tag = value if name == "tag" else self.tag
+        verified = value if name == "verified" else self.verified
+        _refuse_unscoped_probe(tag, verified)
+        self._assign_verified(value if name == "verified" else self.verified, tag=tag, name=name)
+
+    def _assign_verified(
+        self,
+        value: object,
+        *,
+        tag: object | None = None,
+        name: str = "verified",
+    ) -> None:
         self._verified_locked = False
         try:
-            super().__setattr__("verified", value)
+            if name == "tag":
+                super().__setattr__("tag", tag)
+            else:
+                super().__setattr__("verified", value)
         finally:
             self._verified_locked = True
 
@@ -334,6 +359,15 @@ class ViewDoc(BaseModel):
     entities: dict[str, Any]
     affordances: list[Affordance]
     x: DocX | None = None
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _scope_page_url(cls, value: Any, handler: Any) -> Self:
+        token = _affordance_page_url.set(_raw_page_url(value))
+        try:
+            return handler(value)
+        finally:
+            _affordance_page_url.reset(token)
 
     @model_validator(mode="before")
     @classmethod
@@ -528,6 +562,21 @@ def dump_act_result(result: ActResult, *, echo_errors: bool = True) -> dict[str,
     if not echo_errors:
         dumped.pop("error", None)
     return dumped
+
+
+def _raw_page_url(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return None
+    extra = value.get("x")
+    if not isinstance(extra, Mapping):
+        return None
+    return extra.get("url")
+
+
+def _refuse_unscoped_probe(tag: object, verified: object) -> None:
+    message = probed_ok_refusal(tag, verified, page_url=_affordance_page_url.get())
+    if message is not None:
+        raise ContractError(message, errors=[message])
 
 
 def _reject_explicit_null(value: object, key: str) -> None:

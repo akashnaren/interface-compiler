@@ -75,16 +75,16 @@
     return clean(el.getAttribute("title"));
   }
 
+  // Filled once per collection. labelFor and cssOf must not rescan the document.
+  let labelsByFor = new Map();
+  let idCounts = new Map();
+  let nameCounts = new Map();
+
   function labelFor(el) {
     if (!el.id) {
       return null;
     }
-    for (const label of document.querySelectorAll("label[for]")) {
-      if (label.getAttribute("for") === el.id) {
-        return label;
-      }
-    }
-    return null;
+    return labelsByFor.get(el.id) || null;
   }
 
   function labelText(el) {
@@ -288,17 +288,14 @@
   }
 
   function cssOf(el) {
-    if (el.id) {
-      const byId = `#${CSS.escape(el.id)}`;
-      if (document.querySelectorAll(byId).length === 1) {
-        return byId;
-      }
+    if (el.id && idCounts.get(el.id) === 1) {
+      return `#${CSS.escape(el.id)}`;
     }
     const name = el.getAttribute("name");
     if (name && /^[A-Za-z0-9_-]+$/.test(name)) {
-      const byName = `${el.tagName.toLowerCase()}[name="${name}"]`;
-      if (document.querySelectorAll(byName).length === 1) {
-        return byName;
+      const key = `${el.tagName.toLowerCase()}\n${name}`;
+      if (nameCounts.get(key) === 1) {
+        return `${el.tagName.toLowerCase()}[name="${name}"]`;
       }
     }
     const parts = [];
@@ -364,7 +361,7 @@
       return Array.from(el.options, (opt) => ({
         value: opt.value,
         label: clean(opt.label),
-        disabled: opt.disabled === true,
+        disabled: opt.matches(":disabled"),
       }));
     }
     let box = el.getAttribute("role") === "listbox" ? el : null;
@@ -382,7 +379,7 @@
     return Array.from(box.querySelectorAll("[role='option']"), (opt) => ({
       value: opt.getAttribute("data-value") || ownText(opt),
       label: ownText(opt),
-      disabled: opt.getAttribute("aria-disabled") === "true" || opt.hasAttribute("disabled"),
+      disabled: opt.matches(":disabled"),
     }));
   }
 
@@ -430,17 +427,23 @@
     );
   }
 
+  // HTML non-negative integer: ASCII digits only. "1.5" and "-1" are absent.
+  function nonNegativeInteger(value) {
+    if (value === null || !/^\d+$/.test(value)) {
+      return null;
+    }
+    return Number(value);
+  }
+
   function constraintsOf(el) {
-    const minlength = el.getAttribute("minlength");
-    const maxlength = el.getAttribute("maxlength");
     return {
       required: el.required === true,
       pattern: el.getAttribute("pattern"),
       min: el.getAttribute("min"),
       max: el.getAttribute("max"),
       step: el.getAttribute("step"),
-      minlength: minlength === null ? null : Number(minlength),
-      maxlength: maxlength === null ? null : Number(maxlength),
+      minlength: nonNegativeInteger(el.getAttribute("minlength")),
+      maxlength: nonNegativeInteger(el.getAttribute("maxlength")),
     };
   }
 
@@ -473,86 +476,139 @@
     return null;
   }
 
-  const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el, index) => {
-    const rect = el.getBoundingClientRect();
-    const visible = isVisible(el, rect);
-    el.setAttribute("data-ic-fact", String(index));
-    return {
-      marker: String(index),
-      tag: el.tagName.toLowerCase(),
-      role: elementRole(el),
-      name: fallbackName(el),
-      html_id: el.id || null,
-      field_name: el.getAttribute("name"),
-      input_type: el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
-      href: el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
-      form_index: formIndex(el),
-      disabled: el.disabled === true,
-      readonly: el.readOnly === true,
-      aria_disabled: Boolean(el.closest("[aria-disabled='true']")),
-      inert: el.inert === true || Boolean(el.closest("[inert]")),
-      hidden: Boolean(el.closest("[hidden]")),
-      aria_hidden: Boolean(el.closest("[aria-hidden='true']")),
-      value: controlValue(el),
-      checked: checkedState(el),
-      selected: el.tagName === "OPTION" ? el.selected === true : null,
-      options: optionsOf(el),
-      aria_expanded: expanded(el),
-      aria_selected: el.getAttribute("aria-selected"),
-      aria_checked: el.getAttribute("aria-checked"),
-      aria_pressed: el.getAttribute("aria-pressed"),
-      aria_current: el.getAttribute("aria-current"),
-      aria_valuemin: el.getAttribute("aria-valuemin"),
-      aria_valuemax: el.getAttribute("aria-valuemax"),
-      aria_valuenow: el.getAttribute("aria-valuenow"),
-      aria_haspopup: el.getAttribute("aria-haspopup"),
-      aria_controls: el.getAttribute("aria-controls"),
-      box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-      visible,
-      covered: isCovered(el, rect, visible),
-      in_viewport: inViewport(rect),
-      validation_message: el.willValidate ? el.validationMessage : "",
-      landmark: landmarkOf(el),
-      css: cssOf(el),
-      skeleton_path: skeletonOf(el),
-      label_text: labelText(el),
-      group_key: groupKey(el),
-      constraints: constraintsOf(el),
-    };
-  });
-
-  const forms = Array.from(document.forms).map((form, index) => ({
-    index,
-    method: (form.getAttribute("method") || "get").toLowerCase(),
-    action: form.action,
-    valid: form.checkValidity(),
-    html_id: form.id || null,
-  }));
-
-  const modals = [];
-  const seen = new Set();
-  function pushModal(el, role) {
-    if (seen.has(el) || !isVisible(el, el.getBoundingClientRect())) {
-      return;
+  function markerName() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    let hex = "";
+    for (const byte of bytes) {
+      hex += byte.toString(16).padStart(2, "0");
     }
-    seen.add(el);
-    modals.push({
-      html_id: el.id || null,
-      role,
-      name: accName(el),
-      open: true,
+    return `data-ic-${hex}`;
+  }
+
+  function stripMarkers(attribute) {
+    for (const el of document.querySelectorAll("[data-ic-fact]")) {
+      el.removeAttribute("data-ic-fact");
+    }
+    for (const el of document.querySelectorAll(`[${CSS.escape(attribute)}]`)) {
+      el.removeAttribute(attribute);
+    }
+  }
+
+  function indexDocument() {
+    idCounts = new Map();
+    nameCounts = new Map();
+    labelsByFor = new Map();
+    for (const node of document.querySelectorAll("[id]")) {
+      if (!node.id) {
+        continue;
+      }
+      idCounts.set(node.id, (idCounts.get(node.id) || 0) + 1);
+    }
+    for (const node of document.querySelectorAll("[name]")) {
+      const name = node.getAttribute("name");
+      if (!name || !/^[A-Za-z0-9_-]+$/.test(name)) {
+        continue;
+      }
+      const key = `${node.tagName.toLowerCase()}\n${name}`;
+      nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+    }
+    for (const label of document.querySelectorAll("label[for]")) {
+      const id = label.getAttribute("for");
+      if (id && !labelsByFor.has(id)) {
+        labelsByFor.set(id, label);
+      }
+    }
+  }
+
+  indexDocument();
+  const markerAttribute = markerName();
+  stripMarkers(markerAttribute);
+  try {
+    const elements = Array.from(document.querySelectorAll(SELECTOR)).map((el, index) => {
+      const rect = el.getBoundingClientRect();
+      const visible = isVisible(el, rect);
+      el.setAttribute(markerAttribute, String(index));
+      return {
+        marker: String(index),
+        tag: el.tagName.toLowerCase(),
+        role: elementRole(el),
+        name: fallbackName(el),
+        html_id: el.id || null,
+        field_name: el.getAttribute("name"),
+        input_type: el.tagName === "INPUT" ? (el.getAttribute("type") || "text").toLowerCase() : null,
+        href: el.tagName === "A" && el.hasAttribute("href") ? el.href : null,
+        form_index: formIndex(el),
+        disabled: el.matches(":disabled"),
+        readonly: el.readOnly === true,
+        aria_disabled: Boolean(el.closest("[aria-disabled='true']")),
+        inert: el.inert === true || Boolean(el.closest("[inert]")),
+        hidden: Boolean(el.closest("[hidden]")),
+        aria_hidden: Boolean(el.closest("[aria-hidden='true']")),
+        value: controlValue(el),
+        checked: checkedState(el),
+        selected: el.tagName === "OPTION" ? el.selected === true : null,
+        options: optionsOf(el),
+        aria_expanded: expanded(el),
+        aria_selected: el.getAttribute("aria-selected"),
+        aria_checked: el.getAttribute("aria-checked"),
+        aria_pressed: el.getAttribute("aria-pressed"),
+        aria_current: el.getAttribute("aria-current"),
+        aria_valuemin: el.getAttribute("aria-valuemin"),
+        aria_valuemax: el.getAttribute("aria-valuemax"),
+        aria_valuenow: el.getAttribute("aria-valuenow"),
+        aria_haspopup: el.getAttribute("aria-haspopup"),
+        aria_controls: el.getAttribute("aria-controls"),
+        box: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        visible,
+        covered: isCovered(el, rect, visible),
+        in_viewport: inViewport(rect),
+        validation_message: el.willValidate ? el.validationMessage : "",
+        landmark: landmarkOf(el),
+        css: cssOf(el),
+        skeleton_path: skeletonOf(el),
+        label_text: labelText(el),
+        group_key: groupKey(el),
+        constraints: constraintsOf(el),
+      };
     });
-  }
-  for (const dialog of document.querySelectorAll("dialog[open]")) {
-    if (dialog.matches(":modal")) {
-      pushModal(dialog, "dialog");
-    }
-  }
-  for (const dialog of document.querySelectorAll(
-    "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
-  )) {
-    pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
-  }
 
-  return { elements, forms, modals };
+    const forms = Array.from(document.forms).map((form, index) => ({
+      index,
+      method: (form.getAttribute("method") || "get").toLowerCase(),
+      action: form.action,
+      valid: form.checkValidity(),
+      html_id: form.id || null,
+    }));
+
+    const modals = [];
+    const seen = new Set();
+    function pushModal(el, role) {
+      if (seen.has(el) || !isVisible(el, el.getBoundingClientRect())) {
+        return;
+      }
+      seen.add(el);
+      modals.push({
+        html_id: el.id || null,
+        role,
+        name: accName(el),
+        open: true,
+      });
+    }
+    for (const dialog of document.querySelectorAll("dialog[open]")) {
+      if (dialog.matches(":modal")) {
+        pushModal(dialog, "dialog");
+      }
+    }
+    for (const dialog of document.querySelectorAll(
+      "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
+    )) {
+      pushModal(dialog, clean(dialog.getAttribute("role")).split(" ")[0] || "dialog");
+    }
+
+    return { markerAttribute, elements, forms, modals };
+  } catch (error) {
+    stripMarkers(markerAttribute);
+    throw error;
+  }
 })()

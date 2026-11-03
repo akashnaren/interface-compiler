@@ -171,6 +171,9 @@ def raw_command(
     except PlaywrightError as exc:
         typer.echo(_short_playwright_error(exc), err=True)
         raise typer.Exit(1) from exc
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     finally:
         try:
             if page is not None:
