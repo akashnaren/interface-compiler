@@ -1179,6 +1179,54 @@ def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: P
             assert host.options[0].disabled is True
 
 
+def _ax_disabled_property(tree: object) -> bool | None:
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("ignored") is True:
+            continue
+        properties = node.get("properties")
+        if not isinstance(properties, list):
+            return None
+        for prop in properties:
+            if not isinstance(prop, dict) or prop.get("name") != "disabled":
+                continue
+            value = prop.get("value")
+            if isinstance(value, dict) and isinstance(value.get("value"), bool):
+                return value["value"]
+            return None
+        return None
+    return None
+
+
+def _ax_disabled_by_id(page: Page, html_ids: list[str]) -> dict[str, bool | None]:
+    session = page.context.new_cdp_session(page)
+    try:
+        session.send("Accessibility.enable")
+        session.send("DOM.enable")
+        document = session.send("DOM.getDocument", {"depth": 0})
+        root = document["root"]["nodeId"]
+        found: dict[str, bool | None] = {}
+        for html_id in html_ids:
+            queried = session.send(
+                "DOM.querySelector",
+                {"nodeId": root, "selector": f"#{html_id}"},
+            )
+            described = session.send("DOM.describeNode", {"nodeId": queried["nodeId"]})
+            tree = session.send(
+                "Accessibility.getPartialAXTree",
+                {
+                    "backendNodeId": described["node"]["backendNodeId"],
+                    "fetchRelatives": False,
+                },
+            )
+            found[html_id] = _ax_disabled_property(tree)
+        return found
+    finally:
+        session.detach()
+
+
 def _text_at(page: Page, css: str) -> str:
     text = page.evaluate(
         "(css) => { const node = document.querySelector(css); return node ? node.textContent : ''; }",
@@ -1280,7 +1328,25 @@ def _require_selector(page: Page, facts: PageFacts, label: str, *, required: boo
             },
             {},
         ),
-        ("aria", {}, {"own": False, "bare": False, "yes": True}),
+        (
+            "aria",
+            {},
+            {
+                "bare": True,
+                "alink": True,
+                "rolebtn": True,
+                "box": True,
+                "empty": True,
+                "inner": True,
+                "grand": False,
+                "own": False,
+                "grpbtn": True,
+                "tool": True,
+                "item": True,
+                "yes": True,
+                "plainbox": True,
+            },
+        ),
         ("dup-id", {}, {}),
         ("dup-name", {}, {}),
         ("no-rows", {}, {}),
@@ -1307,8 +1373,28 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
     elif case == "aria":
         html = (
             "<div aria-disabled='true'>"
-            "<button id='own' type='button' aria-disabled='false'>No</button>"
             "<button id='bare' type='button'>Bare</button>"
+            "<div id='rolebtn' role='button' tabindex='0'>Role</div>"
+            "<div id='box' role='checkbox' tabindex='0'>Box</div>"
+            "<div id='plainbox' role='checkbox'>Plain</div>"
+            "<button id='empty' type='button' aria-disabled=''>Empty</button>"
+            "<button id='own' type='button' aria-disabled='false'>Own</button>"
+            "<div aria-disabled='false'>"
+            "<button id='grand' type='button'>Grand</button>"
+            "</div>"
+            "</div>"
+            "<div role='group' aria-disabled='true'>"
+            "<button id='grpbtn' type='button'>Group</button>"
+            "<a id='alink' href='/x'>Link</a>"
+            "</div>"
+            "<div role='toolbar' aria-disabled='true'>"
+            "<button id='tool' type='button'>Bold</button>"
+            "</div>"
+            "<div role='menu' aria-disabled='true'>"
+            "<div id='item' role='menuitem' tabindex='0'>Open</div>"
+            "</div>"
+            "<div aria-disabled='false'>"
+            "<button id='inner' type='button' aria-disabled='true'>Inner</button>"
             "</div>"
             "<button id='yes' type='button' aria-disabled='true'>Yes</button>"
         )
@@ -1350,6 +1436,12 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
             assert _by_id(facts, html_id).aria_disabled == expect
         if case == "legend":
             assert _by_id(facts, "legsel").options[0].disabled is False
+        elif case == "aria":
+            # plainbox is not focusable, so the AX tree has no disabled property.
+            checked = [html_id for html_id in aria_disabled if html_id != "plainbox"]
+            ax_disabled = _ax_disabled_by_id(facts_page, checked)
+            for html_id in checked:
+                assert (ax_disabled[html_id] is True) == aria_disabled[html_id]
         elif case == "dup-id":
             _require_selector(facts_page, facts, "Keep my data", required=True)
             _require_selector(facts_page, facts, "Delete everything", required=False)

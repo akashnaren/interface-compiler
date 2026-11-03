@@ -786,9 +786,11 @@
     const hidden = closest(el, "[hidden]") !== null;
     const ariaHidden = closest(el, "[aria-hidden='true']") !== null;
     const inert = closest(el, "[inert]") !== null;
-    // aria-disabled does not inherit. The element's own value matches the AX tree,
-    // including aria-disabled="false" under an aria-disabled ancestor.
-    const ariaDisabled = getAttribute(el, "aria-disabled") === "true";
+    // The nearest non-empty aria-disabled decides. An empty value does not
+    // stop the walk, so a true ancestor still disables the control. A nearer
+    // false stays enabled, and an inner true stays disabled.
+    const owner = closest(el, "[aria-disabled]:not([aria-disabled=''])");
+    const ariaDisabled = owner !== null && getAttribute(owner, "aria-disabled") === "true";
     let displayHidden = hidden;
     let visibilityIsHidden = false;
     if (typeof readCheckVisibility === "function") {
