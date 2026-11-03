@@ -6,9 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page
 
-from interface_compiler.browser.engine import USER_AGENT_SUFFIX
+from interface_compiler.browser.engine import USER_AGENT_SUFFIX, Engine
 from interface_compiler.browser.facts import Constraints, ElementFact, PageFacts, collect_facts
 from interface_compiler.browser.raw import raw_snapshot
 
@@ -673,6 +674,44 @@ def test_facts_isolated_world_ignores_page_overrides(
     assert any(el.html_id == "cart" for el in facts.elements)
     left = facts_page.evaluate("() => document.querySelector('[data-ic-fact]')")
     assert left is None
+
+
+def test_engine_launch_passes_chromium_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    launched: dict[str, object] = {}
+
+    class _Browser:
+        def new_browser_cdp_session(self) -> _Browser:
+            return self
+
+        def send(self, _method: str) -> dict[str, str]:
+            return {"userAgent": "Mozilla/5.0 Chrome/1.0"}
+
+        def detach(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class _Playwright:
+        def __init__(self) -> None:
+            self.chromium = self
+
+        def launch(self, **kwargs: object) -> _Browser:
+            launched.update(kwargs)
+            return _Browser()
+
+        def stop(self) -> None:
+            return None
+
+    class _Driver:
+        def start(self) -> _Playwright:
+            return _Playwright()
+
+    monkeypatch.setattr("interface_compiler.browser.engine.sync_playwright", _Driver)
+    engine = Engine()
+    engine.start()
+    engine.close()
+    assert launched.get("chromium_sandbox") is True
 
 
 def test_facts_busy_renderer_returns_before_the_deadline() -> None:

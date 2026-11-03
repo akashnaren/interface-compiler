@@ -12,6 +12,10 @@ USER_AGENT_SUFFIX = (
     f" interface-compiler/{__version__} (+https://github.com/akashnaren/interface-compiler)"
 )
 VIEWPORT = {"width": 1280, "height": 800}
+_SANDBOX_UNAVAILABLE = (
+    "Chromium sandbox is unavailable. Enable unprivileged user namespaces "
+    "(kernel.apparmor_restrict_unprivileged_userns=0) and start again."
+)
 
 
 def _pipe_closed(exc: BaseException) -> bool:
@@ -22,6 +26,10 @@ def _driver_already_stopped(exc: BaseException) -> bool:
     """True when Playwright is reporting a driver this process already stopped."""
     text = str(exc).lower()
     return _pipe_closed(exc) or "has been closed" in text or "target closed" in text
+
+
+def _sandbox_unavailable(exc: BaseException) -> bool:
+    return "sandbox" in str(exc).lower()
 
 
 class Engine:
@@ -50,9 +58,11 @@ class Engine:
         playwright = sync_playwright().start()
         self._playwright = playwright
         try:
-            browser = playwright.chromium.launch(headless=True)
-        except PlaywrightError:
+            browser = playwright.chromium.launch(headless=True, chromium_sandbox=True)
+        except PlaywrightError as exc:
             self.close()
+            if _sandbox_unavailable(exc):
+                raise RuntimeError(_SANDBOX_UNAVAILABLE) from exc
             raise
         self._browser = browser
         session = browser.new_browser_cdp_session()
