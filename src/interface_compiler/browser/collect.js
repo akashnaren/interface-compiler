@@ -1381,7 +1381,9 @@
   if (batch.length > 0) {
     chunks.push(JSON.stringify(batch));
   }
-  if (chunks.length === 0 && matched.length > 0 && !truncated) {
+  // No rows from a page that has controls is a deadline. Truncation does
+  // not make an empty transfer a successful prefix.
+  if (chunks.length === 0 && matched.length > 0) {
     return deadlinePayload();
   }
 

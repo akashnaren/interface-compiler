@@ -1188,6 +1188,68 @@ def _text_at(page: Page, css: str) -> str:
     return text
 
 
+def _assert_late_controls_ship_a_row_or_the_deadline() -> None:
+    # A million siblings before two id-less controls, at throttle 6. A fast
+    # renderer can still position Pay; an empty success is the failure.
+    script = """
+import sys
+from interface_compiler.browser.engine import Engine
+from interface_compiler.browser.facts import FactCollectionError, collect_facts
+
+engine = Engine()
+engine.start()
+page = engine.new_page()
+try:
+    page.set_content(
+        "<!doctype html><title>late</title>"
+        + "<i></i>" * 1_000_000
+        + "<button type='button'>Pay</button><a href='/x'>Go</a>",
+        wait_until="domcontentloaded",
+        timeout=60_000,
+    )
+    session = page.context.new_cdp_session(page)
+    session.send("Emulation.setCPUThrottlingRate", {"rate": 6})
+    try:
+        facts = collect_facts(page)
+    except FactCollectionError as exc:
+        if "deadline" not in str(exc):
+            sys.stderr.write(str(exc))
+            raise SystemExit(2)
+    else:
+        rows = [(element.name, element.css) for element in facts.elements]
+        if not rows:
+            sys.stderr.write("elements=0 truncated=%s\\n" % facts.truncated)
+            raise SystemExit(3)
+        names = [name for name, _css in rows]
+        if any(name not in ("Pay", "Go") for name in names) or len(names) > 2:
+            sys.stderr.write("rows=%s\\n" % (rows,))
+            raise SystemExit(3)
+        if len(names) < 2 and not facts.truncated:
+            sys.stderr.write("rows=%s truncated=%s\\n" % (rows, facts.truncated))
+            raise SystemExit(3)
+        resolved = page.evaluate(
+            "(rows) => rows.map((row) => {"
+            " const node = document.querySelector(row.css);"
+            " return node ? node.textContent : '';"
+            "})",
+            [{"css": css} for _name, css in rows],
+        )
+        if resolved != names:
+            sys.stderr.write("resolved=%s rows=%s\\n" % (resolved, rows))
+            raise SystemExit(3)
+finally:
+    engine.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def _require_selector(page: Page, facts: PageFacts, label: str, *, required: bool) -> None:
     # A duplicate id or name must not select the earlier control. An unfinished
     # count drops the later row instead of emitting #id or tag[name].
@@ -1221,6 +1283,7 @@ def _require_selector(page: Page, facts: PageFacts, label: str, *, required: boo
         ("aria", {}, {"own": False, "bare": False, "yes": True}),
         ("dup-id", {}, {}),
         ("dup-name", {}, {}),
+        ("no-rows", {}, {}),
     ],
 )
 def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
@@ -1261,6 +1324,11 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
             + "<div name='n'></div>" * 100_000
             + "<button type='button' name='same'>Two</button>"
         )
+    elif case == "no-rows":
+        # A million siblings before id-less controls. The child browser keeps
+        # a deadline kill off the session engine.
+        _assert_late_controls_ship_a_row_or_the_deadline()
+        return
     else:
         raise AssertionError(case)
     session = None

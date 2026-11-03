@@ -228,8 +228,9 @@ def collect_facts(page: Page, *, deadline_s: float = _DEADLINE_S) -> PageFacts:
     loader checks all stop on the same clock, with ``truncated`` set, while
     there is still time to release the session. A walk that is given no time,
     or that ships no rows from a page that has controls, raises instead of
-    returning an empty document. Collection also raises when the browser
-    driver cannot be found, so the deadline is never skipped.
+    returning an empty document. Truncation does not turn that empty result
+    into a success. Collection also raises when the browser driver cannot be
+    found, so the deadline is never skipped.
 
     A renderer that is already spinning does not honor a CDP timeout. The
     deadline stops that browser's driver so the blocked call returns. A slow
@@ -389,7 +390,12 @@ def _collect_within(page: Page, deadline_s: float, started: float) -> PageFacts:
             raise TypeError("fact collector must return an object")
         page_url, title, truncated = _walked_document(payload)
         # Evaluated before session cleanup, while the deadline is still set.
-        return _page_facts(page_url, title, payload, overlay, truncated)
+        facts = _page_facts(page_url, title, payload, overlay, truncated)
+        # Row construction can drop every transferred row. That is still an
+        # empty document from a page that has controls.
+        if not facts.elements and isinstance(controls, int) and controls > 0:
+            raise FactCollectionError("fact collection exceeded the deadline")
+        return facts
     except FactCollectionError:
         raise
     except Exception as exc:
@@ -451,12 +457,9 @@ def _collected_payload(session: CDPSession, root_id: str) -> dict[str, Any]:
             raise TypeError("fact collector returned no payload")
         rows.extend(parsed)
     controls = meta.get("controls")
-    if (
-        not rows
-        and isinstance(controls, int)
-        and controls > 0
-        and meta.get("truncated") is not True
-    ):
+    # A truncated walk that kept nothing is not a prefix. Zero rows from a
+    # page that has controls is a deadline.
+    if not rows and isinstance(controls, int) and controls > 0:
         meta["deadline"] = True
     meta["elements"] = rows
     return meta
