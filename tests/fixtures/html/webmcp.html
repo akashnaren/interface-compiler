@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tool</title>
+</head>
+<body>
+
+  <main aria-label="Tools">
+    <button id="run" type="button">Run tool</button>
+  </main>
+  <script>
+    const host = document.modelContext || navigator.modelContext;
+    if (host && typeof host.registerTool === "function") {
+      host.registerTool({
+        name: "run_tool",
+        description: "Run the sample tool",
+        inputSchema: {type: "object", properties: {}},
+        annotations: {readOnlyHint: false},
+        execute() { return null; }
+      });
+    }
+  </script>
+
+</body>
+</html>

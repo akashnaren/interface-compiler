@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Navy Crew Tee</title>
+</head>
+<body>
+
+  <header>
+    <nav aria-label="Shop">
+      <a id="catalog" href="/catalog">Catalog</a>
+      <a id="cart" href="/cart">Cart</a>
+    </nav>
+  </header>
+  <main aria-label="Product">
+    <h1 id="title">Navy Crew Tee</h1>
+    <p>$28</p>
+    <form id="buy" method="post" action="/cart">
+      <label for="size">Size</label>
+      <select id="size" name="size" required>
+        <option value="" selected>Choose</option>
+        <option value="S">S</option>
+        <option value="M">M</option>
+        <option value="L">L</option>
+      </select>
+      <button id="add" type="submit">Add to cart</button>
+    </form>
+    <section aria-label="You may also like">
+      <a id="also" href="/p/tee-white">White Crew Tee</a>
+    </section>
+    <a id="checkout" href="/checkout">Checkout</a>
+  </main>
+
+</body>
+</html>

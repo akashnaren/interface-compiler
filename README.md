@@ -6,6 +6,8 @@
 
 `interface-compiler` opens a public web page in a headless browser and turns what a person would see (buttons, links, forms, dropdowns, tabs, menus) into a **compiled view document**. This is a small JSON object that answers the two questions an agent asks at every step: *what is true right now*, and *what may I do next*.
 
+Chromium's sandbox is required and on by default.
+
 ```json
 {
   "view": "product",

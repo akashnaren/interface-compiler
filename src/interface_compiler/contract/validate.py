@@ -13,8 +13,12 @@ from typing import Any, NamedTuple
 
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import SchemaError, ValidationError
+from jsonschema.validators import extend
 from pydantic import BaseModel
 from referencing import Registry, Resource
+
+from interface_compiler.checker.verified import verified_errors
+from interface_compiler.contract.patterns import PatternError, ensure_pattern, pattern_matches
 
 _SCHEMA_FILES = {
     "view-doc": "view-doc.v1.json",
@@ -29,6 +33,10 @@ _PATTERN_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 _PATTERN_ECHO_LIMIT = 80
 # Contract errors quote the failing value. A long quote is cut to about this.
 _VALUE_ECHO_LIMIT = 200
+# Key names and path segments are untrusted. One long key must not become the
+# whole ContractError. The final message is capped again after that.
+_SEGMENT_LIMIT = 80
+_MESSAGE_LIMIT = 400
 # jsonschema follows items/$ref recursively and overflows the stack on a
 # chain a few hundred levels deep. Stop before that walk.
 _MAX_SCHEMA_DEPTH = 32
@@ -101,7 +109,7 @@ def validate_args(affordance: object, args: object) -> None:
         _check_json_shape(affordance)
     _ensure_input_schema(schema, "input")
     try:
-        validator = Draft202012Validator(schema, format_checker=_format_checker())
+        validator = _Validator(schema, format_checker=_format_checker())
         _raise_if_invalid(validator, args)
     except ContractError:
         raise
@@ -143,6 +151,9 @@ def _validate(name: str, instance: object) -> None:
         *_exact_id_errors(instance),
         *_duplicate_id_errors(instance),
         *_affordance_constraint_errors(instance),
+        # Mutating actions on a real site cannot be probed_ok. Enforced here so
+        # a later look cannot validate a document that skipped the checker.
+        *verified_errors(instance),
     ]
     if errors:
         raise ContractError(errors[0], errors=errors)
@@ -160,14 +171,16 @@ def _raise_if_invalid(validator: Draft202012Validator, instance: object) -> None
 
 
 def _error_message(error: ValidationError) -> str:
-    location = "/".join(str(part) for part in error.absolute_path)
-    where = location or "<root>"
+    parts = [_cap_text(str(part), _SEGMENT_LIMIT) for part in error.absolute_path]
+    where = "/".join(parts) if parts else "<root>"
     detail = error.message
     if len(detail) > _VALUE_ECHO_LIMIT:
         rendered = repr(error.instance)
         if len(rendered) > _VALUE_ECHO_LIMIT and rendered in detail:
             detail = detail.replace(rendered, _truncate_repr(rendered), 1)
-    return f"{where}: {detail}"
+    if len(detail) > _SEGMENT_LIMIT:
+        detail = _cap_quoted(detail, _SEGMENT_LIMIT)
+    return _cap_text(f"{where}: {detail}", _MESSAGE_LIMIT)
 
 
 @lru_cache(maxsize=1)
@@ -260,18 +273,62 @@ def _input_object_errors(schema: object, where: str) -> list[str]:
                 errors.append(f"{where}/required/{index}: {_echo_value(name)} is not a property")
     if isinstance(properties, Mapping):
         for key, prop in properties.items():
-            errors.extend(_prop_errors(prop, f"{where}/properties/{key}"))
+            errors.extend(_prop_errors(prop, _property_path(where, key)))
     return errors
 
 
 def _compile_pattern(pattern: str) -> ContractError | None:
-    """Return a contract error when Python cannot compile ``pattern``."""
+    """Return a contract error when ``pattern`` cannot be compiled or matched safely."""
     try:
-        re.compile(pattern)
-    except _PATTERN_COMPILE_ERRORS as exc:
-        message = f"{_echo_pattern(pattern)} is not a valid regular expression ({exc})"
+        ensure_pattern(pattern)
+    except PatternError as exc:
+        message = _pattern_error_message(pattern, exc)
         return ContractError(message, errors=[message])
     return None
+
+
+def _pattern_error_message(pattern: str, exc: PatternError) -> str:
+    shown = _echo_pattern(pattern)
+    if exc.invalid:
+        return f"{shown} is not a valid regular expression ({exc.detail})"
+    return f"{shown} is rejected ({exc.detail})"
+
+
+def _property_path(where: str, key: object) -> str:
+    return f"{where}/properties/{_cap_text(str(key), _SEGMENT_LIMIT)}"
+
+
+def _cap_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return f"{text[: limit - 3]}..."
+
+
+def _cap_quoted(text: str, limit: int) -> str:
+    """Cut a quoted key or value so the surrounding sentence stays intact."""
+    parts: list[str] = []
+    index = 0
+    size = len(text)
+    while index < size:
+        quote = text[index]
+        if quote not in {"'", '"'}:
+            parts.append(quote)
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < size:
+            if text[cursor] == "\\":
+                cursor += 2
+                continue
+            if text[cursor] == quote:
+                cursor += 1
+                break
+            cursor += 1
+        parts.append(_cap_text(text[index:cursor], limit))
+        index = min(cursor, size)
+    return "".join(parts)
 
 
 def _echo_pattern(pattern: str) -> str:
@@ -288,12 +345,22 @@ def _echo_value(value: object) -> str:
 def _truncate_repr(rendered: str) -> str:
     if len(rendered) <= _VALUE_ECHO_LIMIT:
         return rendered
+    quote = rendered[0] if rendered else ""
+    if quote in {"'", '"'} and rendered[-1] == quote:
+        # Keep the closer. An open quote would swallow the rest of the sentence
+        # when a later pass caps quoted keys.
+        keep = max(_VALUE_ECHO_LIMIT - 4, 1)
+        return f"{quote}{rendered[1:keep]}...{quote}"
     return f"{rendered[:_VALUE_ECHO_LIMIT]}..."
 
 
 def nesting_too_deep(where: str) -> str:
-    """Contract message for an items or properties chain past the nesting limit."""
-    return f"{where}: nesting exceeds max {_MAX_SCHEMA_DEPTH}"
+    """Contract message for an items or properties chain past the nesting limit.
+
+    The reason is first. ``_cap_text`` keeps the start of the string, so a long
+    property path is what gets cut.
+    """
+    return _cap_text(f"nesting exceeds max {_MAX_SCHEMA_DEPTH}: {where}", _MESSAGE_LIMIT)
 
 
 def _guard_json_document(instance: object) -> None:
@@ -500,8 +567,9 @@ def _reject_json_type(value: object, path: tuple[str, ...]) -> None:
 
 
 def _json_shape_error(path: tuple[str, ...], detail: str) -> None:
-    where = "/".join(path) if path else "<root>"
-    message = f"{where}: {detail}"
+    parts = [_cap_text(part, _SEGMENT_LIMIT) for part in path]
+    where = "/".join(parts) if parts else "<root>"
+    message = _cap_text(f"{where}: {detail}", _MESSAGE_LIMIT)
     raise ContractError(message, errors=[message])
 
 
@@ -534,7 +602,7 @@ def _schema_nesting_errors(
     properties = node.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
-            child_where = f"{where}/properties/{key}"
+            child_where = _property_path(where, key)
             errors.extend(_schema_nesting_errors(child, child_where, depth=depth + 1, seen=seen))
     items = node.get("items")
     if isinstance(items, Mapping):
@@ -550,7 +618,7 @@ def _input_nesting_errors(schema: object, where: str) -> list[str]:
     properties = schema.get("properties")
     if isinstance(properties, Mapping):
         for key, child in properties.items():
-            child_where = f"{where}/properties/{key}"
+            child_where = _property_path(where, key)
             errors.extend(_schema_nesting_errors(child, child_where, depth=0, seen=seen))
     return errors
 
@@ -602,11 +670,12 @@ def _prefix_contract_error(exc: ContractError, where: str) -> ContractError:
     for message in exc.errors:
         location, separator, detail = message.partition(": ")
         if separator and location == "<root>":
-            errors.append(f"{where}: {detail}")
+            rewritten = f"{where}: {detail}"
         elif separator:
-            errors.append(f"{where}/{location}: {detail}")
+            rewritten = f"{where}/{location}: {detail}"
         else:
-            errors.append(f"{where}: {message}")
+            rewritten = f"{where}: {message}"
+        errors.append(_cap_text(rewritten, _MESSAGE_LIMIT))
     return ContractError(errors[0], errors=errors)
 
 
@@ -614,7 +683,7 @@ def _prefix_contract_error(exc: ContractError, where: str) -> ContractError:
 def _input_schema_validator() -> Draft202012Validator:
     full = load_schema("view-doc")
     schema = {"$defs": full["$defs"], "$ref": "#/$defs/input"}
-    return Draft202012Validator(schema, format_checker=_format_checker())
+    return _Validator(schema, format_checker=_format_checker())
 
 
 def _prop_errors(
@@ -638,16 +707,41 @@ def _prop_errors(
     if isinstance(pattern, str):
         failure = _compile_pattern(pattern)
         if failure is not None:
-            errors.append(f"{where}/pattern: {failure}")
+            errors.append(_cap_text(f"{where}/pattern: {failure}", _MESSAGE_LIMIT))
     items = prop.get("items")
     if isinstance(items, Mapping):
         errors.extend(_prop_errors(items, f"{where}/items", depth + 1, seen))
     return errors
 
 
+def _pattern_keyword(
+    validator: Draft202012Validator,
+    patrn: object,
+    instance: object,
+    _schema: object,
+) -> Any:
+    """JSON Schema ``pattern``, matched with RE2 instead of the stdlib engine."""
+    if not validator.is_type(instance, "string") or not isinstance(patrn, str):
+        return None
+    try:
+        matched = pattern_matches(patrn, instance)
+    except PatternError as exc:
+        if exc.detail == "string is too long to match":
+            yield ValidationError("string is too long to match")
+            return
+        yield ValidationError(_pattern_error_message(patrn, exc))
+        return
+    if not matched:
+        yield ValidationError(f"{instance!r} does not match {patrn!r}")
+    return None
+
+
+_Validator = extend(Draft202012Validator, validators={"pattern": _pattern_keyword})
+
+
 @lru_cache(maxsize=len(_SCHEMA_FILES))
 def _validator(name: str) -> Draft202012Validator:
-    return Draft202012Validator(
+    return _Validator(
         load_schema(name),
         registry=_registry(),
         format_checker=_format_checker(),

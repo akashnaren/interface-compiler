@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Choices</title>
+</head>
+<body>
+
+  <main aria-label="Product">
+    <fieldset>
+      <legend>Size</legend>
+      <label><input id="size-s" type="radio" name="size" value="S"> S</label>
+      <label><input id="size-m" type="radio" name="size" value="M" checked> M</label>
+      <label><input id="size-l" type="radio" name="size" value="L"> L</label>
+      <label><input id="size-xl" type="radio" name="size" value="XL" disabled> XL</label>
+    </fieldset>
+    <div role="toolbar" aria-label="Color">
+      <button id="red" type="button" aria-pressed="true">Red</button>
+      <button id="blue" type="button" aria-pressed="false">Blue</button>
+    </div>
+  </main>
+
+</body>
+</html>

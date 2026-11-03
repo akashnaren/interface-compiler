@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Checkout</title>
+</head>
+<body>
+
+  <main aria-label="Checkout">
+    <h1>Checkout</h1>
+    <form id="pay-form" method="post" action="/pay">
+      <label for="address">Address</label>
+      <input id="address" name="address" type="text" required>
+      <button id="pay" type="submit">Pay</button>
+    </form>
+    <a id="back" href="/cart">Back to cart</a>
+  </main>
+
+</body>
+</html>

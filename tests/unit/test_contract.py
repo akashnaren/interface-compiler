@@ -647,6 +647,17 @@ def test_contract_items_nesting_limit(tmp_path: Path) -> None:
     captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
     assert "Traceback" not in captured
     assert "nesting exceeds max 32" in result.stderr
+    wide = _paper()
+    key = "k" * 80
+    node: dict = {"type": "string"}
+    for _ in range(40):
+        node = {"type": "object", "properties": {key: node}}
+    wide["affordances"][1]["input"]["properties"]["size"] = node
+    with pytest.raises(ContractError) as wide_error:
+        validate_doc(wide)
+    wide_message = str(wide_error.value)
+    assert wide_message.startswith("nesting exceeds max 32")
+    assert len(wide_message) <= 400
 
 
 def test_contract_items_nesting_boundary() -> None:
@@ -733,7 +744,7 @@ def test_contract_validate_args_lets_memory_error_propagate(
     def _boom(*_args: object, **_kwargs: object) -> None:
         raise MemoryError("nope")
 
-    monkeypatch.setattr("interface_compiler.contract.validate.Draft202012Validator", _boom)
+    monkeypatch.setattr("interface_compiler.contract.validate._Validator", _boom)
     affordance = {"id": "go", "enabled": True, "input": {"type": "object", "properties": {}}}
     with pytest.raises(MemoryError):
         validate_args(affordance, {})
@@ -964,7 +975,9 @@ def test_contract_wide_shared_list_hits_visit_budget() -> None:
         "enabled": True,
         "input": {"type": "object", "properties": {}},
     }
-    with _deadline(2):
+    # Three walks of the visit budget are a few seconds. The alarm only
+    # catches a walk that does not stop.
+    with _deadline(20):
         with pytest.raises(ContractError) as doc_error:
             validate_doc(doc)
         assert "node visits exceed max 4000000" in str(doc_error.value)
@@ -978,19 +991,24 @@ def test_contract_wide_shared_list_hits_visit_budget() -> None:
 
 def test_contract_error_message_truncates_long_value() -> None:
     pattern_doc = _paper()
-    pattern_doc["view"] = "Z" + ("a" * 20_000)
+    pattern_doc["view"] = "Z" + ("a" * 3_000)
     newline_doc = _paper()
-    newline_doc["view"] = ("a" * 20_000) + "\n"
+    newline_doc["view"] = ("a" * 3_000) + "\n"
     short_doc = _paper()
     short_doc["view"] = "Nope"
+    huge_doc = _paper()
+    huge_doc["view"] = "Z" + ("a" * 20_000)
     with pytest.raises(ContractError) as pattern_error:
         validate_doc(pattern_doc)
     with pytest.raises(ContractError) as newline_error:
         validate_doc(newline_doc)
     with pytest.raises(ContractError) as short_error:
         validate_doc(short_doc)
+    with pytest.raises(ContractError) as huge_error:
+        validate_doc(huge_doc)
     pattern_message = str(pattern_error.value)
     newline_message = str(newline_error.value)
+    huge_message = str(huge_error.value)
     assert "does not match" in pattern_message
     assert "does not match" in newline_message
     assert len(pattern_message) < 400
@@ -998,6 +1016,9 @@ def test_contract_error_message_truncates_long_value() -> None:
     assert "a" * 250 not in pattern_message
     assert "a" * 250 not in newline_message
     assert "'Nope'" in str(short_error.value)
+    assert "string is too long to match" in huge_message
+    assert "a" * 250 not in huge_message
+    assert len(huge_message) < 400
 
 
 def test_contract_integer_must_fit_in_js_safe_range() -> None:
@@ -1088,3 +1109,267 @@ def test_contract_lone_surrogate_rejected_on_every_path(tmp_path: Path) -> None:
         captured = f"{result.stdout}\n{result.stderr}\n{result.output}"
         assert "Traceback" not in captured
         assert "lone surrogate" in result.stderr
+
+
+_BACKTRACKING_PATTERNS = (
+    r"^(a+)+$",
+    r"^(a|a)*$",
+    r"^(a|aa)+$",
+    r"^(a*a)*$",
+    r"^(a+){1,19}$",
+    r"^(.*a){12}$",
+    "a*" * 10 + "b$",
+    "^" + ".*" * 10 + "=$",
+)
+
+
+def _pattern_affordance(pattern: str) -> dict:
+    return {
+        "id": "go",
+        "enabled": True,
+        "input": {
+            "type": "object",
+            "properties": {"q": {"type": "string", "pattern": pattern}},
+            "required": ["q"],
+        },
+    }
+
+
+@pytest.mark.parametrize("pattern", _BACKTRACKING_PATTERNS)
+def test_contract_backtracking_pattern_matches_in_bounded_time(pattern: str) -> None:
+    """RE2 accepts these shapes and searches a long failing input quickly.
+
+    A static screen cannot cover every exponential form, and several of these
+    used to hang ``validate_args``. The document keeps the pattern. The match
+    fails because the input does not match, and it finishes inside the deadline.
+    """
+    affordance = _pattern_affordance(pattern)
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"]["pattern"] = pattern
+    validate_doc(doc)
+    ViewDoc.model_validate(doc)
+    started = time.perf_counter()
+    with _deadline(1), pytest.raises(ContractError) as exc:
+        validate_args(affordance, {"q": ("a" * 4000) + "!"})
+    elapsed = time.perf_counter() - started
+    message = str(exc.value)
+    assert "does not match" in message
+    assert "rejected" not in message
+    assert elapsed < 0.25
+
+
+_UNMATCHABLE_PATTERNS = (
+    r"^((a)\2?)+$",
+    r"^(a)?(?(1)(a+)+|b)$",
+    r"(?=a)",
+    r"(?<=a)",
+)
+
+
+@pytest.mark.parametrize("pattern", _UNMATCHABLE_PATTERNS)
+def test_contract_re2_rejects_patterns_it_cannot_compile(pattern: str) -> None:
+    """Backreferences, conditionals, and lookaround are rejected before matching."""
+    affordance = _pattern_affordance(pattern)
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"]["pattern"] = pattern
+    where = "affordances/1/input/properties/size/pattern"
+    started = time.perf_counter()
+    with _deadline(1):
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(doc)
+        with pytest.raises(ContractError) as args_error:
+            validate_args(affordance, {"q": ("a" * 4000) + "!"})
+    elapsed = time.perf_counter() - started
+    for message in (str(doc_error.value), str(model_error.value), str(args_error.value)):
+        assert "rejected" in message
+        assert "does not match" not in message
+    assert where in str(doc_error.value)
+    assert elapsed < 0.25
+
+
+@pytest.mark.parametrize(
+    ("pattern", "value"),
+    [
+        (r"^[SML]$", "L"),
+        (r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", "ada@example.com"),
+        (
+            (
+                r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}"
+                r"-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+            ),
+            "550e8400-e29b-41d4-a716-446655440000",
+        ),
+        (r"^\d{4}-\d{2}-\d{2}$", "2026-11-03"),
+        (r"^\+?[0-9 .()-]{7,20}$", "+1 415 555 0100"),
+        (r"^(?:\d{1,3}\.){3}\d{1,3}$", "1.2.3.4"),
+        (r"^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$", "2001:0db8:0000:0000:0000:0000:0000:0001"),
+        (r"^[a-z0-9]+(?:-[a-z0-9]+)*$", "my-page"),
+        (r"^#[0-9A-Fa-f]{6}$", "#A1B2C3"),
+        (r"^https?://[A-Za-z0-9.-]+(?::\d{1,5})?(?:/[^\s]*)?$", "https://example.com/a"),
+        (r"^(?:[01]\d|2[0-3]):[0-5]\d$", "23:59"),
+        (r"^\d{5}(-\d{4})?$", "12345-6789"),
+        (r"^[A-Za-z][A-Za-z0-9_]{0,31}$", "Name_1"),
+        (r"^(?:0|[1-9]\d*)(?:\.\d+)?$", "10.5"),
+        (r"^[A-Z]{2,3}$", "USD"),
+        (r"^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)$", "Mon"),
+        (r"^([A-Za-z]+\s?)+$", "Hello World"),
+        (r"(?:[ _-][A-Za-z0-9]+)*", " foo"),
+        (r"(https?://)?example", "https://example"),
+        (r"(a+b)+", "aaabaaab"),
+    ],
+)
+def test_contract_bounded_patterns_still_match(pattern: str, value: str) -> None:
+    affordance = {
+        "id": "go",
+        "enabled": True,
+        "input": {
+            "type": "object",
+            "properties": {"q": {"type": "string", "pattern": pattern}},
+            "required": ["q"],
+        },
+    }
+    validate_args(affordance, {"q": value})
+
+
+def test_contract_error_message_caps_long_keys() -> None:
+    key = "k" * 100_000
+    doc = _paper()
+    doc[key] = 1
+    with pytest.raises(ContractError) as unexpected:
+        validate_doc(doc)
+    unexpected_message = str(unexpected.value)
+    assert len(unexpected_message) <= 500
+    assert all(len(item) <= 500 for item in unexpected.value.errors)
+    assert "was unexpected" in unexpected_message
+    assert key not in unexpected_message
+
+    affordance = {
+        "id": "go",
+        "enabled": True,
+        "input": {
+            "type": "object",
+            "properties": {key: {"type": "string"}},
+            "required": [key],
+        },
+    }
+    with pytest.raises(ContractError) as typed:
+        validate_args(affordance, {key: 1})
+    typed_message = str(typed.value)
+    assert len(typed_message) <= 500
+    assert all(len(item) <= 500 for item in typed.value.errors)
+    assert "string" in typed_message
+    assert key not in typed_message
+
+    noisy = {"size": "XL", key: 1}
+    with pytest.raises(ContractError) as args_error:
+        validate_args(_paper()["affordances"][1], noisy)
+    args_message = str(args_error.value)
+    assert len(args_message) <= 500
+    assert key not in args_message
+
+
+def test_contract_shape_error_caps_a_long_key(tmp_path: Path) -> None:
+    key = "k" * 100_000
+    doc = _paper()
+    doc[key] = float("nan")
+    with pytest.raises(ContractError) as doc_error:
+        validate_doc(doc)
+    doc_message = str(doc_error.value)
+    assert "number must be finite" in doc_message
+    assert len(doc_message) <= 500
+    assert key not in doc_message
+
+    affordance = {
+        "id": "go",
+        "enabled": True,
+        "input": {"type": "object", "properties": {"q": {"type": "number"}}},
+    }
+    with pytest.raises(ContractError) as args_error:
+        validate_args(affordance, {key: float("nan")})
+    args_message = str(args_error.value)
+    assert "number must be finite" in args_message
+    assert len(args_message) <= 500
+    assert key not in args_message
+
+    surrogate = _paper()
+    surrogate[key] = "a\ud800b"
+    result = _cli_validate(surrogate, tmp_path)
+    assert result.exit_code == 1
+    assert key not in result.stderr
+    assert len(result.stderr) <= 500
+    assert "lone surrogate" in result.stderr
+
+
+def test_contract_pattern_path_caps_a_long_property_name() -> None:
+    key = "k" * 100_000
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"][key] = {"type": "string", "pattern": "("}
+    with pytest.raises(ContractError) as doc_error:
+        validate_doc(doc)
+    message = str(doc_error.value)
+    assert "pattern" in message
+    assert len(message) <= 500
+    assert key not in message
+    affordance = doc["affordances"][1]
+    with pytest.raises(ContractError) as args_error:
+        validate_args(affordance, {key: "v"})
+    args_message = str(args_error.value)
+    assert len(args_message) <= 500
+    assert key not in args_message
+
+
+def test_contract_cli_caps_how_many_errors_it_prints(tmp_path: Path) -> None:
+    doc = _paper()
+    blob = "e" * 300
+    doc["affordances"] = [
+        {
+            "id": f"a{index}",
+            "enabled": blob,
+            "input": {"type": "object", "properties": {}},
+        }
+        for index in range(50)
+    ]
+    result = _cli_validate(doc, tmp_path)
+    assert result.exit_code == 1
+    assert "omitted" in result.stderr
+    assert len(result.stderr) <= 4500
+    assert blob not in result.stderr
+    assert len(result.stderr.splitlines()) <= 21
+
+
+def test_contract_overlong_pattern_is_rejected_before_compile() -> None:
+    pattern = "a" * (5 * 1024 * 1024)
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"]["pattern"] = pattern
+    affordance = doc["affordances"][1]
+    started = time.perf_counter()
+    with _deadline(2):
+        with pytest.raises(ContractError) as doc_error:
+            validate_doc(doc)
+        with pytest.raises(ValidationError) as model_error:
+            ViewDoc.model_validate(doc)
+        with pytest.raises(ContractError) as args_error:
+            validate_args(affordance, {"size": "a"})
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0
+    for message in (str(doc_error.value), str(model_error.value), str(args_error.value)):
+        assert "too long" in message
+        assert len(message) <= 500
+        assert "a" * 81 not in message
+
+
+def test_contract_overlong_subject_is_not_matched() -> None:
+    subject = "a" * 5000
+    affordance = _pattern_affordance(r"^a+$")
+    started = time.perf_counter()
+    with _deadline(1), pytest.raises(ContractError) as exc:
+        validate_args(affordance, {"q": subject})
+    elapsed = time.perf_counter() - started
+    message = str(exc.value)
+    assert "string is too long to match" in message
+    assert "does not match" not in message
+    assert subject not in message
+    assert elapsed < 0.25
+    validate_args(affordance, {"q": "a" * 4096})

@@ -17,6 +17,7 @@ dependencies = [
     "extruct>=0.18,<1",
     "protego>=0.7,<1",
     "tiktoken>=0.14,<1",
+    "google-re2>=1.1,<2",
 ]
 
 [project.optional-dependencies]
