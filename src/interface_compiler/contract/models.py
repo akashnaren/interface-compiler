@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
-from interface_compiler.contract.validate import validate_doc, validate_effect
+from interface_compiler.contract.validate import ContractError, validate_doc, validate_effect
 
 _ID = r"^[a-z][a-z0-9_]*$"
 _NULLABLE_FIELDS = frozenset({"match", "main_status", "blocked", "total", "next"})
@@ -77,6 +86,12 @@ class InputSchema(BaseModel):
     properties: dict[str, Prop]
     required: list[str] | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _required_not_null(cls, value: object) -> object:
+        _reject_explicit_null(value, "required")
+        return value
+
     @field_validator("required")
     @classmethod
     def _required_non_empty(cls, value: list[str] | None) -> list[str] | None:
@@ -140,9 +155,15 @@ class Affordance(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(pattern=_ID)
-    enabled: bool
+    enabled: StrictBool
     input: InputSchema
     x: AffordanceX | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _x_not_null(cls, value: object) -> object:
+        _reject_explicit_null(value, "x")
+        return value
 
 
 class PageCursor(BaseModel):
@@ -221,6 +242,13 @@ class ViewDoc(BaseModel):
     entities: dict[str, Any]
     affordances: list[Affordance]
     x: DocX | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _schema_before_parse(cls, value: object) -> object:
+        _reject_explicit_null(value, "x")
+        _validate_raw(value, validate_doc)
+        return value
 
     @field_validator("state")
     @classmethod
@@ -373,13 +401,19 @@ class ActResult(BaseModel):
         "blocked",
         "error",
     ]
-    doc_rev: int
+    doc_rev: StrictInt
     doc: ViewDoc
     effect: Effect | None = None
     preview: Preview | None = None
     confirm_token: str | None = None
     error: ActErrorBody | None = None
     counters: Counters
+
+    @model_validator(mode="before")
+    @classmethod
+    def _schema_before_parse(cls, value: object) -> object:
+        _validate_raw(value, validate_effect)
+        return value
 
     @model_validator(mode="after")
     def _matches_schema(self) -> Self:
@@ -402,6 +436,32 @@ def dump_act_result(result: ActResult, *, echo_errors: bool = True) -> dict[str,
     if not echo_errors:
         dumped.pop("error", None)
     return dumped
+
+
+def _reject_explicit_null(value: object, key: str) -> None:
+    """JSON Schema rejects null for these optional fields; omission is allowed."""
+    if isinstance(value, Mapping) and key in value and value[key] is None:
+        raise ValueError(f"{key} must be omitted rather than null")
+
+
+def _validate_raw(value: object, validate: Callable[[Mapping[str, Any]], None]) -> None:
+    """Check JSON input against the schema before pydantic can coerce it."""
+    if not isinstance(value, Mapping) or not _is_json_value(value):
+        return
+    try:
+        validate(value)
+    except ContractError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, str | bool | int | float):
+        return True
+    if isinstance(value, Mapping):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    return False
 
 
 def _dump_model(model: BaseModel) -> dict[str, Any]:

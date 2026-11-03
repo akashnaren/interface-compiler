@@ -19,6 +19,9 @@ _SCHEMA_FILES = {
     "view-doc": "view-doc.v1.json",
     "effect": "effect.v1.json",
 }
+# The frozen pattern uses `$`. Python's `$` succeeds before a final newline, so
+# jsonschema accepts "pay\n". `\Z` is the end of the string.
+_EXACT_ID = re.compile(r"\A[a-z][a-z0-9_]*\Z")
 _RFC3339 = re.compile(
     r"^(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"T(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
@@ -97,6 +100,9 @@ def _input_schema(affordance: object) -> dict[str, Any]:
 
 def _validate(name: str, instance: object) -> None:
     _raise_if_invalid(_validator(name), instance)
+    id_errors = _exact_id_errors(instance)
+    if id_errors:
+        raise ContractError(id_errors[0], errors=id_errors)
 
 
 def _raise_if_invalid(validator: Draft202012Validator, instance: object) -> None:
@@ -125,7 +131,30 @@ def _registry() -> Registry[Any]:
     return Registry().with_resources(pairs)
 
 
-@lru_cache(maxsize=1)
+def _exact_id_errors(instance: object, *, prefix: str = "") -> list[str]:
+    """Reject view and affordance ids that only matched because of `$`."""
+    if not isinstance(instance, Mapping):
+        return []
+    errors: list[str] = []
+    view = instance.get("view")
+    if isinstance(view, str) and _EXACT_ID.fullmatch(view) is None:
+        errors.append(f"{prefix}view: {view!r} does not match '^[a-z][a-z0-9_]*$'")
+    affordances = instance.get("affordances")
+    if isinstance(affordances, list):
+        for index, item in enumerate(affordances):
+            if not isinstance(item, Mapping):
+                continue
+            ident = item.get("id")
+            if isinstance(ident, str) and _EXACT_ID.fullmatch(ident) is None:
+                where = f"{prefix}affordances/{index}/id"
+                errors.append(f"{where}: {ident!r} does not match '^[a-z][a-z0-9_]*$'")
+    doc = instance.get("doc")
+    if isinstance(doc, Mapping):
+        errors.extend(_exact_id_errors(doc, prefix=f"{prefix}doc/"))
+    return errors
+
+
+@lru_cache(maxsize=len(_SCHEMA_FILES))
 def _validator(name: str) -> Draft202012Validator:
     return Draft202012Validator(
         load_schema(name),

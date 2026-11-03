@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from interface_compiler.cli import app
@@ -408,3 +409,71 @@ def test_contract_cli_validate_rejects_bad_document(tmp_path: Path) -> None:
     result = RUNNER.invoke(app, ["validate", str(path)])
     assert result.exit_code == 1
     assert "valid" not in result.stdout
+
+
+def _cli_validate(doc: dict, tmp_path: Path):
+    path = tmp_path / "doc.json"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return RUNNER.invoke(app, ["validate", str(path)])
+
+
+def test_contract_view_rejects_trailing_newline(tmp_path: Path) -> None:
+    doc = _paper()
+    doc["view"] = "product\n"
+    with pytest.raises(ContractError):
+        validate_doc(doc)
+    result = _cli_validate(doc, tmp_path)
+    assert result.exit_code == 1
+    assert result.stdout.strip() != "valid"
+
+
+def test_contract_affordance_id_rejects_trailing_newline(tmp_path: Path) -> None:
+    doc = _paper()
+    doc["affordances"][6]["id"] = "pay\n"
+    with pytest.raises(ContractError):
+        validate_doc(doc)
+    result = _cli_validate(doc, tmp_path)
+    assert result.exit_code == 1
+    assert result.stdout.strip() != "valid"
+
+
+def test_contract_model_rejects_enabled_true_string() -> None:
+    doc = _paper()
+    doc["affordances"][0]["enabled"] = "true"
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
+
+
+def test_contract_model_rejects_enabled_one() -> None:
+    doc = _paper()
+    doc["affordances"][0]["enabled"] = 1
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
+
+
+def test_contract_model_rejects_doc_rev_string() -> None:
+    result = _act_result()
+    result["doc_rev"] = "1"
+    with pytest.raises(ValidationError):
+        ActResult.model_validate(result)
+
+
+def test_contract_model_rejects_document_x_null() -> None:
+    doc = _paper()
+    doc["x"] = None
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
+
+
+def test_contract_model_rejects_affordance_x_null() -> None:
+    doc = _paper()
+    doc["affordances"][0]["x"] = None
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
+
+
+def test_contract_model_rejects_required_null() -> None:
+    doc = _paper()
+    doc["affordances"][0]["input"]["required"] = None
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
