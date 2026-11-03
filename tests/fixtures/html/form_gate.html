@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Gate</title>
+</head>
+<body>
+<main aria-label="Product">
+  <form id="dis" method="post" action="/cart">
+    <label for="size-d">Size</label>
+    <select id="size-d" name="size" required>
+      <option value="" selected>Choose</option>
+      <option value="S">S</option>
+    </select>
+    <button id="add-off" type="submit" disabled>Add to cart</button>
+  </form>
+  <form id="aria" method="post" action="/cart">
+    <label for="size-a">Size</label>
+    <select id="size-a" name="size" required>
+      <option value="" selected>Choose</option>
+      <option value="S">S</option>
+    </select>
+    <button id="add-aria" type="submit" aria-disabled="true">Add to bag</button>
+  </form>
+  <form id="inertbtn" method="post" action="/cart">
+    <label for="size-i">Size</label>
+    <select id="size-i" name="size" required>
+      <option value="" selected>Choose</option>
+      <option value="S">S</option>
+    </select>
+    <button id="add-inert" type="submit" inert>Add to cart</button>
+  </form>
+  <form id="cover" method="post" action="/cart" style="position:relative;width:220px;height:80px">
+    <label for="size-c">Size</label>
+    <select id="size-c" name="size" required>
+      <option value="" selected>Choose</option>
+      <option value="S">S</option>
+    </select>
+    <button id="add-cover" type="submit" style="width:120px;height:28px">Add to cart</button>
+    <div style="position:absolute;inset:0"></div>
+  </form>
+  <form id="inert" method="post" action="/note" inert>
+    <label for="note">Note</label>
+    <textarea id="note" name="note"></textarea>
+    <button id="fake" type="button">Extra</button>
+    <input id="q" type="search" name="q" aria-label="Search">
+  </form>
+  <form id="mask" method="post" action="/mask" style="position:relative;width:180px;height:48px;margin-top:12px">
+    <input id="body" name="body" placeholder="Body">
+    <button id="fake-fixed" type="button" style="position:fixed;left:0;top:520px;width:80px;height:24px">Fake</button>
+    <button id="reset" type="reset">Reset</button>
+    <div style="position:absolute;inset:0"></div>
+  </form>
+  <fieldset disabled>
+    <form id="boxed" method="post" action="/save">
+      <label for="email">Email</label>
+      <input id="email" type="email" name="email">
+      <button id="save" type="submit">Save</button>
+    </form>
+  </fieldset>
+</main>
+</body>
+</html>

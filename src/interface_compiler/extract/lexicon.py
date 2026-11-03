@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from interface_compiler.extract.naming import normalize_label
 
@@ -71,7 +71,21 @@ _VERBS: tuple[tuple[str, str], ...] = (
     ("download", r"download"),
     ("go_back", r"back(?: to .+)?|go back"),
 )
+_HARD_LABELS: tuple[tuple[str, str], ...] = (
+    ("pay", r"pay(?: now)?|complete (?:purchase|payment)|submit payment"),
+    ("place_order", r"place (?:my )?order|confirm (?:order|purchase)|buy now|purchase"),
+    ("delete", r"delete|remove (?:account|address|card)|close account"),
+    ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
+    ("upload", r"upload"),
+)
+# A hard-block verb matches as a leading phrase, so "Delete account" and
+# "Pay 49.99" count. The rest of the lexicon still matches the whole label.
+_HARD_COMPILED = tuple(
+    (verb, re.compile(rf"(?:{pattern})(?:\s|$)")) for verb, pattern in _HARD_LABELS
+)
 _COMPILED = tuple((verb, re.compile(rf"^(?:{pattern})$")) for verb, pattern in _VERBS)
+_AMOUNT = re.compile(r"\d+")
+_REDIRECT = frozenset({"next", "return", "return_to", "returnto", "returnurl", "redirect", "goto"})
 _VIEWS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?:^|/)(?:cart|bag|basket)(?:/|$)"), "cart"),
     (re.compile(r"(?:^|/)checkout(?:/|$)"), "checkout"),
@@ -85,10 +99,6 @@ _VIEWS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?:^|/)(?:product|item|p|dp)(?:/|$)"), "product"),
 )
 _LOGIN_PATH = re.compile(r"(?:^|/)(?:login|signin|sign-in|account/login|auth|session/new)(?:/|$)")
-_LOGIN_PARAM = re.compile(
-    r"(?:^|[?&])(?:next|return(?:_to|To|Url)?|redirect|goto)=([^&#]*)",
-    re.IGNORECASE,
-)
 _LOGIN_LABEL = re.compile(r"^(?:(?:sign|log) ?in to |login required|members only|account required)")
 
 
@@ -97,9 +107,12 @@ class Lexicon:
     """The fixed verb and route tables. Models may rename; they do not add verbs."""
 
     def verb(self, label: str) -> str | None:
-        text = normalize_label(label)
+        text = _strip_amounts(normalize_label(label))
         if not text:
             return None
+        for name, pattern in _HARD_COMPILED:
+            if pattern.match(text):
+                return name
         for name, pattern in _COMPILED:
             if pattern.fullmatch(text):
                 return name
@@ -138,9 +151,18 @@ class Lexicon:
         parsed = urlsplit(url)
         if _LOGIN_PATH.search(parsed.path or ""):
             return True
-        for match in _LOGIN_PARAM.finditer(url):
-            target = match.group(1)
-            target_path = urlsplit(target).path or target
-            if _LOGIN_PATH.search(target_path):
-                return True
+        # next/goto/redirect that points back at this site, not only at /login.
+        for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+            if key.lower() not in _REDIRECT or not value:
+                continue
+            target = urlsplit(value)
+            if target.scheme or target.netloc:
+                if target.netloc == parsed.netloc:
+                    return True
+                continue
+            return True
         return False
+
+
+def _strip_amounts(text: str) -> str:
+    return " ".join(part for part in text.split() if _AMOUNT.fullmatch(part) is None)

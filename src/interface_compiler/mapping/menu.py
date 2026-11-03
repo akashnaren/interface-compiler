@@ -5,7 +5,7 @@ from __future__ import annotations
 from interface_compiler.browser.facts import ElementFact
 from interface_compiler.extract.naming import slug
 from interface_compiler.mapping.button import map_button
-from interface_compiler.mapping.enabled import element_enabled
+from interface_compiler.mapping.enabled import element_enabled, usable
 from interface_compiler.mapping.link import map_link
 from interface_compiler.mapping.types import (
     MapContext,
@@ -66,10 +66,7 @@ def _actions(
                 if item.tag == "a" or item.role == "link"
                 else map_button(item, ctx)
             )
-            for action in mapped.affordances:
-                if action.x is not None:
-                    action.enabled = False
-                    action.x.reason = "menu closed"
+            _finish_item(mapped, item, ctx, closed=True)
             parts.append(mapped)
     elif items:
         for item in items:
@@ -78,6 +75,7 @@ def _actions(
                 if item.tag == "a" or item.role == "link"
                 else map_button(item, ctx)
             )
+            _finish_item(mapped, item, ctx, closed=False)
             parts.append(mapped)
     return merge_results(parts)
 
@@ -86,11 +84,7 @@ def _options(button: ElementFact, items: list[ElementFact], ctx: MapContext) -> 
     del ctx
     field = slug(button.name) or "option"
     closed = _closed(button, items)
-    visible = [
-        item.name
-        for item in items
-        if item.visible and not item.disabled and not item.aria_disabled and not item.hidden
-    ]
+    visible = [item.name for item in items if usable(item)]
     if closed or not visible:
         prop: dict[str, object] = {"type": "string"}
     else:
@@ -114,6 +108,19 @@ def _options(button: ElementFact, items: list[ElementFact], ctx: MapContext) -> 
         state={f"selected_{field}": selected},
         state_from={f"selected_{field}": "aria"},
     )
+
+
+def _finish_item(mapped: MapResult, item: ElementFact, ctx: MapContext, *, closed: bool) -> None:
+    blocked = ctx.lexicon.hard_block(ctx.lexicon.verb(item.name))
+    for action in mapped.affordances:
+        if action.x is None:
+            continue
+        if blocked:
+            action.enabled = False
+            action.x.reason = blocked
+        elif closed:
+            action.enabled = False
+            action.x.reason = "menu closed"
 
 
 def _closed(button: ElementFact, items: list[ElementFact]) -> bool:

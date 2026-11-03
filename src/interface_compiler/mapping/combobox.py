@@ -29,8 +29,10 @@ def map_combobox(element: ElementFact, ctx: MapContext) -> MapResult:
     del ctx
     field = field_name(element)
     values = enum_values(element)
-    open_popup = element.aria_expanded == "true" and bool(values)
-    always_open = element.role == "listbox" and element.aria_expanded is None and bool(values)
+    # Expanded is not enough: a hidden or zero-size listbox stays free text.
+    rendered = element.popup_open and bool(values)
+    open_popup = element.aria_expanded == "true" and rendered
+    always_open = element.role == "listbox" and element.aria_expanded is None and rendered
     if open_popup or always_open:
         prop: dict[str, object] = {"type": "string", "enum": values}
     else:

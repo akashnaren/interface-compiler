@@ -9,7 +9,7 @@ from interface_compiler.browser.facts import ElementFact
 from interface_compiler.contract.models import Locator
 from interface_compiler.extract.naming import plural, slug
 from interface_compiler.extract.repeats import RepeatGroup
-from interface_compiler.mapping.enabled import element_enabled
+from interface_compiler.mapping.enabled import element_enabled, group_enabled
 from interface_compiler.mapping.types import (
     MapContext,
     MapResult,
@@ -92,9 +92,7 @@ def _merge_entity(
             secondaries.setdefault(key, link)
     key = plural(entity)
     window, cursor = _window(records, 0)
-    visible = any(item.visible for item, _links in rows)
-    enabled = visible
-    reason = None if visible else "not visible"
+    enabled, reason = _group_enabled(rows)
     prop = f"{entity}_id"
     locator = Locator.model_validate(
         {
@@ -165,6 +163,12 @@ def _decode(cursor: str) -> tuple[str, int]:
     text = base64.urlsafe_b64decode(padded).decode()
     _kind, offset = text.split(":")
     return _kind, int(offset)
+
+
+def _group_enabled(
+    rows: list[tuple[ElementFact, list[ElementFact]]],
+) -> tuple[bool, str | None]:
+    return group_enabled([item for item, _links in rows])
 
 
 def _is_link(element: ElementFact) -> bool:

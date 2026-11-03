@@ -8,7 +8,12 @@
 
   <main aria-label="Story">
     <button id="vote" type="button">Log in to vote</button>
-    <a id="vote-link" href="/vote?id=1&amp;goto=/login">Vote</a>
+    <a id="vote-link" href="/vote?id=1&amp;goto=news">Vote</a>
+    <form id="comment" method="post" action="/comment?next=/item/3">
+      <label for="body">Comment</label>
+      <textarea id="body" name="body"></textarea>
+      <button id="post" type="submit">Continue</button>
+    </form>
     <form id="login" method="post" action="/login?next=/story">
       <label for="email">Email</label>
       <input id="email" type="email" name="email" required>

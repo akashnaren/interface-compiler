@@ -152,7 +152,13 @@ def link_id(element: ElementFact, ctx: MapContext) -> str:
 def login_gated(element: ElementFact, ctx: MapContext, affordance_id: str) -> bool:
     if affordance_id == "go_sign_in" or ctx.signed_in:
         return False
-    if ctx.lexicon.login_label(element.name) or ctx.lexicon.login_label(element.label_text):
+    texts = (
+        element.name,
+        element.label_text,
+        element.title,
+        element.described_by,
+    )
+    if any(text and ctx.lexicon.login_label(text) for text in texts):
         return True
     for target in (element.href, element.form_action):
         if target and ctx.lexicon.login_target(target):

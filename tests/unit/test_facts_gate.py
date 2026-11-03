@@ -158,7 +158,7 @@ def test_long_line_does_not_fail_close_a_later_button(facts_page: Page) -> None:
         "<!doctype html><title>line</title><style>body{margin:0}"
         "#line{white-space:nowrap;margin:0}"
         "#line a{display:inline-block;width:16px;height:19px}"
-        "#mask{position:fixed;left:200px;top:0;width:40px;height:19px}"
+        "#mask{position:fixed;left:0;top:0;width:20px;height:19px}"
         "#clear{position:absolute;top:80px;left:0;width:80px;height:24px}"
         f"</style><p id='line'>{links}</p><div id='mask'></div>"
         "<button id='clear' type='button'>Clear</button>",
@@ -166,31 +166,42 @@ def test_long_line_does_not_fail_close_a_later_button(facts_page: Page) -> None:
     )
     facts = collect_facts(facts_page)
     by_id = {element.html_id: element for element in facts.elements}
-    assert by_id["a0"].covered is False
-    assert by_id["a13"].covered is True
+    # a0 and a2 are inside the 12-hit budget. a0 sits on the mask.
+    assert by_id["a0"].covered is True
+    assert by_id["a2"].covered is False
     assert by_id["clear"].covered is False
 
 
-def test_many_inline_spans_do_not_kill_the_engine() -> None:
+def test_many_inline_runs_do_not_kill_the_engine() -> None:
     # Own process: a second Playwright in this process fights the session engine.
     script = """
 from interface_compiler.browser.engine import Engine
 from interface_compiler.browser.facts import collect_facts
 
+pages = [
+    "<p>" + ("<span>x</span>" * 30000) + "</p>",
+    "<p>" + ("<b>x</b>" * 30000) + "</p>",
+    "<div><template shadowrootmode='open'>" + ("<span>x</span>" * 30000) + "</template></div>",
+]
 engine = Engine()
 engine.start()
-page = engine.new_page()
 try:
-    page.set_content(
-        "<!doctype html><title>spans</title><style>body{margin:0}</style>"
-        "<p>" + ("<span>x</span>" * 30000) + "</p><button id='go' type='button'>Go</button>",
-        wait_until="domcontentloaded",
-    )
-    facts = collect_facts(page)
-    button = next(element for element in facts.elements if element.html_id == "go")
-    if engine.dead or not facts.truncated or not button.in_viewport or not button.covered:
-        raise SystemExit(2)
-    page.evaluate("() => 1")
+    for html in pages:
+        page = engine.new_page()
+        try:
+            page.set_content(
+                "<!doctype html><title>inline</title><style>body{margin:0}</style>"
+                + html
+                + "<button id='go' type='button'>Go</button>",
+                wait_until="domcontentloaded",
+            )
+            facts = collect_facts(page)
+            button = next(element for element in facts.elements if element.html_id == "go")
+            if engine.dead or not facts.truncated or not button.in_viewport or not button.covered:
+                raise SystemExit(2)
+            page.evaluate("() => 1")
+        finally:
+            page.context.close()
 finally:
     engine.close()
 """
@@ -199,6 +210,6 @@ finally:
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
     )
     assert completed.returncode == 0, completed.stderr

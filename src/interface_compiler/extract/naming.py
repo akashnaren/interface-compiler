@@ -47,20 +47,23 @@ def cryptic(name: str) -> bool:
 
 
 def field_name(element: ElementFact, *, index: int = 1) -> str:
-    """Label, then a readable name attribute, id, then ``field_<n>``."""
+    """Label, then an aliased name, placeholder, id, then ``field_<n>``."""
     label = slug(element.label_text) if element.label_text else ""
-    named = ""
-    if element.field_name and not cryptic(element.field_name):
-        named = slug(element.field_name)
     if label:
-        chosen = label
-    elif named:
-        chosen = named
-    elif element.html_id:
-        chosen = slug(element.html_id)
-    else:
-        chosen = f"field_{index}"
-    return alias(chosen or f"field_{index}")
+        return alias(label)
+    if element.field_name:
+        # Alias q -> query before the cryptic check, so a one-letter q survives.
+        aliased = alias(slug(element.field_name))
+        if aliased and not cryptic(aliased):
+            return aliased
+    placeholder = slug(element.placeholder) if element.placeholder else ""
+    if placeholder:
+        return alias(placeholder)
+    if element.html_id:
+        named = slug(element.html_id)
+        if named:
+            return alias(named)
+    return f"field_{index}"
 
 
 def plural(name: str) -> str:

@@ -10,6 +10,7 @@
   const pageTitle = document.title;
   const walkStarted = performance.now();
   let truncated = false;
+  let topModalEl = null;
   let indexFinished = false;
   // Selection, the index, and per-row flags stop on shares of the walk budget.
   // A later phase still runs after an earlier one sets truncated, so a slow
@@ -100,6 +101,18 @@
   const readShadowQueryAll = ShadowRoot.prototype.querySelectorAll;
 
   // Mixin getters (ParentNode.children) are not own properties of ShadowRoot.
+  function prototypeCall(object, name) {
+    let current = object;
+    while (current) {
+      const found = Object.getOwnPropertyDescriptor(current, name);
+      if (found && typeof found.value === "function") {
+        return found.value;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  }
+
   function prototypeGetter(object, name) {
     let current = object;
     while (current) {
@@ -115,6 +128,7 @@
   const readShadowRoot = prototypeGetter(Element.prototype, "shadowRoot");
   const readShadowHost = prototypeGetter(ShadowRoot.prototype, "host");
   const readShadowChildren = prototypeGetter(ShadowRoot.prototype, "children");
+  const readShadowFromPoint = prototypeCall(ShadowRoot.prototype, "elementFromPoint");
   // Piercing every node on a huge page costs more than the walk budget.
   // Above this, shadow content is omitted (fail closed) instead of scanned.
   const pierceLimit = 8000;
@@ -197,6 +211,31 @@
 
   function elementFromPoint(x, y) {
     return readElementFromPoint.call(document, x, y);
+  }
+
+  // elementFromPoint stops at a shadow host. Open roots are walked to the real
+  // target. A closed root throws or is null, and the host stays the hit.
+  function hitTarget(x, y) {
+    let hit = elementFromPoint(x, y);
+    const seen = new Set();
+    while (hit && !seen.has(hit)) {
+      seen.add(hit);
+      const root = openShadow(hit);
+      if (!root || !readShadowFromPoint) {
+        break;
+      }
+      let inner = null;
+      try {
+        inner = readShadowFromPoint.call(root, x, y);
+      } catch (error) {
+        break;
+      }
+      if (!inner || inner === hit) {
+        break;
+      }
+      hit = inner;
+    }
+    return hit;
   }
 
   function willValidate(el) {
@@ -286,6 +325,39 @@
     return document.getElementsByTagName("*").length <= pierceLimit;
   }
 
+  function lightHasOpenShadow() {
+    let nodes;
+    try {
+      nodes = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return true;
+    }
+    for (let index = 0; index < nodes.length; index += 1) {
+      if (openShadow(nodes[index])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function describedByText(el) {
+    const labelled = getAttribute(el, "aria-describedby");
+    if (!labelled) {
+      return "";
+    }
+    const parts = [];
+    for (const id of String(labelled).split(/\s+/)) {
+      if (!id) {
+        continue;
+      }
+      const target = elementById(id, el);
+      if (target) {
+        parts.push(ownText(target) || clean(textContent(target)));
+      }
+    }
+    return clean(parts.join(" "));
+  }
+
   // Light DOM plus open shadow roots. A closed root or a thrown read is skipped.
   function collectMatching(selector) {
     let nodes;
@@ -299,6 +371,10 @@
       found.push(nodes[index]);
     }
     if (!canPierceShadows()) {
+      // Open-shadow controls are not collected on a huge page. Say so.
+      if (lightHasOpenShadow()) {
+        truncated = true;
+      }
       return found;
     }
     const seen = new Set(found);
@@ -524,9 +600,9 @@
         return joined;
       }
     }
-    const placeholder = clean(getAttribute(el, "placeholder"));
-    if (placeholder) {
-      return placeholder;
+    const aria = clean(getAttribute(el, "aria-label"));
+    if (aria) {
+      return aria;
     }
     // A submit value is its name. The fieldset legend must not replace it.
     if (tagName(el) === "INPUT") {
@@ -954,6 +1030,90 @@
     return null;
   }
 
+  function renderedBox(el) {
+    if (!el) {
+      return false;
+    }
+    if (hasAttribute(el, "hidden") || closest(el, "[hidden]") !== null) {
+      return false;
+    }
+    let style;
+    try {
+      style = getComputedStyle(el);
+    } catch (error) {
+      return false;
+    }
+    if (style.display === "none" || style.visibility === "hidden") {
+      return false;
+    }
+    const rect = boundingRect(el);
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function optionPopup(el) {
+    if (tagName(el) === "SELECT" || getAttribute(el, "role") === "listbox") {
+      return el;
+    }
+    const controls = getAttribute(el, "aria-controls");
+    const id = controls ? controls.split(/\s+/).find(Boolean) : "";
+    const target = id ? elementById(id, el) : null;
+    if (target && (getAttribute(target, "role") === "listbox" || query(target, "[role='option']"))) {
+      return target;
+    }
+    return null;
+  }
+
+  function popupRendered(el) {
+    if (tagName(el) === "SELECT") {
+      return true;
+    }
+    return renderedBox(optionPopup(el));
+  }
+
+  function controlType(el) {
+    const tag = tagName(el);
+    if (tag === "INPUT") {
+      return (getAttribute(el, "type") || "text").toLowerCase();
+    }
+    if (tag === "BUTTON") {
+      return (getAttribute(el, "type") || "submit").toLowerCase();
+    }
+    return null;
+  }
+
+  function topmostModal(modals) {
+    if (!modals.length) {
+      return null;
+    }
+    const hit = hitTarget(1, 1);
+    let node = hit;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      if (modals.includes(node)) {
+        return node;
+      }
+      seen.add(node);
+      node = parentNodeAcross(node);
+    }
+    return modals[modals.length - 1];
+  }
+
+  function inTopModal(el) {
+    if (!topModalEl) {
+      return false;
+    }
+    let node = el;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      if (node === topModalEl) {
+        return true;
+      }
+      seen.add(node);
+      node = parentNodeAcross(node);
+    }
+    return false;
+  }
+
   function optionsOf(el) {
     if (tagName(el) === "SELECT") {
       return Array.from(el.options, (opt) => ({
@@ -1117,13 +1277,89 @@
   const longRunMs = 40;
   const slowHitMs = 80;
 
+  const phrasingSelector = [
+    "a",
+    "abbr",
+    "b",
+    "bdi",
+    "bdo",
+    "br",
+    "cite",
+    "code",
+    "data",
+    "dfn",
+    "em",
+    "i",
+    "kbd",
+    "mark",
+    "q",
+    "s",
+    "samp",
+    "small",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "time",
+    "u",
+    "var",
+    "wbr",
+  ].join(",");
+
+  function phrasingCount() {
+    let count = 0;
+    try {
+      count = document.querySelectorAll(phrasingSelector).length;
+    } catch (error) {
+      return 12001;
+    }
+    if (count > 12000 || !canPierceShadows()) {
+      return count;
+    }
+    const stack = [];
+    const seen = new Set();
+    let hosts;
+    try {
+      hosts = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return count;
+    }
+    for (let index = 0; index < hosts.length; index += 1) {
+      const shadow = openShadow(hosts[index]);
+      if (shadow) {
+        stack.push(shadow);
+      }
+    }
+    while (stack.length && count <= 12000) {
+      const root = stack.pop();
+      if (seen.has(root)) {
+        continue;
+      }
+      seen.add(root);
+      try {
+        count += readShadowQueryAll.call(root, phrasingSelector).length;
+        const inner = readShadowQueryAll.call(root, "*");
+        for (let index = 0; index < inner.length && count <= 12000; index += 1) {
+          const shadow = openShadow(inner[index]);
+          if (shadow) {
+            stack.push(shadow);
+          }
+        }
+      } catch (error) {
+        // Unreadable root: stop counting it. The hit test stays fail-closed.
+      }
+    }
+    return count;
+  }
+
   function hugeHitTarget() {
-    // 30k inline spans make one hit outlast the engine deadline. Fail closed
-    // before that call. A 4000-row table stays under the element ceiling.
-    return (
-      document.getElementsByTagName("span").length > 12000 ||
-      document.getElementsByTagName("*").length > 60000
-    );
+    // One elementFromPoint walks every inline box. Phrasing runs, including
+    // ones inside open shadow roots, skip the call. A 4000-row table stays
+    // under both ceilings.
+    if (document.getElementsByTagName("*").length > 60000) {
+      return true;
+    }
+    return phrasingCount() > 12000;
   }
 
   function failClosedHits(flags, points, from) {
@@ -1196,7 +1432,7 @@
         }
         const point = list[seen];
         const callStarted = performance.now();
-        flags[point.index] = coveredBy(els[point.index], elementFromPoint(point.x, point.y));
+        flags[point.index] = coveredBy(els[point.index], hitTarget(point.x, point.y));
         if (performance.now() - callStarted > slowHitMs) {
           seen += 1;
           break;
@@ -1482,7 +1718,7 @@
       fallbackName(el),
       elementId(el) || null,
       getAttribute(el, "name"),
-      tagName(el) === "INPUT" ? (getAttribute(el, "type") || "text").toLowerCase() : null,
+      controlType(el),
       tagName(el) === "A" && hasAttribute(el, "href") ? el.href : null,
       formIndex(el),
       binding.form_method,
@@ -1518,10 +1754,11 @@
       labelText(el),
       groupKey(el),
       constraintsOf(el),
-      closestAcross(
-        el,
-        "dialog[open], [role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
-      ) !== null,
+      inTopModal(el),
+      popupRendered(el),
+      clean(getAttribute(el, "placeholder")),
+      clean(getAttribute(el, "title")),
+      describedByText(el),
     ];
   }
 
@@ -1648,31 +1885,72 @@
     "group_key",
     "constraints",
     "in_dialog",
+    "popup_open",
+    "placeholder",
+    "title",
+    "described_by",
   ];
   const covered = coverageOf(kept, keptRects);
-  const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map((form, index) => ({
-    index,
-    method: (getAttribute(form, "method") || "get").toLowerCase(),
-    action: readFormAction.call(form),
-    // :invalid does not fire invalid listeners. form.checkValidity is skipped
-    // because a control named checkValidity replaces the method.
-    valid: !elementMatches(form, ":invalid"),
-    html_id: elementId(form) || null,
-  }));
+  const keptAt = new Map();
+  for (let index = 0; index < kept.length; index += 1) {
+    keptAt.set(kept[index], index);
+  }
+  function fieldsetDisabled(form) {
+    if (closestAcross(form, "fieldset[disabled]") !== null) {
+      return true;
+    }
+    let controls;
+    try {
+      controls = queryAll(form, "input, select, textarea, button");
+    } catch (error) {
+      return true;
+    }
+    for (let index = 0; index < controls.length; index += 1) {
+      if (closestAcross(controls[index], "fieldset[disabled]") !== null) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map(
+    (form, index) => {
+      const at = keptAt.get(form);
+      if (!styleHidden.has(form)) {
+        try {
+          applyRowFlags(form);
+        } catch (error) {
+          flagInert.set(form, true);
+        }
+      }
+      const rect = at === undefined ? boundingRect(form) : keptRects[at];
+      const visible = styleHidden.has(form) ? isVisible(form, rect) : false;
+      return {
+        index,
+        method: (getAttribute(form, "method") || "get").toLowerCase(),
+        action: readFormAction.call(form),
+        // :invalid does not fire invalid listeners. form.checkValidity is skipped
+        // because a control named checkValidity replaces the method.
+        valid: !elementMatches(form, ":invalid"),
+        html_id: elementId(form) || null,
+        visible,
+        hidden: flagHidden.get(form) === true || !visible,
+        inert: flagInert.get(form) === true,
+        covered: at !== undefined && covered[at] === true,
+        disabled: fieldsetDisabled(form),
+      };
+    },
+  );
 
   const modals = [];
   const seen = new Set();
+  const modalRoles = new Map();
   function pushModal(el, role) {
     if (seen.has(el) || !isVisible(el, boundingRect(el))) {
       return;
     }
     seen.add(el);
-    modals.push({
-      html_id: elementId(el) || null,
-      role,
-      name: accName(el),
-      open: true,
-    });
+    modals.push(el);
+    modalRoles.set(el, role);
   }
   for (const dialog of collectMatching("dialog[open]")) {
     if (elementMatches(dialog, ":modal")) {
@@ -1684,6 +1962,14 @@
   )) {
     pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
   }
+  topModalEl = topmostModal(modals);
+  const modalRecords = modals.map((el) => ({
+    html_id: elementId(el) || null,
+    role: modalRoles.get(el) || "dialog",
+    name: accName(el),
+    open: true,
+    top: el === topModalEl,
+  }));
 
   // Stringify in slices so a late clock keeps the rows already copied.
   // Each piece is one JSON array. Python reads them one at a time and stops
@@ -1776,7 +2062,7 @@
     meta: JSON.stringify({
       fields,
       forms,
-      modals,
+      modals: modalRecords,
       url: pageUrl,
       title: pageTitle,
       truncated,

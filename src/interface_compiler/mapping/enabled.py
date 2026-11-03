@@ -22,7 +22,9 @@ def element_enabled(
         return False, "aria-disabled"
     if element.inert:
         return False, "inert"
-    if element.covered and not element.in_dialog:
+    # Only a top-modal control that is itself the hit target is exempt, and
+    # that control is already not covered. Every other hit stays covered.
+    if element.covered:
         return False, "covered"
     if login_gated:
         return False, "requires sign-in"
@@ -33,3 +35,18 @@ def element_enabled(
     if readonly or element.readonly:
         return False, "read-only"
     return True, None
+
+
+def usable(element: ElementFact) -> bool:
+    """True when the universal rules would leave this item enabled."""
+    enabled, _reason = element_enabled(element)
+    return enabled
+
+
+def group_enabled(elements: list[ElementFact]) -> tuple[bool, str | None]:
+    """A group is enabled only when at least one item is usable."""
+    if any(usable(element) for element in elements):
+        return True, None
+    if not elements:
+        return False, "not visible"
+    return element_enabled(elements[0])

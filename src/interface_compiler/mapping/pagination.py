@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from interface_compiler.browser.facts import ElementFact
-from interface_compiler.mapping.enabled import element_enabled
+from interface_compiler.mapping.enabled import element_enabled, group_enabled, usable
 from interface_compiler.mapping.types import (
     MapContext,
     MapResult,
@@ -16,7 +16,7 @@ from interface_compiler.mapping.types import (
 
 def map_pagination(links: list[ElementFact], ctx: MapContext) -> MapResult:
     result = MapResult()
-    numbers: list[int] = []
+    page_links: list[ElementFact] = []
     current: int | None = None
     for element in links:
         verb = ctx.lexicon.verb(element.name)
@@ -27,27 +27,30 @@ def map_pagination(links: list[ElementFact], ctx: MapContext) -> MapResult:
             result.affordances.append(_step("prev_page", element))
             continue
         if element.name.strip().isdigit():
-            number = int(element.name.strip())
-            if element.visible:
-                numbers.append(number)
+            page_links.append(element)
             if element.aria_current:
-                current = number
-    if numbers:
+                current = int(element.name.strip())
+    if page_links:
+        numbers = [int(element.name.strip()) for element in page_links if usable(element)]
+        enabled, reason = group_enabled(page_links)
+        page_prop: dict[str, object] = (
+            {"type": "integer", "enum": numbers} if numbers else {"type": "integer"}
+        )
         result.affordances.append(
             affordance(
                 "go_page",
-                enabled=True,
-                schema=input_schema(
-                    {"page": {"type": "integer", "enum": numbers}},
-                    ["page"],
-                ),
+                enabled=enabled and bool(numbers),
+                schema=input_schema({"page": page_prop}, ["page"]),
                 label="page",
                 locator=ax_locator(
-                    links[0], kind="group", options={str(number): str(number) for number in numbers}
+                    page_links[0],
+                    kind="group",
+                    options={str(number): str(number) for number in numbers},
                 ),
                 grain="field",
                 tag="safe",
-                signature=stable_signature("pagination", "go_page", links[0].landmark),
+                reason=None if enabled and numbers else (reason or "not visible"),
+                signature=stable_signature("pagination", "go_page", page_links[0].landmark),
             )
         )
     if current is not None:

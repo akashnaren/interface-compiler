@@ -160,6 +160,10 @@ class ElementFact:
     constraints: Constraints
     name_source: Literal["ax", "html"]
     in_dialog: bool = False
+    popup_open: bool = False
+    placeholder: str = ""
+    title: str = ""
+    described_by: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +173,11 @@ class FormFact:
     action: str
     valid: bool
     html_id: str | None
+    visible: bool = True
+    hidden: bool = False
+    inert: bool = False
+    covered: bool = False
+    disabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +186,7 @@ class ModalFact:
     role: str
     name: str
     open: bool
+    top: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -996,7 +1006,16 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
         ),
         name_source=name_source,
         in_dialog=_req(item, "in_dialog", bool),
+        popup_open=item.get("popup_open") is True,
+        placeholder=_text(item, "placeholder"),
+        title=_text(item, "title"),
+        described_by=_text(item, "described_by"),
     )
+
+
+def _text(item: dict[str, Any], key: str) -> str:
+    value = item.get(key)
+    return value if isinstance(value, str) else ""
 
 
 def _option(item: object) -> OptionFact:
@@ -1018,6 +1037,11 @@ def _form(item: object) -> FormFact:
         action=_req(item, "action", str),
         valid=_req(item, "valid", bool),
         html_id=_opt(item, "html_id", str),
+        visible=item.get("visible") is not False,
+        hidden=item.get("hidden") is True,
+        inert=item.get("inert") is True,
+        covered=item.get("covered") is True,
+        disabled=item.get("disabled") is True,
     )
 
 
@@ -1029,6 +1053,7 @@ def _modal(item: object) -> ModalFact:
         role=_req(item, "role", str),
         name=_req(item, "name", str),
         open=_req(item, "open", bool),
+        top=item.get("top") is True,
     )
 
 

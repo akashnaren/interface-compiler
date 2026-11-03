@@ -62,9 +62,20 @@ def map_facts(facts: PageFacts, ctx: MapContext | None = None) -> MapResult:
         if mapped is not None:
             parts.append(mapped)
     result = merge_results(parts)
-    if facts.modals:
-        result = apply_dialog(result, facts.modals[0], context)
+    top = _top_modal(facts.modals)
+    if top is not None:
+        result = apply_dialog(result, top, context)
     return result
+
+
+def _top_modal(modals: tuple) -> object:
+    """The topmost modal, not whichever dialog the document listed first."""
+    if not modals:
+        return None
+    for modal in modals:
+        if modal.top:
+            return modal
+    return modals[-1]
 
 
 def _menus(elements: list[ElementFact], used: set[int], ctx: MapContext) -> list[MapResult]:

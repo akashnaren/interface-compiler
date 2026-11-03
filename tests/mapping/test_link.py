@@ -15,9 +15,9 @@ from tests.mapping._find import one
     ],
 )
 def test_link(
-    map_page, html_id: str, affordance_id: str, enabled: bool, reason: str | None
+    mapped_once, html_id: str, affordance_id: str, enabled: bool, reason: str | None
 ) -> None:
-    result, facts = map_page("link.html")
+    result, facts = mapped_once("link.html")
     element = next(item for item in facts.elements if item.html_id == html_id)
     mapped = one(result, affordance_id)
     assert mapped.enabled is enabled
