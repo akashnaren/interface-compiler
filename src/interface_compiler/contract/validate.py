@@ -16,6 +16,9 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from pydantic import BaseModel
 from referencing import Registry, Resource
 
+from interface_compiler.checker.verified import verified_errors
+from interface_compiler.contract.patterns import backtracking_risk
+
 _SCHEMA_FILES = {
     "view-doc": "view-doc.v1.json",
     "effect": "effect.v1.json",
@@ -29,6 +32,10 @@ _PATTERN_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 _PATTERN_ECHO_LIMIT = 80
 # Contract errors quote the failing value. A long quote is cut to about this.
 _VALUE_ECHO_LIMIT = 200
+# Key names and path segments are untrusted. One long key must not become the
+# whole ContractError. The final message is capped again after that.
+_SEGMENT_LIMIT = 80
+_MESSAGE_LIMIT = 400
 # jsonschema follows items/$ref recursively and overflows the stack on a
 # chain a few hundred levels deep. Stop before that walk.
 _MAX_SCHEMA_DEPTH = 32
@@ -143,6 +150,9 @@ def _validate(name: str, instance: object) -> None:
         *_exact_id_errors(instance),
         *_duplicate_id_errors(instance),
         *_affordance_constraint_errors(instance),
+        # Mutating actions on a real site cannot be probed_ok. Enforced here so
+        # a later look cannot validate a document that skipped the checker.
+        *verified_errors(instance),
     ]
     if errors:
         raise ContractError(errors[0], errors=errors)
@@ -160,14 +170,16 @@ def _raise_if_invalid(validator: Draft202012Validator, instance: object) -> None
 
 
 def _error_message(error: ValidationError) -> str:
-    location = "/".join(str(part) for part in error.absolute_path)
-    where = location or "<root>"
+    parts = [_cap_text(str(part), _SEGMENT_LIMIT) for part in error.absolute_path]
+    where = "/".join(parts) if parts else "<root>"
     detail = error.message
     if len(detail) > _VALUE_ECHO_LIMIT:
         rendered = repr(error.instance)
         if len(rendered) > _VALUE_ECHO_LIMIT and rendered in detail:
             detail = detail.replace(rendered, _truncate_repr(rendered), 1)
-    return f"{where}: {detail}"
+    if len(detail) > _SEGMENT_LIMIT:
+        detail = _cap_quoted(detail, _SEGMENT_LIMIT)
+    return _cap_text(f"{where}: {detail}", _MESSAGE_LIMIT)
 
 
 @lru_cache(maxsize=1)
@@ -265,13 +277,50 @@ def _input_object_errors(schema: object, where: str) -> list[str]:
 
 
 def _compile_pattern(pattern: str) -> ContractError | None:
-    """Return a contract error when Python cannot compile ``pattern``."""
+    """Return a contract error when ``pattern`` cannot be compiled or matched safely."""
     try:
         re.compile(pattern)
     except _PATTERN_COMPILE_ERRORS as exc:
         message = f"{_echo_pattern(pattern)} is not a valid regular expression ({exc})"
         return ContractError(message, errors=[message])
+    reason = backtracking_risk(pattern)
+    if reason is not None:
+        message = f"{_echo_pattern(pattern)} is rejected ({reason})"
+        return ContractError(message, errors=[message])
     return None
+
+
+def _cap_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return f"{text[: limit - 3]}..."
+
+
+def _cap_quoted(text: str, limit: int) -> str:
+    """Cut a quoted key or value so the surrounding sentence stays intact."""
+    parts: list[str] = []
+    index = 0
+    size = len(text)
+    while index < size:
+        quote = text[index]
+        if quote not in {"'", '"'}:
+            parts.append(quote)
+            index += 1
+            continue
+        cursor = index + 1
+        while cursor < size:
+            if text[cursor] == "\\":
+                cursor += 2
+                continue
+            if text[cursor] == quote:
+                cursor += 1
+                break
+            cursor += 1
+        parts.append(_cap_text(text[index:cursor], limit))
+        index = min(cursor, size)
+    return "".join(parts)
 
 
 def _echo_pattern(pattern: str) -> str:
@@ -288,6 +337,12 @@ def _echo_value(value: object) -> str:
 def _truncate_repr(rendered: str) -> str:
     if len(rendered) <= _VALUE_ECHO_LIMIT:
         return rendered
+    quote = rendered[0] if rendered else ""
+    if quote in {"'", '"'} and rendered[-1] == quote:
+        # Keep the closer. An open quote would swallow the rest of the sentence
+        # when a later pass caps quoted keys.
+        keep = max(_VALUE_ECHO_LIMIT - 4, 1)
+        return f"{quote}{rendered[1:keep]}...{quote}"
     return f"{rendered[:_VALUE_ECHO_LIMIT]}..."
 
 

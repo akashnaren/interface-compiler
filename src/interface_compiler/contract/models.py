@@ -15,9 +15,11 @@ from pydantic import (
     model_validator,
 )
 
+from interface_compiler.checker.verified import probed_ok_refusal
 from interface_compiler.contract.validate import (
     ContractError,
     _compile_pattern,
+    _echo_value,
     _guard_json_document,
     _json_copy,
     _schema_nesting_errors,
@@ -28,6 +30,12 @@ from interface_compiler.contract.validate import (
 
 _ID = r"^[a-z][a-z0-9_]*$"
 _NULLABLE_FIELDS = frozenset({"match", "main_status", "blocked", "total", "next"})
+_VERIFIED_STATES = (
+    "unverified",
+    "probed_ok",
+    "probed_failed",
+    "stopped_before_commit",
+)
 
 
 def _is_scalar(value: object) -> bool:
@@ -185,6 +193,21 @@ class AffordanceX(BaseModel):
         | None
     ) = None
     verified_at: str | None = None
+
+    def set_verified(self, status: str, *, page_url: str | None) -> None:
+        """Record a probe outcome for this affordance.
+
+        ``probed_ok`` is refused when the tag is missing or ``mutating`` and
+        ``page_url`` is not a loopback fixture host. The field is left unchanged
+        when the outcome is refused.
+        """
+        if status not in _VERIFIED_STATES:
+            message = f"verified {_echo_value(status)} is not a probe outcome"
+            raise ContractError(message, errors=[message])
+        message = probed_ok_refusal(self.tag, status, page_url=page_url)
+        if message is not None:
+            raise ContractError(message, errors=[message])
+        self.verified = status
 
 
 class Affordance(BaseModel):
