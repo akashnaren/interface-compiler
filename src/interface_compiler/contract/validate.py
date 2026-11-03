@@ -75,12 +75,18 @@ def validate_args(affordance: object, args: object) -> None:
         message = "<root>: args must be a JSON object"
         raise ContractError(message, errors=[message])
     schema = _input_schema(affordance)
+    schema_errors = _input_object_errors(schema, "input")
+    if schema_errors:
+        raise ContractError(schema_errors[0], errors=schema_errors)
     try:
         validator = Draft202012Validator(schema, format_checker=_format_checker())
+        _raise_if_invalid(validator, args)
     except SchemaError as exc:
         message = f"input: {exc.message}"
         raise ContractError(message, errors=[message]) from exc
-    _raise_if_invalid(validator, args)
+    except re.error as exc:
+        message = f"input: invalid regular expression ({exc})"
+        raise ContractError(message, errors=[message]) from exc
 
 
 def _input_schema(affordance: object) -> dict[str, Any]:
@@ -100,9 +106,13 @@ def _input_schema(affordance: object) -> dict[str, Any]:
 
 def _validate(name: str, instance: object) -> None:
     _raise_if_invalid(_validator(name), instance)
-    id_errors = _exact_id_errors(instance)
-    if id_errors:
-        raise ContractError(id_errors[0], errors=id_errors)
+    errors = [
+        *_exact_id_errors(instance),
+        *_duplicate_id_errors(instance),
+        *_affordance_constraint_errors(instance),
+    ]
+    if errors:
+        raise ContractError(errors[0], errors=errors)
 
 
 def _raise_if_invalid(validator: Draft202012Validator, instance: object) -> None:
@@ -151,6 +161,84 @@ def _exact_id_errors(instance: object, *, prefix: str = "") -> list[str]:
     doc = instance.get("doc")
     if isinstance(doc, Mapping):
         errors.extend(_exact_id_errors(doc, prefix=f"{prefix}doc/"))
+    return errors
+
+
+def _duplicate_id_errors(instance: object, *, prefix: str = "") -> list[str]:
+    """Reject a second affordance that reuses an id already present."""
+    if not isinstance(instance, Mapping):
+        return []
+    errors: list[str] = []
+    affordances = instance.get("affordances")
+    if isinstance(affordances, list):
+        seen: dict[str, int] = {}
+        for index, item in enumerate(affordances):
+            if not isinstance(item, Mapping):
+                continue
+            ident = item.get("id")
+            if not isinstance(ident, str):
+                continue
+            previous = seen.get(ident)
+            if previous is None:
+                seen[ident] = index
+                continue
+            where = f"{prefix}affordances/{index}/id"
+            also = f"{prefix}affordances/{previous}/id"
+            errors.append(f"{where}: duplicate id {ident!r} (also at {also})")
+    doc = instance.get("doc")
+    if isinstance(doc, Mapping):
+        errors.extend(_duplicate_id_errors(doc, prefix=f"{prefix}doc/"))
+    return errors
+
+
+def _affordance_constraint_errors(instance: object, *, prefix: str = "") -> list[str]:
+    """Reject input schemas whose patterns or required names cannot be applied."""
+    if not isinstance(instance, Mapping):
+        return []
+    errors: list[str] = []
+    affordances = instance.get("affordances")
+    if isinstance(affordances, list):
+        for index, item in enumerate(affordances):
+            if not isinstance(item, Mapping):
+                continue
+            where = f"{prefix}affordances/{index}/input"
+            errors.extend(_input_object_errors(item.get("input"), where))
+    doc = instance.get("doc")
+    if isinstance(doc, Mapping):
+        errors.extend(_affordance_constraint_errors(doc, prefix=f"{prefix}doc/"))
+    return errors
+
+
+def _input_object_errors(schema: object, where: str) -> list[str]:
+    if not isinstance(schema, Mapping):
+        return []
+    errors: list[str] = []
+    properties = schema.get("properties")
+    known = properties if isinstance(properties, Mapping) else {}
+    required = schema.get("required")
+    if isinstance(required, list):
+        for index, name in enumerate(required):
+            if isinstance(name, str) and name not in known:
+                errors.append(f"{where}/required/{index}: {name!r} is not a property")
+    if isinstance(properties, Mapping):
+        for key, prop in properties.items():
+            errors.extend(_prop_errors(prop, f"{where}/properties/{key}"))
+    return errors
+
+
+def _prop_errors(prop: object, where: str) -> list[str]:
+    if not isinstance(prop, Mapping):
+        return []
+    errors: list[str] = []
+    pattern = prop.get("pattern")
+    if isinstance(pattern, str):
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            errors.append(f"{where}/pattern: {pattern!r} is not a valid regular expression ({exc})")
+    items = prop.get("items")
+    if items is not None:
+        errors.extend(_prop_errors(items, f"{where}/items"))
     return errors
 
 

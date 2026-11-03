@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, Self
 
@@ -55,6 +56,17 @@ class Prop(BaseModel):
     multipleOf: int | float | None = None
     items: Prop | None = None
 
+    @field_validator("pattern")
+    @classmethod
+    def _pattern_compiles(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"{value!r} is not a valid regular expression ({exc})") from exc
+        return value
+
     @field_validator("enum")
     @classmethod
     def _enum_non_empty(cls, value: list[Any] | None) -> list[Any] | None:
@@ -102,6 +114,16 @@ class InputSchema(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("required items must be unique")
         return value
+
+    @model_validator(mode="after")
+    def _required_names_properties(self) -> Self:
+        if self.required is None:
+            return self
+        missing = [name for name in self.required if name not in self.properties]
+        if missing:
+            names = ", ".join(missing)
+            raise ValueError(f"required entries not in properties: {names}")
+        return self
 
 
 class Locator(BaseModel):
@@ -339,7 +361,7 @@ class Effect(BaseModel):
 
     predicted: Predicted
     observed: Observed
-    match: bool | None
+    match: StrictBool | None
     blocked_requests: list[BlockedRequest]
     demoted: list[Demotion]
 
@@ -349,7 +371,7 @@ class ClientValidation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    valid: bool
+    valid: StrictBool
     messages: list[str]
 
 
@@ -379,12 +401,12 @@ class Counters(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    illegal: int
-    malformed: int
-    ignored: int
-    stale: int
-    blocked: int
-    acts: int
+    illegal: StrictInt
+    malformed: StrictInt
+    ignored: StrictInt
+    stale: StrictInt
+    blocked: StrictInt
+    acts: StrictInt
 
 
 class ActResult(BaseModel):

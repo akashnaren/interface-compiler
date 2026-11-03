@@ -12,6 +12,7 @@ from interface_compiler.cli import app
 from interface_compiler.contract import (
     ActResult,
     ContractError,
+    Effect,
     ViewDoc,
     ablate,
     count_tokens,
@@ -25,6 +26,7 @@ from interface_compiler.contract import (
     validate_doc,
     validate_effect,
 )
+from interface_compiler.contract.models import ClientValidation, Counters
 
 ROOT = Path(__file__).resolve().parents[2]
 PAPER_PATH = ROOT / "tests" / "fixtures" / "paper_example.json"
@@ -477,3 +479,107 @@ def test_contract_model_rejects_required_null() -> None:
     doc["affordances"][0]["input"]["required"] = None
     with pytest.raises(ValidationError):
         ViewDoc.model_validate(doc)
+
+
+def test_contract_invalid_pattern_rejected() -> None:
+    doc = _paper()
+    doc["affordances"][1]["input"]["properties"]["size"]["pattern"] = "("
+    with pytest.raises(ContractError) as exc:
+        validate_doc(doc)
+    assert "affordances/1/input/properties/size/pattern" in str(exc.value)
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate(doc)
+    with pytest.raises(ValidationError):
+        ViewDoc.model_validate_json(json.dumps(doc))
+
+    nested = _paper()
+    nested["affordances"][1]["input"]["properties"]["tags"] = {
+        "type": "array",
+        "items": {"type": "string", "pattern": "("},
+    }
+    with pytest.raises(ContractError) as exc:
+        validate_doc(nested)
+    assert "affordances/1/input/properties/tags/items/pattern" in str(exc.value)
+
+    valid = _paper()
+    valid["affordances"][1]["input"]["properties"]["size"]["pattern"] = "^[SML]$"
+    validate_doc(valid)
+    validate_args(valid["affordances"][1], {"size": "L"})
+
+
+def test_contract_validate_args_invalid_pattern_is_contract_error() -> None:
+    affordance = {
+        "id": "set_size",
+        "enabled": True,
+        "input": {
+            "type": "object",
+            "properties": {"size": {"type": "string", "pattern": "("}},
+            "required": ["size"],
+        },
+    }
+    with pytest.raises(ContractError) as exc:
+        validate_args(affordance, {"size": "L"})
+    assert "pattern" in str(exc.value)
+
+
+def test_contract_duplicate_affordance_ids_rejected() -> None:
+    doc = _paper()
+    clone = json.loads(json.dumps(doc["affordances"][6]))
+    clone["enabled"] = True
+    doc["affordances"].append(clone)
+    with pytest.raises(ContractError) as exc:
+        validate_doc(doc)
+    message = str(exc.value)
+    assert "pay" in message
+    assert "affordances/7/id" in message
+
+
+def test_contract_duplicate_affordance_ids_in_act_doc_rejected() -> None:
+    result = _act_result()
+    clone = json.loads(json.dumps(result["doc"]["affordances"][6]))
+    clone["enabled"] = True
+    result["doc"]["affordances"].append(clone)
+    with pytest.raises(ContractError) as exc:
+        validate_effect(result)
+    message = str(exc.value)
+    assert "pay" in message
+    assert "doc/affordances/7/id" in message
+
+
+def test_contract_required_must_name_a_property() -> None:
+    doc = _paper()
+    doc["affordances"][1]["input"]["required"] = ["color"]
+    with pytest.raises(ContractError) as exc:
+        validate_doc(doc)
+    assert "affordances/1/input/required/0" in str(exc.value)
+    assert "color" in str(exc.value)
+
+    result = _act_result()
+    result["doc"]["affordances"][1]["input"]["required"] = ["color"]
+    with pytest.raises(ContractError) as exc:
+        validate_effect(result)
+    assert "doc/affordances/1/input/required/0" in str(exc.value)
+
+
+def test_contract_model_strict_act_scalars() -> None:
+    with pytest.raises(ValidationError):
+        ClientValidation.model_validate({"valid": "true", "messages": []})
+    with pytest.raises(ValidationError):
+        ClientValidation.model_validate({"valid": 1, "messages": []})
+    effect = _act_result()["effect"]
+    effect["match"] = "true"
+    with pytest.raises(ValidationError):
+        Effect.model_validate(effect)
+    effect["match"] = 1
+    with pytest.raises(ValidationError):
+        Effect.model_validate(effect)
+    counters = {
+        "illegal": 0,
+        "malformed": 0,
+        "ignored": 0,
+        "stale": 0,
+        "blocked": 0,
+        "acts": "1",
+    }
+    with pytest.raises(ValidationError):
+        Counters.model_validate(counters)
