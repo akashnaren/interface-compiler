@@ -1179,35 +1179,41 @@ def test_facts_ancestor_disabled_controls(html: str, html_id: str, facts_page: P
             assert host.options[0].disabled is True
 
 
-def _ax_disabled_property(tree: object) -> bool | None:
+def _ax_state(tree: object) -> tuple[bool | None, bool]:
     nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    disabled: bool | None = None
+    ignored = False
     if not isinstance(nodes, list):
-        return None
+        return None, False
     for node in nodes:
-        if not isinstance(node, dict) or node.get("ignored") is True:
+        if not isinstance(node, dict):
+            continue
+        if node.get("ignored") is True:
+            ignored = True
+            continue
+        if disabled is not None:
             continue
         properties = node.get("properties")
         if not isinstance(properties, list):
-            return None
+            continue
         for prop in properties:
             if not isinstance(prop, dict) or prop.get("name") != "disabled":
                 continue
             value = prop.get("value")
             if isinstance(value, dict) and isinstance(value.get("value"), bool):
-                return value["value"]
-            return None
-        return None
-    return None
+                disabled = value["value"]
+            break
+    return disabled, ignored
 
 
-def _ax_disabled_by_id(page: Page, html_ids: list[str]) -> dict[str, bool | None]:
+def _ax_states_by_id(page: Page, html_ids: list[str]) -> dict[str, tuple[bool | None, bool]]:
     session = page.context.new_cdp_session(page)
     try:
         session.send("Accessibility.enable")
         session.send("DOM.enable")
         document = session.send("DOM.getDocument", {"depth": 0})
         root = document["root"]["nodeId"]
-        found: dict[str, bool | None] = {}
+        found: dict[str, tuple[bool | None, bool]] = {}
         for html_id in html_ids:
             queried = session.send(
                 "DOM.querySelector",
@@ -1221,7 +1227,7 @@ def _ax_disabled_by_id(page: Page, html_ids: list[str]) -> dict[str, bool | None
                     "fetchRelatives": False,
                 },
             )
-            found[html_id] = _ax_disabled_property(tree)
+            found[html_id] = _ax_state(tree)
         return found
     finally:
         session.detach()
@@ -1312,8 +1318,12 @@ def _require_selector(page: Page, facts: PageFacts, label: str, *, required: boo
     assert _text_at(page, element.css) == label
 
 
+# The accessibility tree omits disabled on these. Reporting them disabled is fail-closed.
+_AX_OMITS_DISABLED = frozenset({"plainbox", "roleplain", "hidhead"})
+
+
 @pytest.mark.parametrize(
-    ("case", "disabled", "aria_disabled"),
+    ("case", "disabled", "aria_disabled", "aria_hidden"),
     [
         (
             "legend",
@@ -1326,6 +1336,7 @@ def _require_selector(page: Page, facts: PageFacts, label: str, *, required: boo
                 "out": True,
                 "leg2": True,
             },
+            {},
             {},
         ),
         (
@@ -1344,18 +1355,35 @@ def _require_selector(page: Page, facts: PageFacts, label: str, *, required: boo
                 "tool": True,
                 "item": True,
                 "yes": True,
+                "foo": True,
+                "sptrue": True,
+                "truetr": True,
+                "falsetr": True,
+                "ancfoo": True,
+                "ancsp": True,
+                "ancfs": True,
+                "ownfalse": False,
+                "uptrue": True,
+                "grptrue": True,
+                "anctrue": True,
+                "undef": True,
+                "yesword": True,
                 "plainbox": True,
+                "roleplain": True,
+                "hidhead": True,
             },
+            {"hidfalse": True, "hidlink": True},
         ),
-        ("dup-id", {}, {}),
-        ("dup-name", {}, {}),
-        ("no-rows", {}, {}),
+        ("dup-id", {}, {}, {}),
+        ("dup-name", {}, {}, {}),
+        ("no-rows", {}, {}, {}),
     ],
 )
 def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
     case: str,
     disabled: dict[str, bool],
     aria_disabled: dict[str, bool],
+    aria_hidden: dict[str, bool],
     facts_page: Page,
 ) -> None:
     if case == "legend":
@@ -1397,6 +1425,31 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
             "<button id='inner' type='button' aria-disabled='true'>Inner</button>"
             "</div>"
             "<button id='yes' type='button' aria-disabled='true'>Yes</button>"
+            "<button id='foo' type='button' aria-disabled='foo'>Foo</button>"
+            "<button id='sptrue' type='button' aria-disabled=' true '>Sp</button>"
+            "<button id='truetr' type='button' aria-disabled='true '>Trail</button>"
+            "<button id='falsetr' type='button' aria-disabled='false '>Fspace</button>"
+            "<div aria-disabled='foo'><button id='ancfoo' type='button'>Anc foo</button></div>"
+            "<div aria-disabled=' true '><button id='ancsp' type='button'>Anc sp</button></div>"
+            "<div aria-disabled='false '><button id='ancfs' type='button'>Anc fs</button></div>"
+            "<div aria-disabled='true'>"
+            "<button id='ownfalse' type='button' aria-disabled='FALSE'>FALSE</button>"
+            "<div id='roleplain' role='button'>Plain role</div>"
+            "<h1 id='hidhead'>Heading</h1>"
+            "</div>"
+            "<button id='uptrue' type='button' aria-disabled='TRUE'>UP</button>"
+            "<div role='group' aria-disabled='TRUE'>"
+            "<button id='grptrue' type='button'>Group TRUE</button>"
+            "</div>"
+            "<div aria-disabled='True'><button id='anctrue' type='button'>Django</button></div>"
+            "<div aria-disabled='true'>"
+            "<button id='undef' type='button' aria-disabled='undefined'>Undef</button>"
+            "<button id='yesword' type='button' aria-disabled='yes'>Yesword</button>"
+            "</div>"
+            "<div aria-hidden='TRUE'>"
+            "<button id='hidfalse' type='button' aria-hidden='false'>Still</button>"
+            "</div>"
+            "<div aria-hidden='True'><a id='hidlink' href='/x'>Hidden link</a></div>"
         )
     elif case == "dup-id":
         html = (
@@ -1434,14 +1487,17 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
             assert _by_id(facts, html_id).disabled == expect
         for html_id, expect in aria_disabled.items():
             assert _by_id(facts, html_id).aria_disabled == expect
+        for html_id, expect in aria_hidden.items():
+            assert _by_id(facts, html_id).aria_hidden == expect
         if case == "legend":
             assert _by_id(facts, "legsel").options[0].disabled is False
         elif case == "aria":
-            # plainbox is not focusable, so the AX tree has no disabled property.
-            checked = [html_id for html_id in aria_disabled if html_id != "plainbox"]
-            ax_disabled = _ax_disabled_by_id(facts_page, checked)
+            checked = [html_id for html_id in aria_disabled if html_id not in _AX_OMITS_DISABLED]
+            states = _ax_states_by_id(facts_page, [*checked, *aria_hidden])
             for html_id in checked:
-                assert (ax_disabled[html_id] is True) == aria_disabled[html_id]
+                assert (states[html_id][0] is True) == aria_disabled[html_id]
+            for html_id, expect in aria_hidden.items():
+                assert states[html_id][1] is expect
         elif case == "dup-id":
             _require_selector(facts_page, facts, "Keep my data", required=True)
             _require_selector(facts_page, facts, "Delete everything", required=False)

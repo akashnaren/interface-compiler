@@ -779,18 +779,51 @@
     return rect.width > 0 && rect.height > 0;
   }
 
+  function asciiLower(value) {
+    let lower = "";
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      lower += code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : value.charAt(index);
+    }
+    return lower;
+  }
+
+  // Absent or empty keeps walking. ASCII-lowercased "false", with no trim,
+  // is enabled. Any other non-empty value is disabled.
+  function ariaDisabledState(el) {
+    let node = el;
+    while (node && nodeType(node) === 1) {
+      const value = getAttribute(node, "aria-disabled");
+      if (value !== null && value !== "") {
+        return asciiLower(value) !== "false";
+      }
+      node = parentElement(node);
+    }
+    return false;
+  }
+
+  // A descendant false does not reveal a hidden ancestor. Any value that
+  // trims and lowercases to "true" hides this element.
+  function ariaHiddenState(el) {
+    let node = el;
+    while (node && nodeType(node) === 1) {
+      const value = getAttribute(node, "aria-hidden");
+      if (value !== null && asciiLower(value.trim()) === "true") {
+        return true;
+      }
+      node = parentElement(node);
+    }
+    return false;
+  }
+
   // Flags come from this element's ancestors, not from the document walk.
   // One closest() per condition so an inner inert node does not hide an outer
-  // aria-hidden ancestor. visibility:hidden still has a box, so it is a second check.
+  // hidden ancestor. visibility:hidden still has a box, so it is a second check.
   function applyRowFlags(el) {
     const hidden = closest(el, "[hidden]") !== null;
-    const ariaHidden = closest(el, "[aria-hidden='true']") !== null;
+    const ariaHidden = ariaHiddenState(el);
     const inert = closest(el, "[inert]") !== null;
-    // The nearest non-empty aria-disabled decides. An empty value does not
-    // stop the walk, so a true ancestor still disables the control. A nearer
-    // false stays enabled, and an inner true stays disabled.
-    const owner = closest(el, "[aria-disabled]:not([aria-disabled=''])");
-    const ariaDisabled = owner !== null && getAttribute(owner, "aria-disabled") === "true";
+    const ariaDisabled = ariaDisabledState(el);
     let displayHidden = hidden;
     let visibilityIsHidden = false;
     if (typeof readCheckVisibility === "function") {
