@@ -183,6 +183,8 @@ def _merge_entity(
         secondary_id = f"open_{entity}_{slug_key}"
         sec_gated = login_gated(link, ctx, secondary_id)
         sec_enabled, sec_reason = element_enabled(link, login_gated=sec_gated)
+        sec_verb = ctx.lexicon.verb(link.name)
+        sec_enabled, sec_reason = apply_hard_block(sec_enabled, sec_reason, sec_verb, ctx.lexicon)
         result.affordances.append(
             affordance(
                 secondary_id,

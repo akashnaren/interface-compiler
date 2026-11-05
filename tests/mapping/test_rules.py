@@ -243,10 +243,10 @@ def _by_html(result, html_id: str):
     return found[0]
 
 
-def _html(facts_page, html: str):
+def _html(facts_page, html: str, **context: object):
     facts_page.set_content(html, wait_until="domcontentloaded")
     facts = collect_facts(facts_page)
-    return map_facts(facts, MapContext(page_url=facts.url)), facts
+    return map_facts(facts, MapContext(page_url=facts.url, **context)), facts  # type: ignore[arg-type]
 
 
 def test_form_gate(mapped_once) -> None:
@@ -274,6 +274,7 @@ def test_form_gate(mapped_once) -> None:
         "described",
         "rows",
         "orders",
+        "secondary",
         "fields",
     ],
 )
@@ -372,6 +373,24 @@ def test_review_fixes(case: str, map_page, facts_page) -> None:
         assert order.enabled is False
         assert order.x is not None and order.x.reason == "hard-blocked in v1: place_order"
         assert order.input.model_dump(exclude_none=True) == {"type": "object", "properties": {}}
+        return
+    if case == "secondary":
+        result, _facts = _html(
+            facts_page,
+            "<style>body{margin:0} a{display:block}</style><main>"
+            "<article><h2><a href='/i/1'>Story 1</a></h2>"
+            "<a href='/account/delete'>Delete account</a></article>"
+            "<article><h2><a href='/i/2'>Story 2</a></h2>"
+            "<a href='/account/delete'>Delete account</a></article>"
+            "<article><h2><a href='/i/3'>Story 3</a></h2>"
+            "<a href='/account/delete'>Delete account</a></article></main>",
+            include_secondary=("item.delete_account",),
+        )
+        opened = one(result, "open_item")
+        assert opened.enabled is True
+        deleted = one(result, "open_item_delete_account")
+        assert deleted.enabled is False
+        assert deleted.x is not None and deleted.x.reason == "hard-blocked in v1: delete"
         return
     result, _facts = _html(
         facts_page,
