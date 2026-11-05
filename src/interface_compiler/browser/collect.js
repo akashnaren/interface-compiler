@@ -84,6 +84,10 @@
   const readNodeType = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
   const readTextContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").get;
   const readFormAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action").get;
+  const readFormElements = Object.getOwnPropertyDescriptor(
+    HTMLFormElement.prototype,
+    "elements",
+  ).get;
   const readGetAttribute = Element.prototype.getAttribute;
   const readHasAttribute = Element.prototype.hasAttribute;
   const readClosest = Element.prototype.closest;
@@ -2130,22 +2134,34 @@
     return false;
   }
 
+  function formControls(form) {
+    // form.elements includes controls associated with form=, not only descendants.
+    const listed = readFormElements.call(form);
+    const controls = [];
+    for (let index = 0; index < listed.length; index += 1) {
+      controls.push(listed[index]);
+    }
+    return controls;
+  }
+
   function fieldsetDisabled(form) {
     let controls;
     try {
-      controls = queryAll(form, "input, select, textarea, button");
+      controls = formControls(form);
     } catch (error) {
       return true;
     }
+    // Any fillable control in a disabled fieldset disables the form. An enabled
+    // control earlier in the list must not hide that. A first-legend control
+    // still keeps the form available.
     let blocked = false;
+    let legendAvailable = false;
     for (let index = 0; index < controls.length; index += 1) {
       const control = controls[index];
       if (isSubmitControl(control)) {
-        // An outside submit must not re-enable the fieldset. A submit in the
-        // first legend is enabled, and it keeps the form available.
         const fieldset = closestAcross(control, "fieldset[disabled]");
         if (fieldset && inFirstLegend(control, fieldset)) {
-          return false;
+          legendAvailable = true;
         }
         continue;
       }
@@ -2157,13 +2173,20 @@
         continue;
       }
       try {
-        // A later enabled control must not clear a fieldset that already blocked.
-        if (!blocked && !elementMatches(control, ":disabled")) {
-          return false;
+        const fieldset = closestAcross(control, "fieldset[disabled]");
+        if (
+          fieldset &&
+          inFirstLegend(control, fieldset) &&
+          !elementMatches(control, ":disabled")
+        ) {
+          legendAvailable = true;
         }
       } catch (error) {
         return true;
       }
+    }
+    if (legendAvailable) {
+      return false;
     }
     if (blocked) {
       return true;

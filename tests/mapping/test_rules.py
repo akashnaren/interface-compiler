@@ -185,7 +185,10 @@ def test_sign_out_link_is_mutating(label: str) -> None:
 
 @pytest.mark.parametrize(
     ("label", "href", "reason"),
-    [("Delete account", "/account/delete", "hard-blocked in v1: delete")],
+    [
+        ("Delete account", "/account/delete", "hard-blocked in v1: delete"),
+        ("Del\u00adete account", "/account/delete", "hard-blocked in v1: delete"),
+    ],
 )
 def test_map_link_hard_block(label: str, href: str, reason: str) -> None:
     result = map_link(
@@ -275,6 +278,8 @@ def test_form_gate(mapped_once) -> None:
         "rows",
         "orders",
         "secondary",
+        "shy-button",
+        "shy-secondary",
         "fields",
     ],
 )
@@ -392,6 +397,33 @@ def test_review_fixes(case: str, map_page, facts_page) -> None:
         assert deleted.enabled is False
         assert deleted.x is not None and deleted.x.reason == "hard-blocked in v1: delete"
         return
+    if case == "shy-button":
+        result, _facts = _html(
+            facts_page,
+            "<button type='button'>Del\u00adete account</button>",
+        )
+        deleted = one(result, "delete")
+        assert deleted.enabled is False
+        assert deleted.x is not None and deleted.x.reason == "hard-blocked in v1: delete"
+        return
+    if case == "shy-secondary":
+        shy = "Del\u00adete account"
+        rows = "".join(
+            f"<article><h2><a href='/i/{index}'>Story {index}</a></h2>"
+            f"<a href='/account/delete'>{shy}</a></article>"
+            for index in (1, 2, 3)
+        )
+        result, _facts = _html(
+            facts_page,
+            "<style>body{margin:0} a{display:block}</style><main>" + rows + "</main>",
+            include_secondary=("item.del_ete_account",),
+        )
+        opened = one(result, "open_item")
+        assert opened.enabled is True
+        deleted = one(result, "open_item_del_ete_account")
+        assert deleted.enabled is False
+        assert deleted.x is not None and deleted.x.reason == "hard-blocked in v1: delete"
+        return
     result, _facts = _html(
         facts_page,
         "<form id='dead' method='post' action='/save'>"
@@ -427,6 +459,8 @@ def _cue(case: str, sample: str) -> bool:
         ("hint", "nonmembers only", False),
         ("fieldset", "save", False),
         ("mixed", "save", False),
+        ("enabled-first", "save", False),
+        ("associated", "save", False),
         ("legend", "save", True),
         ("choices", "add_to_cart", False),
         ("modal", "high", True),
@@ -461,6 +495,32 @@ def test_fieldset_modal_and_login_cues(
         )
         saved = one(result, sample)
         assert saved.enabled is False
+        assert saved.x is not None and saved.x.reason == "disabled"
+        assert facts.forms[0].disabled is True
+        assert "email" not in props(saved)
+        return
+    if case == "enabled-first":
+        result, facts = _html(
+            page,
+            "<form method='post' action='/c'><input name='name' aria-label='Name'>"
+            "<fieldset disabled><input name='email' aria-label='Email'></fieldset>"
+            "<button>Save</button></form>",
+        )
+        saved = one(result, sample)
+        assert saved.enabled is expected
+        assert saved.x is not None and saved.x.reason == "disabled"
+        assert facts.forms[0].disabled is True
+        assert "email" not in props(saved)
+        return
+    if case == "associated":
+        result, facts = _html(
+            page,
+            "<form id='f' method='post' action='/c'></form>"
+            "<fieldset disabled><input form='f' name='email' aria-label='Email'></fieldset>"
+            "<button form='f'>Save</button>",
+        )
+        saved = one(result, sample)
+        assert saved.enabled is expected
         assert saved.x is not None and saved.x.reason == "disabled"
         assert facts.forms[0].disabled is True
         assert "email" not in props(saved)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from interface_compiler.browser.facts import ElementFact
 
@@ -75,7 +76,10 @@ def plural(name: str) -> str:
 
 
 def normalize_label(text: str) -> str:
+    # Format characters (soft hyphen, zero-width spaces, BOM) must not split a verb.
+    normalized = unicodedata.normalize("NFKC", text)
+    visible = "".join(char for char in normalized if unicodedata.category(char) != "Cf")
     chars: list[str] = []
-    for char in text.casefold():
+    for char in visible.casefold():
         chars.append(char if char.isalnum() or char.isspace() else " ")
     return " ".join("".join(chars).split())
