@@ -183,12 +183,14 @@ def _form_grain_result(
         if named is None:
             continue
         name, prop = named
-        properties[name] = prop
-        if element.constraints.required:
-            required.append(name)
         if element.value is not None and element.role not in {"button"}:
             state[name] = "<redacted>" if element.input_type == "password" else element.value
             state_from[name] = "control"
+        if element.disabled or element.aria_disabled:
+            continue
+        properties[name] = prop
+        if element.constraints.required:
+            required.append(name)
     search = _is_search(form, controls, properties)
     if search:
         affordance_id = "search"

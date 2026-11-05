@@ -98,9 +98,15 @@ _VIEWS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?:^|/)(?:category|collections?|shop|products)(?:/|$)"), "catalog"),
     (re.compile(r"(?:^|/)(?:product|item|p|dp)(?:/|$)"), "product"),
 )
-_LOGIN_PATH = re.compile(r"(?:^|/)(?:login|signin|sign-in|account/login|auth|session/new)(?:/|$)")
+_LOGIN_PATH = re.compile(
+    r"(?:^|/)(?:login|signin|sign-in|account/login|auth|session/new)(?:/|$)",
+    re.IGNORECASE,
+)
 _LOGIN_LABEL = re.compile(r"^(?:(?:sign|log) ?in to |login required|members only|account required)")
-_LOGIN_HINT = re.compile(r"(?:(?:sign|log) ?in to |login required|members only|account required)")
+# "members only" has to finish the hint. "members only pricing" is not a sign-in cue.
+_LOGIN_HINT = re.compile(
+    r"\b(?:(?:sign|log) ?in to|login required|account required)\b|\bmembers only\b(?!\s+\S)"
+)
 # Social and account verbs, plus the same words when they are the URL path.
 _ACCOUNT = frozenset(
     {
@@ -165,16 +171,19 @@ class Lexicon:
         return _LOGIN_LABEL.search(normalize_label(label)) is not None
 
     def login_hint(self, text: str) -> bool:
-        """Unanchored sign-in hint for title and aria-describedby text."""
+        """Sign-in hint for title and aria-describedby text."""
         return _LOGIN_HINT.search(normalize_label(text)) is not None
 
     def account_action(self, *, label: str = "", url: str = "") -> bool:
-        """True for vote/like/follow/comment/save/reply/flag and similar verbs."""
+        """True when the label, or the last path segment, is an account verb.
+
+        ``/item/3/like`` is an action. ``/book/odyssey`` is a resource path.
+        """
         verb = self.verb(label) if label else None
         if verb in _ACCOUNT:
             return True
         parts = [part.casefold() for part in urlsplit(url).path.split("/") if part]
-        return any(part in _ACCOUNT for part in parts)
+        return bool(parts) and parts[-1] in _ACCOUNT
 
     def login_target(self, url: str, *, account_action: bool = False) -> bool:
         """A redirect gates when its path is a login route, on any host.

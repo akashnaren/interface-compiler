@@ -242,11 +242,11 @@ def _account_verb(element: ElementFact, ctx: MapContext) -> str | None:
     label = ctx.lexicon.verb(element.name)
     if label and ctx.lexicon.account_action(label=element.name):
         return label
-    parts = [part.casefold() for part in urlsplit(element.href or "").path.split("/") if part]
-    for part in parts:
-        if ctx.lexicon.account_action(url=f"/{part}"):
-            return part
-    return None
+    href = element.href or ""
+    if not ctx.lexicon.account_action(url=href):
+        return None
+    parts = [part.casefold() for part in urlsplit(href).path.split("/") if part]
+    return parts[-1] if parts else None
 
 
 def _link_tag(element: ElementFact, ctx: MapContext) -> str:

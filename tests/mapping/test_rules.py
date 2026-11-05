@@ -348,3 +348,96 @@ def test_review_fixes(case: str, map_page, facts_page) -> None:
     )
     blocked = one(result, "submit_dead")
     assert blocked.enabled is False and blocked.x is not None and blocked.x.reason == "disabled"
+
+
+def _cue(case: str, sample: str) -> bool:
+    if case == "route":
+        return _LEXICON.login_target(sample)
+    if case == "account":
+        action = _LEXICON.account_action(url=sample)
+        assert _LEXICON.login_target(f"{sample}?next=/", account_action=action) is action
+        return action
+    if case == "hint":
+        return _LEXICON.login_hint(sample)
+    raise AssertionError(case)
+
+
+@pytest.mark.parametrize(
+    ("case", "sample", "expected"),
+    [
+        ("route", "/Login", True),
+        ("route", "/Account/Login", True),
+        ("account", "/book/odyssey", False),
+        ("account", "/item/3/comment", True),
+        ("hint", "members only pricing", False),
+        ("hint", "members only", True),
+        ("hint", "Please sign in to continue", True),
+        ("hint", "nonmembers only", False),
+        ("fieldset", "save", False),
+        ("legend", "save", True),
+        ("choices", "add_to_cart", False),
+        ("modal", "high", True),
+    ],
+)
+def test_fieldset_modal_and_login_cues(
+    case: str, sample: str, expected: bool, request: pytest.FixtureRequest
+) -> None:
+    if case in {"route", "account", "hint"}:
+        assert _cue(case, sample) is expected
+        return
+    page = request.getfixturevalue("facts_page")
+    if case == "fieldset":
+        result, facts = _html(
+            page,
+            "<form method='post' action='/save'><input type='hidden' name='csrf' value='t'>"
+            "<fieldset disabled><label for='email'>Email</label>"
+            "<input id='email' type='email' name='email'></fieldset>"
+            "<button id='go' type='submit'>Save</button></form>",
+        )
+        saved = one(result, sample)
+        assert saved.enabled is expected and saved.x is not None and saved.x.reason == "disabled"
+        assert facts.forms[0].disabled is True
+        assert next(item for item in facts.elements if item.html_id == "email").disabled is True
+        return
+    if case == "legend":
+        result, facts = _html(
+            page,
+            "<form method='post' action='/save'><fieldset disabled>"
+            "<legend><label>Query<input id='q' name='q'></label></legend>"
+            "<label>Email<input id='email' type='email' name='email'></label></fieldset>"
+            "<button type='submit'>Save</button></form>",
+        )
+        saved = one(result, sample)
+        assert saved.enabled is expected and "query" in props(saved) and "email" not in props(saved)
+        assert next(item for item in facts.elements if item.html_id == "q").disabled is False
+        assert next(item for item in facts.elements if item.html_id == "email").disabled is True
+        return
+    if case == "choices":
+        result, _facts = _html(
+            page,
+            "<form method='post' action='/cart'><fieldset disabled>"
+            "<label><input type='radio' name='size' value='s'> S</label>"
+            "<label><input type='radio' name='size' value='m'> M</label></fieldset>"
+            "<button type='submit'>Add to cart</button></form>",
+        )
+        added = one(result, sample)
+        assert added.enabled is expected and added.x is not None and added.x.reason == "disabled"
+        assert one(result, "set_size").enabled is False
+        return
+    if case != "modal":
+        raise AssertionError(case)
+    result, facts = _html(
+        page,
+        "<style>body{margin:0}</style>"
+        "<div style='transform:translateZ(0);position:relative;z-index:0'>"
+        "<div id='low' role='dialog' aria-modal='true' aria-label='Low' "
+        "style='position:fixed;top:16px;left:16px;width:160px;height:48px;z-index:80'>"
+        "<button type='button'>Low</button></div></div>"
+        "<div id='high' role='dialog' aria-modal='true' aria-label='High' "
+        "style='position:fixed;top:200px;left:16px;width:160px;height:48px;z-index:1'>"
+        "<button type='button'>High</button></div>",
+    )
+    assert next(modal.html_id for modal in facts.modals if modal.top) == sample
+    assert one(result, "do_high").enabled is expected
+    assert one(result, "do_low").x is not None
+    assert one(result, "do_low").x.reason == "blocked by dialog"

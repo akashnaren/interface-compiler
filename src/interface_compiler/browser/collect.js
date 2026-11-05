@@ -1085,8 +1085,9 @@
     if (!modals.length) {
       return null;
     }
-    // Hit-test each dialog at its own center (or its first control). The
-    // dialog that contains that hit is a candidate. Never sample (1, 1).
+    // Hit-test each dialog at its visible center. The dialog that contains
+    // that hit is painted there. Never sample (1, 1). z-index is the fallback
+    // when that test cannot pick a single dialog.
     const hits = [];
     for (let index = 0; index < modals.length; index += 1) {
       const modal = modals[index];
@@ -1098,6 +1099,9 @@
       if (target && nodeInside(modal, target)) {
         hits.push(modal);
       }
+    }
+    if (hits.length === 1) {
+      return hits[0];
     }
     return highestModal(hits.length ? hits : modals);
   }
@@ -1134,29 +1138,123 @@
 
   function highestModal(modals) {
     let best = modals[0];
-    let bestRank = modalRank(best, 0);
+    let bestChain = modalChain(best);
+    let bestIndex = 0;
     for (let index = 1; index < modals.length; index += 1) {
-      const rank = modalRank(modals[index], index);
-      if (rank >= bestRank) {
+      const chain = modalChain(modals[index]);
+      if (chainOutranks(chain, index, bestChain, bestIndex)) {
         best = modals[index];
-        bestRank = rank;
+        bestChain = chain;
+        bestIndex = index;
       }
     }
     return best;
   }
 
-  function modalRank(modal, index) {
-    let z = 0;
+  // A transformed, filtered, or opacity ancestor traps the dialog's own
+  // z-index. Compare those contexts from the root. A top-layer dialog is
+  // above the page, and its ancestors do not count.
+  function modalChain(modal) {
+    let topLayer = false;
     try {
-      const value = Number(getComputedStyle(modal).zIndex);
-      if (Number.isFinite(value)) {
-        z = value;
-      }
+      topLayer = elementMatches(modal, ":modal");
     } catch (error) {
-      z = 0;
+      topLayer = false;
     }
-    // Later DOM order wins a tie. That is the topmost paint order.
-    return z * 100000 + index;
+    if (topLayer) {
+      return { top: true, contexts: [{ node: modal, z: usedZ(modal) }] };
+    }
+    const contexts = [];
+    let node = modal;
+    const seen = new Set();
+    let own = true;
+    while (node && nodeType(node) === 1 && !seen.has(node)) {
+      seen.add(node);
+      let style = null;
+      try {
+        style = getComputedStyle(node);
+      } catch (error) {
+        break;
+      }
+      if (own) {
+        contexts.push({ node, z: usedZ(modal, style) });
+        own = false;
+      } else {
+        const level = contextLevel(style);
+        if (level !== null) {
+          contexts.push({ node, z: level });
+        }
+      }
+      node = parentNodeAcross(node);
+    }
+    contexts.reverse();
+    return { top: false, contexts };
+  }
+
+  function usedZ(modal, style) {
+    let read = style;
+    if (!read) {
+      try {
+        read = getComputedStyle(modal);
+      } catch (error) {
+        return 0;
+      }
+    }
+    const value = Number(read.zIndex);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function contextLevel(style) {
+    const z = Number(style.zIndex);
+    const finite = Number.isFinite(z) ? z : 0;
+    const positioned =
+      style.position === "relative" ||
+      style.position === "absolute" ||
+      style.position === "fixed" ||
+      style.position === "sticky";
+    if (positioned && style.zIndex !== "auto") {
+      return finite;
+    }
+    const will = style.willChange || "";
+    const traps =
+      style.position === "fixed" ||
+      style.position === "sticky" ||
+      style.opacity !== "1" ||
+      (style.transform && style.transform !== "none") ||
+      (style.filter && style.filter !== "none") ||
+      (style.perspective && style.perspective !== "none") ||
+      style.isolation === "isolate" ||
+      (style.mixBlendMode && style.mixBlendMode !== "normal") ||
+      (style.backdropFilter && style.backdropFilter !== "none") ||
+      (style.webkitBackdropFilter && style.webkitBackdropFilter !== "none") ||
+      /transform|opacity|filter/.test(will);
+    return traps ? finite : null;
+  }
+
+  function chainOutranks(chain, index, best, bestIndex) {
+    if (chain.top !== best.top) {
+      return chain.top;
+    }
+    const left = chain.contexts;
+    const right = best.contexts;
+    const length = Math.min(left.length, right.length);
+    for (let level = 0; level < length; level += 1) {
+      const a = left[level];
+      const b = right[level];
+      if (a.node === b.node) {
+        continue;
+      }
+      // Different contexts. A nested z-index does not escape its ancestor.
+      if (a.z !== b.z) {
+        return a.z > b.z;
+      }
+      return index >= bestIndex;
+    }
+    if (left.length !== right.length) {
+      return left.length > right.length;
+    }
+    // Later DOM order wins a tie.
+    return index >= bestIndex;
   }
 
   function inTopModal(el) {
@@ -1956,10 +2054,121 @@
   for (let index = 0; index < kept.length; index += 1) {
     keptAt.set(kept[index], index);
   }
+  function isSubmitControl(control) {
+    const tag = tagName(control);
+    const type = (getAttribute(control, "type") || "").toLowerCase();
+    return (
+      (tag === "BUTTON" && (type === "" || type === "submit")) ||
+      (tag === "INPUT" && (type === "submit" || type === "image"))
+    );
+  }
+
+  function isFillable(control) {
+    const tag = tagName(control);
+    const type = (getAttribute(control, "type") || "").toLowerCase();
+    if (tag === "INPUT") {
+      return (
+        type !== "hidden" &&
+        type !== "submit" &&
+        type !== "image" &&
+        type !== "reset" &&
+        type !== "button"
+      );
+    }
+    return tag === "SELECT" || tag === "TEXTAREA";
+  }
+
+  function firstLegendChild(fieldset) {
+    try {
+      for (const child of children(fieldset)) {
+        if (tagName(child) === "LEGEND") {
+          return child;
+        }
+      }
+    } catch (error) {
+      return null;
+    }
+    return null;
+  }
+
+  function inFirstLegend(el, fieldset) {
+    const legend = firstLegendChild(fieldset);
+    if (!legend) {
+      return false;
+    }
+    if (legend === el) {
+      return true;
+    }
+    try {
+      return contains(legend, el);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // :disabled is false for the first legend of that fieldset. An outer
+  // disabled fieldset still counts. A submit outside does not turn the
+  // other controls back on.
+  function fieldsetDisables(control) {
+    let node = control;
+    const seen = new Set();
+    while (node) {
+      const fieldset = closestAcross(node, "fieldset[disabled]");
+      if (!fieldset || seen.has(fieldset)) {
+        return false;
+      }
+      seen.add(fieldset);
+      if (!inFirstLegend(control, fieldset)) {
+        try {
+          return elementMatches(control, ":disabled");
+        } catch (error) {
+          return true;
+        }
+      }
+      node = parentNodeAcross(fieldset);
+    }
+    return false;
+  }
+
   function fieldsetDisabled(form) {
-    // A disabled fieldset disables the controls inside it, not the whole form.
-    // The form is disabled only when the form element itself sits in one.
-    return closestAcross(form, "fieldset[disabled]") !== null;
+    let controls;
+    try {
+      controls = queryAll(form, "input, select, textarea, button");
+    } catch (error) {
+      return true;
+    }
+    let blocked = false;
+    for (let index = 0; index < controls.length; index += 1) {
+      const control = controls[index];
+      if (isSubmitControl(control)) {
+        // An outside submit must not re-enable the fieldset. A submit in the
+        // first legend is enabled, and it keeps the form available.
+        const fieldset = closestAcross(control, "fieldset[disabled]");
+        if (fieldset && inFirstLegend(control, fieldset)) {
+          return false;
+        }
+        continue;
+      }
+      if (!isFillable(control)) {
+        continue;
+      }
+      if (fieldsetDisables(control)) {
+        blocked = true;
+        continue;
+      }
+      try {
+        if (!elementMatches(control, ":disabled")) {
+          return false;
+        }
+      } catch (error) {
+        return true;
+      }
+    }
+    if (blocked) {
+      return true;
+    }
+    const fieldset = closestAcross(form, "fieldset[disabled]");
+    return fieldset !== null && !inFirstLegend(form, fieldset);
   }
   const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map(
     (form, index) => {
