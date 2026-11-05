@@ -164,6 +164,7 @@ class ElementFact:
     placeholder: str = ""
     title: str = ""
     described_by: str = ""
+    text_alternatives: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1010,12 +1011,20 @@ def _element(item: dict[str, Any], hit: _AxHit | None) -> ElementFact:
         placeholder=_text(item, "placeholder"),
         title=_text(item, "title"),
         described_by=_text(item, "described_by"),
+        text_alternatives=_texts(item, "text_alternatives"),
     )
 
 
 def _text(item: dict[str, Any], key: str) -> str:
     value = item.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _texts(item: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = item.get(key)
+    if not isinstance(value, list):
+        return ()
+    return tuple(part for part in value if isinstance(part, str) and part)
 
 
 def _option(item: object) -> OptionFact:

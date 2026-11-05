@@ -35,6 +35,9 @@ def map_form(form: FormFact, fields: list[ElementFact], ctx: MapContext) -> MapR
     submits = [element for element in fields if _is_submit(element)]
     submit = submits[0] if submits else None
     verb = ctx.lexicon.verb(submit.name) if submit else None
+    view = ctx.view_hint or ctx.lexicon.view_for_href(ctx.page_url)
+    if view == "checkout" and form.method != "get" and not ctx.lexicon.hard_block(verb):
+        verb = "checkout_submit"
     if _field_grain(controls, verb):
         return _field_grain_result(form, controls, submit, verb, ctx)
     return _form_grain_result(form, controls, submit, verb, ctx)
@@ -143,6 +146,7 @@ def _field_grain_result(
             lexicon=ctx.lexicon,
             form_disabled=form.disabled,
             missing=tuple(missing),
+            upload=any(element.input_type == "file" for element in controls),
         )
         parts.append(
             MapResult(
@@ -192,7 +196,7 @@ def _form_grain_result(
         if element.constraints.required:
             required.append(name)
     search = _is_search(form, controls, properties)
-    if search:
+    if search and not ctx.lexicon.hard_block(verb):
         affordance_id = "search"
         verb = "search"
     elif verb:
@@ -357,9 +361,9 @@ def _unusable_fields(fields: list[ElementFact]) -> str | None:
 
 
 def _is_submit(element: ElementFact) -> bool:
-    """A submitter is type=submit (the default on button) or input type=image."""
+    """Anything except type=button and type=reset submits, including an unknown type."""
     if element.tag == "button":
-        return (element.input_type or "submit") == "submit"
+        return (element.input_type or "submit") not in {"button", "reset"}
     return element.input_type in {"submit", "image"}
 
 

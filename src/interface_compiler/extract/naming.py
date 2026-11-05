@@ -7,6 +7,13 @@ import unicodedata
 
 from interface_compiler.browser.facts import ElementFact
 
+# Blank letters and format marks that are not caught by Mn/Me/Cf alone.
+_IGNORABLE = frozenset(
+    chr(code) for code in (0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0)
+)
+# Look-alikes that can spell a hard verb. Folded after casefold.
+_LOOKALIKE = str.maketrans("аеорсхуіјѕԁԛԝһӏαονρτκι", "aeopcxyijsdqwhlaovptki")
+
 _ALIAS = (
     (re.compile(r"^(?:q|s|query|search|keywords?|k|search_query|search_term_string)$"), "query"),
     (re.compile(r"^(?:e_mail|mail|email_address)$"), "email"),
@@ -22,7 +29,7 @@ _HASH = re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE)
 def slug(text: str, *, limit: int = 32) -> str:
     """Lowercase ASCII slug, at most ``limit`` characters, no leading digit."""
     chars: list[str] = []
-    for char in text.lower():
+    for char in match_key(text):
         chars.append(char if char.isascii() and char.isalnum() else "_")
     collapsed = "".join(chars)
     while "__" in collapsed:
@@ -75,11 +82,25 @@ def plural(name: str) -> str:
     return name + "s"
 
 
+def match_keys(text: str) -> tuple[str, str]:
+    """Spaced and no-space keys for hard matching. Display text stays untouched."""
+    kept: list[str] = []
+    for char in unicodedata.normalize("NFKD", text):
+        if char in _IGNORABLE or unicodedata.category(char) in {"Mn", "Me", "Cf"}:
+            continue
+        if unicodedata.category(char).startswith("Z"):
+            kept.append(" ")
+            continue
+        kept.append(char)
+    folded = "".join(kept).casefold().translate(_LOOKALIKE)
+    chars = [char if char.isalnum() or char.isspace() else " " for char in folded]
+    spaced = " ".join("".join(chars).split())
+    return spaced, spaced.replace(" ", "")
+
+
+def match_key(text: str) -> str:
+    return match_keys(text)[0]
+
+
 def normalize_label(text: str) -> str:
-    # Format characters (soft hyphen, zero-width spaces, BOM) must not split a verb.
-    normalized = unicodedata.normalize("NFKC", text)
-    visible = "".join(char for char in normalized if unicodedata.category(char) != "Cf")
-    chars: list[str] = []
-    for char in visible.casefold():
-        chars.append(char if char.isalnum() or char.isspace() else " ")
-    return " ".join("".join(chars).split())
+    return match_key(text)

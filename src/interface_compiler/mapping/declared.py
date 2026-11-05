@@ -13,6 +13,7 @@ from interface_compiler.mapping.types import (
     affordance,
     apply_hard_block,
     input_schema,
+    seal_hard_blocks,
     stable_signature,
 )
 
@@ -47,7 +48,9 @@ def jsonld_nodes(html: str) -> list[dict[str, object]]:
 
 def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResult:
     raw_type = action.get("@type", "Action")
-    type_name = raw_type[0] if isinstance(raw_type, list) and raw_type else str(raw_type)
+    parts = raw_type if isinstance(raw_type, list) and raw_type else [raw_type]
+    type_name = str(parts[0])
+    label = " ".join(str(part) for part in parts if part)
     verb = slug(type_name.removesuffix("Action")) or "action"
     properties: dict[str, dict[str, object]] = {}
     required: list[str] = []
@@ -83,20 +86,23 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
             "named_by": "declared",
         }
     )
-    return MapResult(
-        affordances=[
-            affordance(
-                verb,
-                enabled=enabled,
-                schema=input_schema(properties, required or None),
-                label=type_name,
-                locator=locator,
-                grain="declared",
-                tag=tag,
-                reason=reason,
-                signature=stable_signature("declared", verb, template),
-            )
-        ]
+    return seal_hard_blocks(
+        MapResult(
+            affordances=[
+                affordance(
+                    verb,
+                    enabled=enabled,
+                    schema=input_schema(properties, required or None),
+                    label=label,
+                    locator=locator,
+                    grain="declared",
+                    tag=tag,
+                    reason=reason,
+                    signature=stable_signature("declared", verb, template),
+                )
+            ]
+        ),
+        ctx,
     )
 
 

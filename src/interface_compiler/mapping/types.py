@@ -11,9 +11,11 @@ from urllib.parse import urlsplit
 from interface_compiler.browser.facts import ElementFact
 from interface_compiler.contract.models import Affordance, AffordanceX, InputSchema, Locator
 from interface_compiler.extract.lexicon import Lexicon
-from interface_compiler.extract.naming import normalize_label, slug
+from interface_compiler.extract.naming import match_key, normalize_label, slug
 
 _DIGIT = re.compile(r"\d")
+_CAMEL = re.compile(r"([a-z0-9])([A-Z])")
+_SOURCES: dict[int, tuple[str, ...]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +102,27 @@ def affordance(
     )
 
 
+def name_sources(element: ElementFact) -> tuple[str, ...]:
+    found: list[str] = []
+    for text in (
+        element.name,
+        element.label_text,
+        element.value or "",
+        element.title,
+        element.described_by,
+        *element.text_alternatives,
+    ):
+        if text and text not in found:
+            found.append(text)
+    return tuple(found)
+
+
+def note_sources(locator: Locator, *elements: ElementFact) -> None:
+    texts = tuple(text for element in elements for text in name_sources(element))
+    if texts:
+        _SOURCES[id(locator)] = _SOURCES.get(id(locator), ()) + texts
+
+
 def ax_locator(element: ElementFact, **extra: object) -> Locator:
     payload: dict[str, object] = {
         "kind": "ax",
@@ -113,16 +136,14 @@ def ax_locator(element: ElementFact, **extra: object) -> Locator:
         "in_dialog": element.in_dialog,
     }
     payload.update(extra)
-    return Locator.model_validate(payload)
+    locator = Locator.model_validate(payload)
+    note_sources(locator, element)
+    return locator
 
 
 def stable_signature(*parts: str) -> str:
-    normalized = []
-    for part in parts:
-        text = " ".join(part.casefold().split())
-        normalized.append(_DIGIT.sub("#", text))
-    digest = hashlib.sha1("|".join(normalized).encode()).hexdigest()
-    return digest[:12]
+    folded = "|".join(_DIGIT.sub("#", match_key(part)) for part in parts)
+    return hashlib.sha1(folded.encode()).hexdigest()[:12]
 
 
 def button_id(label: str, lexicon: Lexicon) -> str:
@@ -162,7 +183,7 @@ def login_gated(
 ) -> bool:
     if affordance_id == "go_sign_in" or ctx.signed_in:
         return False
-    if any(text and ctx.lexicon.login_label(text) for text in (element.name, element.label_text)):
+    if any(ctx.lexicon.login_label(text) for text in name_sources(element)):
         return True
     if any(text and ctx.lexicon.login_hint(text) for text in (element.title, element.described_by)):
         return True
@@ -193,3 +214,66 @@ def apply_hard_block(
 
 def normalize(text: str) -> str:
     return normalize_label(text)
+
+
+def _phrases(text: str) -> tuple[str, ...]:
+    found = [text]
+    for piece in re.split(r"[\s/#]+", text):
+        tail = piece.rsplit(":", 1)[-1]
+        stem = tail.removesuffix("Action")
+        spaced = _CAMEL.sub(r"\1 \2", stem).replace("_", " ").replace("-", " ")
+        if spaced and spaced not in found:
+            found.append(spaced)
+    return tuple(found)
+
+
+def _hard_verb(lexicon: Lexicon, *texts: str) -> str | None:
+    for text in texts:
+        if not text:
+            continue
+        for phrase in _phrases(text):
+            verb = lexicon.verb(phrase)
+            if lexicon.hard_block(verb):
+                return verb
+    return None
+
+
+def seal_hard_blocks(result: MapResult, ctx: MapContext) -> MapResult:
+    updated: list[Affordance] = []
+    for action in result.affordances:
+        extra = action.x
+        if extra is None:
+            updated.append(action)
+            continue
+        texts = [extra.label or "", action.id]
+        locator = extra.locator
+        if locator is not None:
+            texts.append(locator.name or "")
+            if locator.tool:
+                texts.append(locator.tool)
+            texts.extend(locator.options or ())
+            texts.extend(_SOURCES.get(id(locator), ()))
+        for prop in action.input.properties.values():
+            texts.extend(str(item) for item in prop.enum or ())
+        verb = _hard_verb(ctx.lexicon, *texts)
+        reason = extra.reason
+        if isinstance(reason, str) and reason.startswith("hard-blocked in v1: "):
+            current = reason.removeprefix("hard-blocked in v1: ")
+            if ctx.lexicon.hard_block(current):
+                verb = current
+        if verb is None:
+            updated.append(action)
+            continue
+        if reason not in _BEFORE_HARD:
+            reason = ctx.lexicon.hard_block(verb)
+        updated.append(
+            action.model_copy(
+                update={
+                    "enabled": False,
+                    "x": extra.model_copy(update={"reason": reason, "tag": ctx.lexicon.tag(verb)}),
+                }
+            )
+        )
+    result.affordances = updated
+    _SOURCES.clear()
+    return result

@@ -8,10 +8,12 @@ from interface_compiler.browser.facts import Box, Constraints, ElementFact, Form
 from interface_compiler.extract.lexicon import Lexicon
 from interface_compiler.extract.naming import field_name, slug
 from interface_compiler.mapping import MapContext, map_facts
+from interface_compiler.mapping.declared import map_schema_org_action
 from interface_compiler.mapping.enabled import element_enabled
 from interface_compiler.mapping.form import fill_missing, map_form
 from interface_compiler.mapping.input_schema import property_for
 from interface_compiler.mapping.link import map_link
+from interface_compiler.mapping.webmcp import map_webmcp_tool
 from tests.mapping._find import one, props
 
 _LEXICON = Lexicon()
@@ -249,7 +251,8 @@ def _by_html(result, html_id: str):
 def _html(facts_page, html: str, **context: object):
     facts_page.set_content(html, wait_until="domcontentloaded")
     facts = collect_facts(facts_page)
-    return map_facts(facts, MapContext(page_url=facts.url, **context)), facts  # type: ignore[arg-type]
+    context.setdefault("page_url", facts.url)
+    return map_facts(facts, MapContext(**context)), facts  # type: ignore[arg-type]
 
 
 def test_form_gate(mapped_once) -> None:
@@ -416,11 +419,11 @@ def test_review_fixes(case: str, map_page, facts_page) -> None:
         result, _facts = _html(
             facts_page,
             "<style>body{margin:0} a{display:block}</style><main>" + rows + "</main>",
-            include_secondary=("item.del_ete_account",),
+            include_secondary=("item.delete_account",),
         )
         opened = one(result, "open_item")
         assert opened.enabled is True
-        deleted = one(result, "open_item_del_ete_account")
+        deleted = one(result, "open_item_delete_account")
         assert deleted.enabled is False
         assert deleted.x is not None and deleted.x.reason == "hard-blocked in v1: delete"
         return
@@ -567,3 +570,173 @@ def test_fieldset_modal_and_login_cues(
     assert one(result, "do_high").enabled is expected
     assert one(result, "do_low").x is not None
     assert one(result, "do_low").x.reason == "blocked by dialog"
+
+
+def _blocked(verb: str) -> str:
+    return f"hard-blocked in v1: {verb}"
+
+
+_DELETE = _blocked("delete")
+_PAY = _blocked("pay")
+_ORDER = _blocked("place_order")
+_A6 = "".join(
+    f"<article><h2><a href='/item/{index}'>Item {index}</a></h2>"
+    f"<a href='/item/{index}/del'>{label}</a></article>"
+    for index, label in ((1, "Edit"), (2, "Delete"), (3, "Delete"))
+)
+_A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
+
+
+@pytest.mark.parametrize(
+    ("case", "html", "reason", "context"),
+    [
+        ("a1-yes", "<button>Yes, delete</button>", _DELETE, None),
+        ("a1-permanently", "<button>Permanently delete account</button>", _DELETE, None),
+        ("a2-marks", "<button>De\u00a0le\u0301\u034f\u3164\ufe0fte</button>", _DELETE, None),
+        ("a3-cyrillic", "<button>D\u0435lete account</button>", _DELETE, None),
+        ("a3-lookalike", "<button>\u0420\u0430\u0443</button>", _PAY, None),
+        ("a3-greek", "<button>\u03a1\u03b1y</button>", _PAY, None),
+        (
+            "a4-aria",
+            "<div role=button tabindex=0 aria-label=Go>Delete account</div>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a4-labelledby",
+            "<span id=l>Next</span><button aria-labelledby=l>Delete</button>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a4-hidden",
+            "<button><span aria-hidden=true>Delete account</span><span style='position:absolute;left:-9999px'>Continue</span></button>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a4-value",
+            "<form><input name=reason><button aria-label=Go value='Delete account'>OK</button></form>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a4-labelfor",
+            "<label for=s>Go</label><button id=s>Delete account</button>",
+            _DELETE,
+            None,
+        ),
+        ("g1-login", "<button>Lo\u0301g in to vote</button>", "requires sign-in", None),
+        ("g2-title", "<button title='Delete account'>OK</button>", _DELETE, None),
+        (
+            "g2-image",
+            "<input type=image alt='Buy now' aria-label=Go style='width:40px;height:40px'>",
+            _ORDER,
+            None,
+        ),
+        ("g2-login", "<button aria-label=Vote>Log in to vote</button>", "requires sign-in", None),
+        ("g3-split", "<button><span>De</span><span>lete</span></button>", _DELETE, None),
+        (
+            "a5-expanded",
+            "<button type=button aria-expanded=false>Delete account</button>",
+            _DELETE,
+            None,
+        ),
+        ("a5-summary", "<details><summary>Delete account</summary></details>", _DELETE, None),
+        ("g4-pay", "<div role=button tabindex=0 aria-expanded=false>Pay</div>", _PAY, None),
+        ("g4-purchase", "<details><summary>Purchase</summary></details>", _ORDER, None),
+        (
+            "g5-chips",
+            "<div role=toolbar aria-label=Account><button type=button aria-pressed=false>Delete</button><button type=button aria-pressed=false>Keep</button></div>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a6-secondary",
+            "<style>a{display:block}</style><main>" + _A6 + "</main>",
+            _DELETE,
+            {"include_secondary": ("item.del",)},
+        ),
+        (
+            "a7-url",
+            "<style>a{display:block}</style><main>" + _A7 + "</main>",
+            _DELETE,
+            {"absent": "like"},
+        ),
+        (
+            "a8-search",
+            "<form method=get><input type=search name=q><button>Delete all</button></form>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a9-upload",
+            "<form method=post><input type=file><button>Save</button></form>",
+            _blocked("upload"),
+            None,
+        ),
+        (
+            "a10-bogus",
+            "<form><input><button type=bogus>Delete account</button></form>",
+            _DELETE,
+            None,
+        ),
+        (
+            "a10-type-button",
+            "<form><input><button type=button>Delete account</button></form>",
+            _DELETE,
+            None,
+        ),
+        ("g6-submit", "<input type=submit value=Pay>", _PAY, None),
+        ("g6-button", "<input type=button value='Delete account'>", _DELETE, None),
+        (
+            "a11-checkout",
+            "<form method=post action=/checkout/complete><button>Continue</button></form>",
+            _blocked("checkout_submit"),
+            {"page_url": "http://example/checkout"},
+        ),
+        ("a12-iri", None, _ORDER, {"schema": {"@type": "https://schema.org/BuyAction"}}),
+        ("a12-prefix", None, _DELETE, {"schema": {"@type": "schema:DeleteAction"}}),
+        ("a12-list", None, _ORDER, {"schema": {"@type": ["Action", "BuyAction"]}}),
+        ("a12-snake", None, _DELETE, {"tool": "delete_account"}),
+        ("a12-camel", None, _DELETE, {"tool": "deleteItem"}),
+        ("a12-order", None, _ORDER, {"tool": "placeOrder"}),
+        ("a12-purchase", None, _ORDER, {"tool": "purchase"}),
+        ("a12-send", None, _blocked("send"), {"tool": "send_email"}),
+        ("a12-pay", None, _PAY, {"tool": "Pay now"}),
+        ("a12-buy", None, _ORDER, {"tool": "Buy now"}),
+        ("a12-shy", None, _DELETE, {"tool": "Del\u00adete"}),
+        (
+            "a13-role",
+            "<fieldset disabled><div role=button tabindex=0>Save</div></fieldset>",
+            "disabled",
+            None,
+        ),
+        (
+            "a13-shadow",
+            "<fieldset disabled><div id=h></div></fieldset><script>document.getElementById('h').attachShadow({mode:'open'}).innerHTML='<button type=\"button\">Save</button>'</script>",
+            "disabled",
+            None,
+        ),
+    ],
+)
+def test_hard_fail_open(case, html, reason, context, facts_page) -> None:
+    ctx = dict(context or {})
+    if "schema" in ctx:
+        result = map_schema_org_action(ctx["schema"], MapContext(page_url="http://example/"))
+    elif "tool" in ctx:
+        result = map_webmcp_tool({"name": ctx["tool"]}, MapContext(page_url="http://example/"))
+    else:
+        absent = ctx.pop("absent", None)
+        result, _facts = _html(facts_page, html, **ctx)
+        if absent:
+            assert not any(item.enabled and item.id == absent for item in result.affordances)
+    blocked = [item for item in result.affordances if item.x and item.x.reason == reason]
+    found = [
+        (item.id, item.enabled, None if item.x is None else item.x.reason)
+        for item in result.affordances
+    ]
+    assert blocked, (case, found)
+    assert all(item.enabled is False for item in blocked)
+    if reason.startswith("hard-blocked"):
+        assert all(item.x is not None and item.x.tag == "mutating" for item in blocked)

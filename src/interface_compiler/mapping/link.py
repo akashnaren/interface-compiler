@@ -19,6 +19,7 @@ from interface_compiler.mapping.types import (
     input_schema,
     link_id,
     login_gated,
+    name_sources,
     stable_signature,
 )
 
@@ -52,12 +53,17 @@ def map_link_groups(groups: list[RepeatGroup], ctx: MapContext) -> MapResult:
     """One ``open_<entity>`` per entity type. Secondary links stay off unless asked."""
     by_entity: dict[str, list[tuple[ElementFact, list[ElementFact]]]] = {}
     by_action: dict[str, list[tuple[ElementFact, list[ElementFact]]]] = {}
+    blocked: dict[str, ElementFact] = {}
     for group in groups:
         for item in group.items:
             links = [element for element in item.elements if _is_link(element)]
             if not links:
                 continue
             primary = _primary(links)
+            verb = _row_hard(ctx, [primary])
+            if verb:
+                blocked.setdefault(verb, primary)
+                continue
             action = _account_verb(primary, ctx)
             if action:
                 by_action.setdefault(action, []).append((primary, links))
@@ -65,18 +71,8 @@ def map_link_groups(groups: list[RepeatGroup], ctx: MapContext) -> MapResult:
             entity = _entity_name(primary.href or "")
             by_entity.setdefault(entity, []).append((primary, links))
     result = MapResult()
-    blocked: dict[str, ElementFact] = {}
     for entity, rows in by_entity.items():
-        # A safe row must not hide a hard one inside the same entity bucket.
-        safe: list[tuple[ElementFact, list[ElementFact]]] = []
-        for primary, links in rows:
-            verb = ctx.lexicon.verb(primary.name)
-            if verb and ctx.lexicon.hard_block(verb):
-                blocked.setdefault(verb, primary)
-                continue
-            safe.append((primary, links))
-        if safe:
-            result = _merge_entity(result, entity, safe, ctx, action=None)
+        result = _merge_entity(result, entity, rows, ctx, action=None)
     for verb, primary in blocked.items():
         result.affordances.append(
             affordance(
@@ -123,7 +119,10 @@ def _merge_entity(
             if link is primary:
                 continue
             key = _secondary_slug(primary, link)
-            secondaries.setdefault(key, link)
+            if _row_hard(ctx, [link]):
+                secondaries[key] = link
+            else:
+                secondaries.setdefault(key, link)
         if not enabled:
             if reason:
                 skipped.append(reason)
@@ -264,6 +263,15 @@ def _record_id(element: ElementFact, index: int, seen: set[str]) -> str:
     if candidate in seen:
         candidate = f"{candidate}-{index}"
     return candidate
+
+
+def _row_hard(ctx: MapContext, links: list[ElementFact]) -> str | None:
+    for link in links:
+        for text in name_sources(link):
+            verb = ctx.lexicon.verb(text)
+            if ctx.lexicon.hard_block(verb):
+                return verb
+    return None
 
 
 def _account_verb(element: ElementFact, ctx: MapContext) -> str | None:

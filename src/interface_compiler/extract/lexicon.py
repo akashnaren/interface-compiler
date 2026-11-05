@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
-from interface_compiler.extract.naming import normalize_label
+from interface_compiler.extract.naming import match_keys, normalize_label
 
 # Hard-block verbs are matched before mutating verbs, then safe verbs.
 _HARD = frozenset({"pay", "place_order", "checkout_submit", "delete", "send", "upload"})
@@ -32,7 +32,7 @@ _MUTATING = frozenset(
 )
 _VERBS: tuple[tuple[str, str], ...] = (
     ("pay", r"pay(?: now)?|complete (?:purchase|payment)|submit payment"),
-    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy now|purchase"),
+    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy(?: now)?|purchase"),
     ("delete", r"delete|remove (?:account|address|card)|close account"),
     ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
     ("add_to_cart", r"add to (?:cart|bag|basket|trolley)"),
@@ -73,16 +73,17 @@ _VERBS: tuple[tuple[str, str], ...] = (
 )
 _HARD_LABELS: tuple[tuple[str, str], ...] = (
     ("pay", r"pay(?: now)?|complete (?:purchase|payment)|submit payment"),
-    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy now|purchase"),
+    ("place_order", r"place (?:my |your )?order|confirm (?:order|purchase)|buy(?: now)?|purchase"),
     ("delete", r"delete|remove (?:account|address|card)|close account"),
     ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
     ("upload", r"upload"),
 )
-# A hard-block verb matches as a leading phrase, so "Delete account" and
-# "Pay 49.99" count. The rest of the lexicon still matches the whole label.
+# Hard verbs match anywhere on a word boundary ("Yes, delete"). The flat
+# pattern also catches a verb split by a space ("De lete").
 _HARD_COMPILED = tuple(
-    (verb, re.compile(rf"(?:{pattern})(?:\s|$)")) for verb, pattern in _HARD_LABELS
+    (verb, re.compile(rf"(?:^|\s)(?:{pattern})(?:\s|$)")) for verb, pattern in _HARD_LABELS
 )
+_HARD_FLAT = tuple((verb, re.compile(pattern.replace(" ", ""))) for verb, pattern in _HARD_LABELS)
 _COMPILED = tuple((verb, re.compile(rf"^(?:{pattern})$")) for verb, pattern in _VERBS)
 _AMOUNT = re.compile(r"\d+")
 _REDIRECT = frozenset({"next", "return", "return_to", "returnto", "returnurl", "redirect", "goto"})
@@ -130,14 +131,20 @@ class Lexicon:
     """The fixed verb and route tables. Models may rename; they do not add verbs."""
 
     def verb(self, label: str) -> str | None:
-        text = _strip_amounts(normalize_label(label))
-        if not text:
+        spaced, flat = match_keys(label)
+        spaced = _strip_amounts(spaced)
+        flat = _strip_amounts(flat).replace(" ", "")
+        if not spaced and not flat:
             return None
         for name, pattern in _HARD_COMPILED:
-            if pattern.match(text):
+            if spaced and pattern.search(spaced):
                 return name
+        if " " in spaced:
+            for name, pattern in _HARD_FLAT:
+                if flat and pattern.search(flat):
+                    return name
         for name, pattern in _COMPILED:
-            if pattern.fullmatch(text):
+            if pattern.fullmatch(spaced):
                 return name
         return None
 

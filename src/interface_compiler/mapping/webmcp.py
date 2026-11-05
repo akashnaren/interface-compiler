@@ -12,6 +12,7 @@ from interface_compiler.mapping.types import (
     affordance,
     apply_hard_block,
     input_schema,
+    seal_hard_blocks,
     stable_signature,
 )
 
@@ -43,20 +44,23 @@ def map_webmcp_tool(tool: dict[str, Any], ctx: MapContext) -> MapResult:
     locator = Locator.model_validate(
         {"kind": "webmcp", "tool": str(tool.get("name") or name), "named_by": "declared"}
     )
-    return MapResult(
-        affordances=[
-            affordance(
-                name,
-                enabled=enabled,
-                schema=input_schema(properties, required or None),
-                label=str(tool.get("description") or name),
-                locator=locator,
-                grain="declared",
-                tag=tag,
-                reason=reason,
-                signature=stable_signature("webmcp", name),
-            )
-        ]
+    return seal_hard_blocks(
+        MapResult(
+            affordances=[
+                affordance(
+                    name,
+                    enabled=enabled,
+                    schema=input_schema(properties, required or None),
+                    label=str(tool.get("description") or name),
+                    locator=locator,
+                    grain="declared",
+                    tag=tag,
+                    reason=reason,
+                    signature=stable_signature("webmcp", name),
+                )
+            ]
+        ),
+        ctx,
     )
 
 

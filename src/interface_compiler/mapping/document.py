@@ -18,7 +18,13 @@ from interface_compiler.mapping.select import map_select
 from interface_compiler.mapping.tabs import map_tabs
 from interface_compiler.mapping.text import map_text_field
 from interface_compiler.mapping.toggle import map_checkbox
-from interface_compiler.mapping.types import MapContext, MapResult, merge_results
+from interface_compiler.mapping.types import (
+    MapContext,
+    MapResult,
+    merge_results,
+    note_sources,
+    seal_hard_blocks,
+)
 
 _SKIP_ROLES = frozenset(
     {
@@ -65,7 +71,7 @@ def map_facts(facts: PageFacts, ctx: MapContext | None = None) -> MapResult:
     top = _top_modal(facts.modals)
     if top is not None:
         result = apply_dialog(result, top, context)
-    return result
+    return seal_hard_blocks(result, context)
 
 
 def _top_modal(modals: tuple) -> object:
@@ -158,7 +164,12 @@ def _forms(
         fields = [element for element in by_index.get(form.index, []) if id(element) not in used]
         if not fields:
             continue
-        results.append(map_form(form, fields, ctx))
+        mapped = map_form(form, fields, ctx)
+        for action in mapped.affordances:
+            locator = action.x.locator if action.x else None
+            if locator is not None and locator.kind == "form":
+                note_sources(locator, *fields)
+        results.append(mapped)
         used.update(id(element) for element in fields)
     return results
 
@@ -201,6 +212,8 @@ def _one(element: ElementFact, ctx: MapContext) -> MapResult | None:
         return map_combobox(element, ctx)
     if element.role in {"slider", "spinbutton"} or element.input_type in {"range", "number"}:
         return map_range(element, ctx)
+    if element.input_type in {"submit", "image", "button", "reset"}:
+        return map_button(element, ctx)
     if element.role in {"textbox", "searchbox"} or element.tag in {"textarea", "input"}:
         if element.form_index is None:
             return map_text_field(element, ctx)

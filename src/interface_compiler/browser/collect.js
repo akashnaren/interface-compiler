@@ -1661,7 +1661,7 @@
     const tag = tagName(el);
     const type = (getAttribute(el, "type") || "").toLowerCase();
     const submit =
-      (tag === "BUTTON" && (type === "" || type === "submit")) ||
+      (tag === "BUTTON" && type !== "button" && type !== "reset") ||
       (tag === "INPUT" && (type === "submit" || type === "image"));
     if (!submit) {
       return { form_method: null, form_action: null };
@@ -1871,6 +1871,24 @@
     return idShortcut(el) !== "" || nameShortcut(el) !== "";
   }
 
+  function textAlternatives(el) {
+    const parts = [
+      clean(textContent(el)),
+      clean(getAttribute(el, "value")),
+      clean(getAttribute(el, "alt")),
+      clean(getAttribute(el, "title")),
+      associatedLabel(el),
+    ];
+    const tag = tagName(el);
+    if (tag === "BUTTON" || tag === "A" || tag === "SUMMARY") {
+      const images = queryAll(el, "img[alt]");
+      for (let index = 0; index < images.length; index += 1) {
+        parts.push(clean(getAttribute(images[index], "alt")));
+      }
+    }
+    return parts.filter(Boolean);
+  }
+
   function elementRow(el, rect, coveredFlag) {
     const visible = isVisible(el, rect);
     const role = elementRole(el);
@@ -1886,7 +1904,9 @@
       formIndex(el),
       binding.form_method,
       binding.form_action,
-      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
+      role === "option"
+        ? optionDisabled(el)
+        : elementMatches(el, ":disabled") || fieldsetDisables(el),
       el.readOnly === true,
       flagAriaDisabled.get(el) === true,
       flagInert.get(el) === true,
@@ -1922,6 +1942,7 @@
       clean(getAttribute(el, "placeholder")),
       clean(getAttribute(el, "title")),
       describedByText(el),
+      textAlternatives(el),
     ];
   }
 
@@ -2052,6 +2073,7 @@
     "placeholder",
     "title",
     "described_by",
+    "text_alternatives",
   ];
   const covered = coverageOf(kept, keptRects);
   const keptAt = new Map();
@@ -2062,7 +2084,7 @@
     const tag = tagName(control);
     const type = (getAttribute(control, "type") || "").toLowerCase();
     return (
-      (tag === "BUTTON" && (type === "" || type === "submit")) ||
+      (tag === "BUTTON" && type !== "button" && type !== "reset") ||
       (tag === "INPUT" && (type === "submit" || type === "image"))
     );
   }
@@ -2123,11 +2145,7 @@
       }
       seen.add(fieldset);
       if (!inFirstLegend(control, fieldset)) {
-        try {
-          return elementMatches(control, ":disabled");
-        } catch (error) {
-          return true;
-        }
+        return true;
       }
       node = parentNodeAcross(fieldset);
     }

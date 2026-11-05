@@ -1464,7 +1464,7 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
     elif case == "dup-name":
         html = (
             "<button type='button' name='same'>One</button>"
-            + "<div name='n'></div>" * 8_000
+            + "<div name='n'></div>" * 40_000
             + "<button type='button' name='same'>Two</button>"
         )
     elif case == "no-rows":
@@ -1510,6 +1510,7 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
         elif case == "dup-name":
             _require_selector(facts_page, facts, "One", required=True)
             _require_selector(facts_page, facts, "Two", required=False)
+            assert facts.truncated is True
     finally:
         if session is not None:
             session.send("Emulation.setCPUThrottlingRate", {"rate": 1})
@@ -1538,6 +1539,7 @@ def test_facts_ancestor_flags_do_not_wait_for_the_document_walk(facts_page: Page
             timeout=60_000,
         )
         facts = collect_facts(facts_page)
+        assert facts.truncated is True
     finally:
         facts_page.set_content(
             "<!doctype html><title>empty</title>",
@@ -2312,6 +2314,9 @@ try:
     got = len(facts.elements)
     if got <= 0 or got > full or (got < full and not facts.truncated):
         sys.stderr.write("elements=%s truncated=%s" % (got, facts.truncated))
+        raise SystemExit(3)
+    if kind == "late" and not facts.truncated:
+        sys.stderr.write("late not truncated elements=%s\\n" % got)
         raise SystemExit(3)
     if engine.dead:
         raise SystemExit(4)
