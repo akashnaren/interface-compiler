@@ -183,6 +183,20 @@ def test_sign_out_link_is_mutating(label: str) -> None:
     assert mapped.x is not None and mapped.x.tag == "mutating"
 
 
+@pytest.mark.parametrize(
+    ("label", "href", "reason"),
+    [("Delete account", "/account/delete", "hard-blocked in v1: delete")],
+)
+def test_map_link_hard_block(label: str, href: str, reason: str) -> None:
+    result = map_link(
+        _element(tag="a", role="link", name=label, href=href),
+        MapContext(page_url="http://example/"),
+    )
+    mapped = one(result, "go_account")
+    assert mapped.enabled is False
+    assert mapped.x is not None and mapped.x.reason == reason
+
+
 def test_hard_block_beats_missing_after_fill() -> None:
     size = _element(
         tag="select",
@@ -259,6 +273,7 @@ def test_form_gate(mapped_once) -> None:
         "groups",
         "described",
         "rows",
+        "orders",
         "fields",
     ],
 )
@@ -340,6 +355,24 @@ def test_review_fixes(case: str, map_page, facts_page) -> None:
         assert vote.x is not None
         assert vote.x.reason == "requires sign-in" and vote.x.tag == "mutating"
         return
+    if case == "orders":
+        result, _facts = _html(
+            facts_page,
+            "<style>body{margin:0} a{display:block}</style><main>"
+            "<a href='/o/1'>Place your order 1</a>"
+            "<a href='/o/2'>Place your order 2</a>"
+            "<a href='/o/3'>Place your order 3</a></main>",
+        )
+        assert not any(
+            item.id == "open_item"
+            and (item.enabled or (item.x is not None and item.x.tag == "safe"))
+            for item in result.affordances
+        )
+        order = one(result, "place_order")
+        assert order.enabled is False
+        assert order.x is not None and order.x.reason == "hard-blocked in v1: place_order"
+        assert order.input.model_dump(exclude_none=True) == {"type": "object", "properties": {}}
+        return
     result, _facts = _html(
         facts_page,
         "<form id='dead' method='post' action='/save'>"
@@ -374,6 +407,7 @@ def _cue(case: str, sample: str) -> bool:
         ("hint", "Please sign in to continue", True),
         ("hint", "nonmembers only", False),
         ("fieldset", "save", False),
+        ("mixed", "save", False),
         ("legend", "save", True),
         ("choices", "add_to_cart", False),
         ("modal", "high", True),
@@ -398,6 +432,19 @@ def test_fieldset_modal_and_login_cues(
         assert saved.enabled is expected and saved.x is not None and saved.x.reason == "disabled"
         assert facts.forms[0].disabled is True
         assert next(item for item in facts.elements if item.html_id == "email").disabled is True
+        return
+    if case == "mixed":
+        result, facts = _html(
+            page,
+            "<form method='post' action='/c'><fieldset disabled>"
+            "<input name='email' aria-label='Email'></fieldset>"
+            "<input name='name' aria-label='Name'><button>Save</button></form>",
+        )
+        saved = one(result, sample)
+        assert saved.enabled is False
+        assert saved.x is not None and saved.x.reason == "disabled"
+        assert facts.forms[0].disabled is True
+        assert "email" not in props(saved)
         return
     if case == "legend":
         result, facts = _html(

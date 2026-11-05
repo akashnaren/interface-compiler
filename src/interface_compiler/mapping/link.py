@@ -14,6 +14,7 @@ from interface_compiler.mapping.types import (
     MapContext,
     MapResult,
     affordance,
+    apply_hard_block,
     ax_locator,
     input_schema,
     link_id,
@@ -28,6 +29,8 @@ def map_link(element: ElementFact, ctx: MapContext) -> MapResult:
     affordance_id = link_id(element, ctx)
     gated = login_gated(element, ctx, affordance_id)
     enabled, reason = element_enabled(element, login_gated=gated)
+    verb = ctx.lexicon.verb(element.name)
+    enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
     tag = _link_tag(element, ctx)
     return MapResult(
         affordances=[
@@ -62,8 +65,31 @@ def map_link_groups(groups: list[RepeatGroup], ctx: MapContext) -> MapResult:
             entity = _entity_name(primary.href or "")
             by_entity.setdefault(entity, []).append((primary, links))
     result = MapResult()
+    blocked: dict[str, ElementFact] = {}
     for entity, rows in by_entity.items():
-        result = _merge_entity(result, entity, rows, ctx, action=None)
+        # A safe row must not hide a hard one inside the same entity bucket.
+        safe: list[tuple[ElementFact, list[ElementFact]]] = []
+        for primary, links in rows:
+            verb = ctx.lexicon.verb(primary.name)
+            if verb and ctx.lexicon.hard_block(verb):
+                blocked.setdefault(verb, primary)
+                continue
+            safe.append((primary, links))
+        if safe:
+            result = _merge_entity(result, entity, safe, ctx, action=None)
+    for verb, primary in blocked.items():
+        result.affordances.append(
+            affordance(
+                verb,
+                enabled=False,
+                label=primary.name,
+                locator=ax_locator(primary),
+                grain="single",
+                tag=ctx.lexicon.tag(verb),
+                reason=ctx.lexicon.hard_block(verb),
+                signature=stable_signature("hard-link", verb, primary.landmark),
+            )
+        )
     for action, rows in by_action.items():
         result = _merge_entity(result, action, rows, ctx, action=action)
     return result

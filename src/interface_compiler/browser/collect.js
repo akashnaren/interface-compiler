@@ -2157,7 +2157,8 @@
         continue;
       }
       try {
-        if (!elementMatches(control, ":disabled")) {
+        // A later enabled control must not clear a fieldset that already blocked.
+        if (!blocked && !elementMatches(control, ":disabled")) {
           return false;
         }
       } catch (error) {
