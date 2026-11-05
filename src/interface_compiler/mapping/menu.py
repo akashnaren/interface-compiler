@@ -98,7 +98,12 @@ def _options(button: ElementFact, items: list[ElementFact], ctx: MapContext) -> 
                 enabled=enabled,
                 schema=input_schema({field: prop}, [field]),
                 label=button.name,
-                locator=ax_locator(button, kind="group", options={name: name for name in visible}),
+                locator=ax_locator(
+                    button,
+                    kind="group",
+                    options={name: name for name in visible},
+                    sources=tuple(items),
+                ),
                 grain="field",
                 tag="safe",
                 reason=reason,

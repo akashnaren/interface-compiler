@@ -46,6 +46,7 @@ def map_pagination(links: list[ElementFact], ctx: MapContext) -> MapResult:
                     page_links[0],
                     kind="group",
                     options={str(number): str(number) for number in numbers},
+                    sources=tuple(page_links),
                 ),
                 grain="field",
                 tag="safe",

@@ -42,7 +42,12 @@ def map_tabs(
                     [prop_name],
                 ),
                 label=label,
-                locator=ax_locator(sample, kind="group", options={name: name for name in names}),
+                locator=ax_locator(
+                    sample,
+                    kind="group",
+                    options={name: name for name in names},
+                    sources=tuple(tabs),
+                ),
                 grain="field",
                 tag="safe",
                 reason=None if enabled and names else (reason or "not visible"),

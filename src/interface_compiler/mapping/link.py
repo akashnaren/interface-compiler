@@ -18,8 +18,8 @@ from interface_compiler.mapping.types import (
     ax_locator,
     input_schema,
     link_id,
-    login_gated,
     name_sources,
+    note_sources,
     stable_signature,
 )
 
@@ -28,8 +28,7 @@ _PAGE = 10
 
 def map_link(element: ElementFact, ctx: MapContext) -> MapResult:
     affordance_id = link_id(element, ctx)
-    gated = login_gated(element, ctx, affordance_id)
-    enabled, reason = element_enabled(element, login_gated=gated)
+    enabled, reason = element_enabled(element)
     verb = ctx.lexicon.verb(element.name)
     enabled, reason = apply_hard_block(enabled, reason, verb, ctx.lexicon)
     tag = _link_tag(element, ctx)
@@ -112,8 +111,7 @@ def _merge_entity(
     landmark = ""
     affordance_id = action or f"open_{entity}"
     for index, (primary, links) in enumerate(rows):
-        gated = login_gated(primary, ctx, affordance_id)
-        enabled, reason = element_enabled(primary, login_gated=gated)
+        enabled, reason = element_enabled(primary)
         landmark = landmark or primary.landmark
         for link in links:
             if link is primary:
@@ -151,6 +149,7 @@ def _merge_entity(
             "named_by": "rule",
         }
     )
+    note_sources(locator, *(primary for primary, _links in rows))
     result.affordances.append(
         affordance(
             affordance_id,
@@ -180,8 +179,7 @@ def _merge_entity(
         if not wanted:
             continue
         secondary_id = f"open_{entity}_{slug_key}"
-        sec_gated = login_gated(link, ctx, secondary_id)
-        sec_enabled, sec_reason = element_enabled(link, login_gated=sec_gated)
+        sec_enabled, sec_reason = element_enabled(link)
         sec_verb = ctx.lexicon.verb(link.name)
         sec_enabled, sec_reason = apply_hard_block(sec_enabled, sec_reason, sec_verb, ctx.lexicon)
         result.affordances.append(

@@ -168,7 +168,7 @@ def _forms(
         for action in mapped.affordances:
             locator = action.x.locator if action.x else None
             if locator is not None and locator.kind == "form":
-                note_sources(locator, *fields)
+                note_sources(locator, *fields, urls=(form.action,))
         results.append(mapped)
         used.update(id(element) for element in fields)
     return results

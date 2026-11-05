@@ -11,11 +11,13 @@ from urllib.parse import urlsplit
 from interface_compiler.browser.facts import ElementFact
 from interface_compiler.contract.models import Affordance, AffordanceX, InputSchema, Locator
 from interface_compiler.extract.lexicon import Lexicon
-from interface_compiler.extract.naming import match_key, normalize_label, slug
+from interface_compiler.extract.naming import match_key, normalize_label, slug, suspect_label
 
 _DIGIT = re.compile(r"\d")
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
 _SOURCES: dict[int, tuple[str, ...]] = {}
+_ELEMENTS: dict[int, tuple[ElementFact, ...]] = {}
+_URLS: dict[int, tuple[str, ...]] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,13 +119,21 @@ def name_sources(element: ElementFact) -> tuple[str, ...]:
     return tuple(found)
 
 
-def note_sources(locator: Locator, *elements: ElementFact) -> None:
+def note_sources(locator: Locator, *elements: ElementFact, urls: tuple[str, ...] = ()) -> None:
+    key = id(locator)
     texts = tuple(text for element in elements for text in name_sources(element))
     if texts:
-        _SOURCES[id(locator)] = _SOURCES.get(id(locator), ()) + texts
+        _SOURCES[key] = _SOURCES.get(key, ()) + texts
+    if elements:
+        _ELEMENTS[key] = _ELEMENTS.get(key, ()) + elements
+    extra = tuple(url for url in urls if url)
+    if extra:
+        _URLS[key] = _URLS.get(key, ()) + extra
 
 
 def ax_locator(element: ElementFact, **extra: object) -> Locator:
+    raw = extra.pop("sources", ())
+    group = tuple(raw) if isinstance(raw, (list, tuple)) else ()
     payload: dict[str, object] = {
         "kind": "ax",
         "role": element.role,
@@ -137,7 +147,7 @@ def ax_locator(element: ElementFact, **extra: object) -> Locator:
     }
     payload.update(extra)
     locator = Locator.model_validate(payload)
-    note_sources(locator, element)
+    note_sources(locator, element, *group)
     return locator
 
 
@@ -238,6 +248,25 @@ def _hard_verb(lexicon: Lexicon, *texts: str) -> str | None:
     return None
 
 
+def _needs_login(
+    ctx: MapContext,
+    affordance_id: str,
+    texts: list[str],
+    elements: tuple[ElementFact, ...],
+    urls: tuple[str, ...],
+) -> bool:
+    if affordance_id == "go_sign_in" or ctx.signed_in:
+        return False
+    lexicon = ctx.lexicon
+    if any(text and (lexicon.login_label(text) or lexicon.login_hint(text)) for text in texts):
+        return True
+    if any(login_gated(element, ctx, affordance_id) for element in elements):
+        return True
+    return any(
+        lexicon.login_target(url, account_action=lexicon.account_action(url=url)) for url in urls
+    )
+
+
 def seal_hard_blocks(result: MapResult, ctx: MapContext) -> MapResult:
     updated: list[Affordance] = []
     for action in result.affordances:
@@ -246,13 +275,18 @@ def seal_hard_blocks(result: MapResult, ctx: MapContext) -> MapResult:
             updated.append(action)
             continue
         texts = [extra.label or "", action.id]
+        elements: tuple[ElementFact, ...] = ()
+        urls: tuple[str, ...] = ()
         locator = extra.locator
         if locator is not None:
             texts.append(locator.name or "")
             if locator.tool:
                 texts.append(locator.tool)
             texts.extend(locator.options or ())
-            texts.extend(_SOURCES.get(id(locator), ()))
+            key = id(locator)
+            texts.extend(_SOURCES.get(key, ()))
+            elements = _ELEMENTS.get(key, ())
+            urls = _URLS.get(key, ())
         for prop in action.input.properties.values():
             texts.extend(str(item) for item in prop.enum or ())
         verb = _hard_verb(ctx.lexicon, *texts)
@@ -261,19 +295,35 @@ def seal_hard_blocks(result: MapResult, ctx: MapContext) -> MapResult:
             current = reason.removeprefix("hard-blocked in v1: ")
             if ctx.lexicon.hard_block(current):
                 verb = current
-        if verb is None:
+        if verb is None and any(element.input_type == "file" for element in elements):
+            verb = "upload"
+        login = _needs_login(ctx, action.id, texts, elements, urls)
+        mixed = verb is None and any(text and suspect_label(text) for text in texts)
+        if verb is None and not login and not mixed:
             updated.append(action)
             continue
-        if reason not in _BEFORE_HARD:
-            reason = ctx.lexicon.hard_block(verb)
+        tag = extra.tag
+        if login and reason not in _BEFORE_HARD:
+            reason = "requires sign-in"
+        elif mixed and reason not in _BEFORE_HARD:
+            reason = "hard-blocked in v1: mixed-script label"
+            tag = "mutating"
+        elif verb is not None and reason not in _BEFORE_HARD:
+            blocked = ctx.lexicon.hard_block(verb)
+            if blocked:
+                reason = blocked
+        if verb is not None:
+            tag = ctx.lexicon.tag(verb)
         updated.append(
             action.model_copy(
                 update={
                     "enabled": False,
-                    "x": extra.model_copy(update={"reason": reason, "tag": ctx.lexicon.tag(verb)}),
+                    "x": extra.model_copy(update={"reason": reason, "tag": tag}),
                 }
             )
         )
     result.affordances = updated
     _SOURCES.clear()
+    _ELEMENTS.clear()
+    _URLS.clear()
     return result

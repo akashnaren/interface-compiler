@@ -12,15 +12,13 @@ from interface_compiler.mapping.types import (
     apply_hard_block,
     ax_locator,
     button_id,
-    login_gated,
     stable_signature,
 )
 
 
 def map_button(element: ElementFact, ctx: MapContext) -> MapResult:
     affordance_id = button_id(element.name, ctx.lexicon)
-    gated = login_gated(element, ctx, affordance_id)
-    enabled, reason = element_enabled(element, login_gated=gated)
+    enabled, reason = element_enabled(element)
     enabled, reason = apply_hard_block(enabled, reason, ctx.lexicon.verb(element.name), ctx.lexicon)
     tag = ctx.lexicon.tag(ctx.lexicon.verb(element.name))
     state: dict[str, bool] = {}

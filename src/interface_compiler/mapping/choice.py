@@ -38,7 +38,10 @@ def map_choice_group(options: list[ElementFact], ctx: MapContext) -> MapResult:
                 schema=schema,
                 label=field,
                 locator=ax_locator(
-                    sample, kind="group", options={label: label for label in labels}
+                    sample,
+                    kind="group",
+                    options={label: label for label in labels},
+                    sources=tuple(options),
                 ),
                 grain="field",
                 tag="safe",

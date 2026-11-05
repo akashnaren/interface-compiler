@@ -579,6 +579,7 @@ def _blocked(verb: str) -> str:
 _DELETE = _blocked("delete")
 _PAY = _blocked("pay")
 _ORDER = _blocked("place_order")
+_MIXED = _blocked("mixed-script label")
 _A6 = "".join(
     f"<article><h2><a href='/item/{index}'>Item {index}</a></h2>"
     f"<a href='/item/{index}/del'>{label}</a></article>"
@@ -593,9 +594,17 @@ _A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
         ("a1-yes", "<button>Yes, delete</button>", _DELETE, None),
         ("a1-permanently", "<button>Permanently delete account</button>", _DELETE, None),
         ("a2-marks", "<button>De\u00a0le\u0301\u034f\u3164\ufe0fte</button>", _DELETE, None),
-        ("a3-cyrillic", "<button>D\u0435lete account</button>", _DELETE, None),
-        ("a3-lookalike", "<button>\u0420\u0430\u0443</button>", _PAY, None),
-        ("a3-greek", "<button>\u03a1\u03b1y</button>", _PAY, None),
+        ("a3-cyrillic", "<button>D\u0435lete account</button>", _MIXED, None),
+        ("a3-greek", "<button>\u03a1\u03b1y</button>", _MIXED, None),
+        ("r9-alpha", "<button>P\u0251y</button>", _MIXED, None),
+        ("r9-smallcaps", "<button>\ua731\u1d07\u0274\u1d05</button>", _MIXED, None),
+        ("r9-lisu", "<button>\ua4d3elete</button>", _MIXED, None),
+        ("r9-armenian", "<button>Se\u0578d</button>", _MIXED, None),
+        ("r9-cyr-t", "<button>pos\u0442</button>", _MIXED, None),
+        ("r9-cyr-m", "<button>re\u043cove account</button>", _MIXED, None),
+        ("r9-upsilon", "<button>\u03c5pload</button>", _MIXED, None),
+        ("r9-nu-send", "<button>se\u03bdd</button>", _MIXED, None),
+        ("r9-nu-login", "<button>log i\u03bd</button>", _MIXED, None),
         (
             "a4-aria",
             "<div role=button tabindex=0 aria-label=Go>Delete account</div>",
@@ -695,6 +704,102 @@ _A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
             _blocked("checkout_submit"),
             {"page_url": "http://example/checkout"},
         ),
+        (
+            "r9-formmethod",
+            "<form method=get action=/checkout><button formmethod=post>Continue</button></form>",
+            _blocked("checkout_submit"),
+            {"page_url": "http://example/checkout"},
+        ),
+        (
+            "r9-chips",
+            (
+                "<div role=toolbar aria-label=Account>"
+                "<button type=button aria-pressed=false>Keep</button>"
+                "<button type=button aria-pressed=false aria-label=Keep>Delete</button></div>"
+            ),
+            _DELETE,
+            None,
+        ),
+        (
+            "r9-tabs",
+            (
+                "<div role=tablist aria-label=Details>"
+                "<button type=button role=tab aria-selected=true>Specs</button>"
+                "<button type=button role=tab aria-label=Keep>Delete</button></div>"
+            ),
+            _DELETE,
+            None,
+        ),
+        (
+            "r9-menu",
+            (
+                "<button type=button aria-haspopup=menu aria-expanded=true aria-controls=m>Sort</button>"
+                "<div id=m role=menu><div role=menuitemradio aria-checked=true>Newest</div>"
+                "<div role=menuitemradio aria-label=Keep>Delete</div></div>"
+            ),
+            _DELETE,
+            None,
+        ),
+        (
+            "r9-page",
+            (
+                "<nav><a href=/p/1>1</a><a href=/p/2 aria-label=2>Delete</a>"
+                "<a href=/p/3>Next</a></nav>"
+            ),
+            _DELETE,
+            None,
+        ),
+        (
+            "r9-login-title",
+            "<button type=button aria-expanded=false title='Login required'>Details</button>",
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r9-login-summary",
+            "<details><summary>Log in to vote</summary></details>",
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r9-login-switch",
+            "<div role=switch tabindex=0 title='Login required'>Off</div>",
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r9-login-chip",
+            (
+                "<div role=toolbar aria-label=Account>"
+                "<button type=button aria-pressed=false>Keep</button>"
+                "<button type=button aria-pressed=false title='Login required'>Keep</button></div>"
+            ),
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r9-login-tab",
+            (
+                "<div role=tablist aria-label=Details>"
+                "<button type=button role=tab aria-selected=true>Specs</button>"
+                "<button type=button role=tab title='Login required'>Reviews</button></div>"
+            ),
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r9-order",
+            None,
+            _blocked("order"),
+            {"schema": {"@type": "https://schema.org/OrderAction"}},
+        ),
+        (
+            "r9-communicate",
+            None,
+            _blocked("send"),
+            {"schema": {"@type": ["Action", "schema:CommunicateAction"]}},
+        ),
+        ("r9-file", "<input type=file>", _blocked("upload"), None),
         ("a12-iri", None, _ORDER, {"schema": {"@type": "https://schema.org/BuyAction"}}),
         ("a12-prefix", None, _DELETE, {"schema": {"@type": "schema:DeleteAction"}}),
         ("a12-list", None, _ORDER, {"schema": {"@type": ["Action", "BuyAction"]}}),

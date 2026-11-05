@@ -67,7 +67,12 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
     if isinstance(target, dict):
         template = str(target.get("urlTemplate") or "")
     enabled, reason = True, None
-    hard = _HARD_TYPES.get(type_name)
+    hard = None
+    for part in parts:
+        tail = str(part).rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        if tail in _HARD_TYPES:
+            hard = _HARD_TYPES[tail]
+            break
     if hard:
         enabled, reason = False, f"hard-blocked in v1: {hard}"
     elif verb in {"pay", "delete", "send"}:

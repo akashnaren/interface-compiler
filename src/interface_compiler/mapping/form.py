@@ -20,7 +20,6 @@ from interface_compiler.mapping.types import (
     apply_hard_block,
     ax_locator,
     input_schema,
-    login_gated,
     merge_results,
     stable_signature,
 )
@@ -36,7 +35,8 @@ def map_form(form: FormFact, fields: list[ElementFact], ctx: MapContext) -> MapR
     submit = submits[0] if submits else None
     verb = ctx.lexicon.verb(submit.name) if submit else None
     view = ctx.view_hint or ctx.lexicon.view_for_href(ctx.page_url)
-    if view == "checkout" and form.method != "get" and not ctx.lexicon.hard_block(verb):
+    method = submit.form_method if submit is not None and submit.form_method else form.method
+    if view == "checkout" and method != "get" and not ctx.lexicon.hard_block(verb):
         verb = "checkout_submit"
     if _field_grain(controls, verb):
         return _field_grain_result(form, controls, submit, verb, ctx)
@@ -137,8 +137,7 @@ def _field_grain_result(
     for group in radios.values():
         parts.append(map_choice_group(group, ctx))
     if submit is not None and verb:
-        gated = _form_login(submit, form.action, ctx, verb)
-        enabled, reason = element_enabled(submit, login_gated=gated)
+        enabled, reason = element_enabled(submit)
         enabled, reason = gate_submit(
             enabled,
             reason,
@@ -205,13 +204,10 @@ def _form_grain_result(
         affordance_id = "submit_" + (_form_slug(form, controls) or "form")
     label = submit.name if submit else affordance_id
     upload = any(element.input_type == "file" for element in controls)
-    gated = _form_login(submit, form.action, ctx, affordance_id)
-    if affordance_id == "go_sign_in":
-        gated = False
     if submit is not None:
-        enabled, reason = element_enabled(submit, login_gated=gated)
+        enabled, reason = element_enabled(submit)
     else:
-        enabled, reason = _form_enabled(form, controls, login_gated=gated)
+        enabled, reason = _form_enabled(form, controls, login_gated=False)
     enabled, reason = gate_submit(
         enabled,
         reason,
@@ -278,23 +274,6 @@ def _free_text(element: ElementFact) -> bool:
     if element.tag == "textarea":
         return True
     return element.input_type in _FREE or element.role in {"textbox", "searchbox"}
-
-
-def _form_login(
-    submit: ElementFact | None,
-    action: str,
-    ctx: MapContext,
-    affordance_id: str,
-) -> bool:
-    if submit is not None and login_gated(submit, ctx, affordance_id, action=action):
-        return True
-    return ctx.lexicon.login_target(
-        action,
-        account_action=ctx.lexicon.account_action(
-            label=submit.name if submit else "",
-            url=action,
-        ),
-    )
 
 
 def _missing(form: FormFact, controls: list[ElementFact]) -> list[str]:

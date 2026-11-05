@@ -11,8 +11,6 @@ from interface_compiler.browser.facts import ElementFact
 _IGNORABLE = frozenset(
     chr(code) for code in (0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0)
 )
-# Look-alikes that can spell a hard verb. Folded after casefold.
-_LOOKALIKE = str.maketrans("аеорсхуіјѕԁԛԝһӏαονρτκι", "aeopcxyijsdqwhlaovptki")
 
 _ALIAS = (
     (re.compile(r"^(?:q|s|query|search|keywords?|k|search_query|search_term_string)$"), "query"),
@@ -92,7 +90,7 @@ def match_keys(text: str) -> tuple[str, str]:
             kept.append(" ")
             continue
         kept.append(char)
-    folded = "".join(kept).casefold().translate(_LOOKALIKE)
+    folded = "".join(kept).casefold()
     chars = [char if char.isalnum() or char.isspace() else " " for char in folded]
     spaced = " ".join("".join(chars).split())
     return spaced, spaced.replace(" ", "")
@@ -100,6 +98,37 @@ def match_keys(text: str) -> tuple[str, str]:
 
 def match_key(text: str) -> str:
     return match_keys(text)[0]
+
+
+def suspect_label(text: str) -> bool:
+    """Latin mixed with another script, or a confusable extended letter.
+
+    IPA, small capitals, Lisu, and Armenian are suspect on their own.
+    A fully Cyrillic or Greek label is not.
+    """
+    latin = other = False
+    for char in unicodedata.normalize("NFKD", text):
+        if char in _IGNORABLE or unicodedata.category(char) in {"Mn", "Me", "Cf"}:
+            continue
+        if not char.isalpha():
+            latin = other = False
+            continue
+        code = ord(char)
+        if (
+            0x0250 <= code <= 0x02AF
+            or 0x1D00 <= code <= 0x1D2B
+            or 0xA730 <= code <= 0xA7FF
+            or 0xA4D0 <= code <= 0xA4FF
+            or 0x0530 <= code <= 0x058F
+        ):
+            return True
+        if char.isascii() or 0x00C0 <= code <= 0x024F or 0x1E00 <= code <= 0x1EFF:
+            latin = True
+        else:
+            other = True
+        if latin and other:
+            return True
+    return False
 
 
 def normalize_label(text: str) -> str:
