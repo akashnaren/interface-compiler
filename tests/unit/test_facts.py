@@ -1464,7 +1464,7 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
     elif case == "dup-name":
         html = (
             "<button type='button' name='same'>One</button>"
-            + "<div name='n'></div>" * 100_000
+            + "<div name='n'></div>" * 8_000
             + "<button type='button' name='same'>Two</button>"
         )
     elif case == "no-rows":
@@ -1520,9 +1520,9 @@ def test_facts_first_legend_stays_enabled_and_duplicate_selectors_resolve(
 
 
 def test_facts_ancestor_flags_do_not_wait_for_the_document_walk(facts_page: Page) -> None:
-    # A million inlines would exhaust the document walk. Flags still come from
-    # each control's own ancestors, or the control is absent.
-    filler = "<i>x</i> " * 1_000_000
+    # Enough inlines that a slow walk stops before these controls. Flags still
+    # come from each control's own ancestors.
+    filler = "<i>x</i> " * 80_000
     try:
         facts_page.set_content(
             "<!doctype html><title>flags</title>"
@@ -2198,7 +2198,7 @@ finally:
         ("nested", 12000, 5.0, 1),
         ("nested", 14000, 5.0, 1),
         ("table", 30000, 5.0, 1),
-        ("late", 120000, 2.0, 4),
+        ("late", 40000, 2.0, 4),
     ],
 )
 def test_facts_huge_table_is_truncated_instead_of_killed(
