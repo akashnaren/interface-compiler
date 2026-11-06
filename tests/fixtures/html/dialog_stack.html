@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Stack</title>
+  <style>body { margin: 0; }</style>
+</head>
+<body>
+<button id="outside" type="button">Outside</button>
+<dialog id="lower" aria-label="Lower">
+  <button id="lower-btn" type="button" style="width:80px;height:24px">Lower</button>
+</dialog>
+<dialog id="plain" open aria-label="Plain" style="position:absolute;top:280px;left:0;width:140px">
+  <button id="plain-btn" type="button" style="width:80px;height:24px">Plain</button>
+  <div style="position:absolute;inset:0"></div>
+</dialog>
+<dialog id="top" aria-label="Top">
+  <button id="stay" type="button" style="width:80px;height:24px">Stay</button>
+  <span style="position:relative;display:inline-block;width:80px;height:24px">
+    <button id="under" type="button" style="width:80px;height:24px">Under</button>
+    <span style="position:absolute;left:0;top:0;width:80px;height:24px;display:inline-block"></span>
+  </span>
+</dialog>
+<script>
+  document.getElementById("lower").showModal();
+  document.getElementById("top").showModal();
+</script>
+</body>
+</html>

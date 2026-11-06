@@ -10,6 +10,7 @@
   const pageTitle = document.title;
   const walkStarted = performance.now();
   let truncated = false;
+  let topModalEl = null;
   let indexFinished = false;
   // Selection, the index, and per-row flags stop on shares of the walk budget.
   // A later phase still runs after an earlier one sets truncated, so a slow
@@ -83,6 +84,10 @@
   const readNodeType = Object.getOwnPropertyDescriptor(Node.prototype, "nodeType").get;
   const readTextContent = Object.getOwnPropertyDescriptor(Node.prototype, "textContent").get;
   const readFormAction = Object.getOwnPropertyDescriptor(HTMLFormElement.prototype, "action").get;
+  const readFormElements = Object.getOwnPropertyDescriptor(
+    HTMLFormElement.prototype,
+    "elements",
+  ).get;
   const readGetAttribute = Element.prototype.getAttribute;
   const readHasAttribute = Element.prototype.hasAttribute;
   const readClosest = Element.prototype.closest;
@@ -93,6 +98,44 @@
   const readQuery = Element.prototype.querySelector;
   const readQueryAll = Element.prototype.querySelectorAll;
   const readElementFromPoint = Document.prototype.elementFromPoint;
+  const readGetRootNode = Node.prototype.getRootNode;
+  const readDocGetElementById = Document.prototype.getElementById;
+  const readShadowGetElementById = ShadowRoot.prototype.getElementById;
+  const readDocQueryAll = Document.prototype.querySelectorAll;
+  const readShadowQueryAll = ShadowRoot.prototype.querySelectorAll;
+
+  // Mixin getters (ParentNode.children) are not own properties of ShadowRoot.
+  function prototypeCall(object, name) {
+    let current = object;
+    while (current) {
+      const found = Object.getOwnPropertyDescriptor(current, name);
+      if (found && typeof found.value === "function") {
+        return found.value;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  }
+
+  function prototypeGetter(object, name) {
+    let current = object;
+    while (current) {
+      const found = Object.getOwnPropertyDescriptor(current, name);
+      if (found && found.get) {
+        return found.get;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  }
+
+  const readShadowRoot = prototypeGetter(Element.prototype, "shadowRoot");
+  const readShadowHost = prototypeGetter(ShadowRoot.prototype, "host");
+  const readShadowChildren = prototypeGetter(ShadowRoot.prototype, "children");
+  const readShadowFromPoint = prototypeCall(ShadowRoot.prototype, "elementFromPoint");
+  // Piercing every node on a huge page costs more than the walk budget.
+  // Above this, shadow content is omitted (fail closed) instead of scanned.
+  const pierceLimit = 8000;
   // A control named willValidate hides the IDL getter on its form. Each
   // element type has its own getter; calling the wrong one throws.
   const readWillValidate = {
@@ -174,12 +217,234 @@
     return readElementFromPoint.call(document, x, y);
   }
 
+  // elementFromPoint stops at a shadow host. Open roots are walked to the real
+  // target. A closed root throws or is null, and the host stays the hit.
+  function hitTarget(x, y) {
+    let hit = elementFromPoint(x, y);
+    const seen = new Set();
+    while (hit && !seen.has(hit)) {
+      seen.add(hit);
+      const root = openShadow(hit);
+      if (!root || !readShadowFromPoint) {
+        break;
+      }
+      let inner = null;
+      try {
+        inner = readShadowFromPoint.call(root, x, y);
+      } catch (error) {
+        break;
+      }
+      if (!inner || inner === hit) {
+        break;
+      }
+      hit = inner;
+    }
+    return hit;
+  }
+
   function willValidate(el) {
     const read = readWillValidate[tagName(el)];
     if (!read) {
       return false;
     }
     return read.call(el) === true;
+  }
+
+  // Closed shadow roots and unreadable roots are null. Callers omit them.
+  function openShadow(el) {
+    if (!el || nodeType(el) !== 1 || !readShadowRoot) {
+      return null;
+    }
+    try {
+      const root = readShadowRoot.call(el);
+      if (!root || nodeType(root) !== 11) {
+        return null;
+      }
+      if (root.mode && root.mode !== "open") {
+        return null;
+      }
+      return root;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function shadowHostOf(el) {
+    try {
+      const root = readGetRootNode.call(el);
+      if (!root || nodeType(root) !== 11) {
+        return null;
+      }
+      return readShadowHost.call(root) || null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function shadowChildren(el) {
+    const root = openShadow(el);
+    if (!root || !readShadowChildren) {
+      return [];
+    }
+    try {
+      return Array.from(readShadowChildren.call(root));
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function parentNodeAcross(node) {
+    const parent = parentElement(node);
+    if (parent) {
+      return parent;
+    }
+    return shadowHostOf(node);
+  }
+
+  function elementById(id, hint) {
+    if (!id) {
+      return null;
+    }
+    if (hint) {
+      try {
+        const root = readGetRootNode.call(hint);
+        if (root && nodeType(root) === 11) {
+          const found = readShadowGetElementById.call(root, id);
+          if (found) {
+            return found;
+          }
+        }
+      } catch (error) {
+        return null;
+      }
+    }
+    try {
+      return readDocGetElementById.call(document, id);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function canPierceShadows() {
+    return document.getElementsByTagName("*").length <= pierceLimit;
+  }
+
+  function lightHasOpenShadow() {
+    let nodes;
+    try {
+      nodes = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return true;
+    }
+    for (let index = 0; index < nodes.length; index += 1) {
+      if (openShadow(nodes[index])) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function describedByText(el) {
+    const labelled = getAttribute(el, "aria-describedby");
+    if (!labelled) {
+      return "";
+    }
+    const parts = [];
+    for (const id of String(labelled).split(/\s+/)) {
+      if (!id) {
+        continue;
+      }
+      const target = elementById(id, el);
+      if (target) {
+        parts.push(ownText(target) || clean(textContent(target)));
+      }
+    }
+    return clean(parts.join(" "));
+  }
+
+  // Light DOM plus open shadow roots. A closed root or a thrown read is skipped.
+  function collectMatching(selector) {
+    let nodes;
+    try {
+      nodes = readDocQueryAll.call(document, selector);
+    } catch (error) {
+      return [];
+    }
+    const found = [];
+    for (let index = 0; index < nodes.length; index += 1) {
+      found.push(nodes[index]);
+    }
+    if (!canPierceShadows()) {
+      // Open-shadow controls are not collected on a huge page. Say so.
+      if (lightHasOpenShadow()) {
+        truncated = true;
+      }
+      return found;
+    }
+    const seen = new Set(found);
+    const stack = [];
+    let hosts;
+    try {
+      hosts = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return found;
+    }
+    for (let index = 0; index < hosts.length; index += 1) {
+      const shadow = openShadow(hosts[index]);
+      if (shadow) {
+        stack.push(shadow);
+      }
+    }
+    while (stack.length) {
+      const root = stack.pop();
+      let inner;
+      let innerHosts;
+      try {
+        inner = readShadowQueryAll.call(root, selector);
+        innerHosts = readShadowQueryAll.call(root, "*");
+      } catch (error) {
+        continue;
+      }
+      for (let index = 0; index < inner.length; index += 1) {
+        const el = inner[index];
+        if (!seen.has(el)) {
+          seen.add(el);
+          found.push(el);
+        }
+      }
+      for (let index = 0; index < innerHosts.length; index += 1) {
+        const shadow = openShadow(innerHosts[index]);
+        if (shadow) {
+          stack.push(shadow);
+        }
+      }
+    }
+    return found;
+  }
+
+  function closestAcross(el, selector) {
+    const found = closest(el, selector);
+    if (found) {
+      return found;
+    }
+    let node = el;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      seen.add(node);
+      const host = shadowHostOf(node);
+      if (!host || seen.has(host)) {
+        return null;
+      }
+      if (elementMatches(host, selector)) {
+        return host;
+      }
+      const outer = closest(host, selector);
+      if (outer) {
+        return outer;
+      }
+      node = host;
+    }
+    return null;
   }
 
   function clean(value) {
@@ -262,7 +527,7 @@
         if (!id) {
           continue;
         }
-        const target = document.getElementById(id);
+        const target = elementById(id, el);
         if (target) {
           parts.push(ownText(target) || clean(textContent(target)));
         }
@@ -282,6 +547,7 @@
   let nthOfType = new Map();
   let legendText = new Map();
   let formIndexes = new Map();
+  let indexedForms = [];
   let flagHidden = new Map();
   let flagAriaHidden = new Map();
   let flagInert = new Map();
@@ -328,7 +594,7 @@
     if (labelledBy) {
       const parts = [];
       for (const id of labelledBy.split(/\s+/)) {
-        const target = id ? document.getElementById(id) : null;
+        const target = id ? elementById(id, el) : null;
         if (target) {
           parts.push(ownText(target) || clean(textContent(target)));
         }
@@ -338,9 +604,9 @@
         return joined;
       }
     }
-    const placeholder = clean(getAttribute(el, "placeholder"));
-    if (placeholder) {
-      return placeholder;
+    const aria = clean(getAttribute(el, "aria-label"));
+    if (aria) {
+      return aria;
     }
     // A submit value is its name. The fieldset legend must not replace it.
     if (tagName(el) === "INPUT") {
@@ -475,14 +741,14 @@
   }
 
   function landmarkOf(el) {
-    let node = parentElement(el);
+    let node = parentNodeAcross(el);
     while (node && node !== document.documentElement) {
       const role = landmarkRole(node);
       if (role) {
         const name = accName(node);
         return name ? `${role} ${name}` : role;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return "";
   }
@@ -497,7 +763,7 @@
       if (!id) {
         continue;
       }
-      const target = document.getElementById(id);
+      const target = elementById(id, el);
       if (target) {
         parts.push(ownText(target) || clean(textContent(target)));
       }
@@ -666,7 +932,8 @@
   }
 
   function idShortcut(el) {
-    if (!idsFinished) {
+    // #id does not reach into a shadow tree. The positional path does.
+    if (!idsFinished || shadowHostOf(el)) {
       return "";
     }
     const id = elementId(el);
@@ -677,7 +944,7 @@
   }
 
   function nameShortcut(el) {
-    if (!namesFinished) {
+    if (!namesFinished || shadowHostOf(el)) {
       return "";
     }
     const name = getAttribute(el, "name");
@@ -691,15 +958,23 @@
   }
 
   function cssOf(el) {
-    const shortcut = idShortcut(el) || nameShortcut(el);
-    if (shortcut) {
-      return shortcut;
+    if (!shadowHostOf(el)) {
+      const shortcut = idShortcut(el) || nameShortcut(el);
+      if (shortcut) {
+        return shortcut;
+      }
     }
-    const parts = [];
+    const segments = [];
+    let current = [];
     let node = el;
+    const seen = new Set();
     while (node && nodeType(node) === 1 && tagName(node) !== "HTML") {
+      if (seen.has(node)) {
+        return "";
+      }
+      seen.add(node);
       if (tagName(node) === "BODY") {
-        parts.unshift("body");
+        current.unshift("body");
         break;
       }
       // A missing nth-of-type must not become 1. That selector names an
@@ -708,10 +983,24 @@
       if (typeof nth !== "number" || nth < 1) {
         return "";
       }
-      parts.unshift(`${localName(node)}:nth-of-type(${nth})`);
-      node = parentElement(node);
+      current.unshift(`${localName(node)}:nth-of-type(${nth})`);
+      const parent = parentElement(node);
+      if (parent) {
+        node = parent;
+        continue;
+      }
+      const host = shadowHostOf(node);
+      if (!host) {
+        return "";
+      }
+      segments.unshift(current.join(" > "));
+      current = [];
+      node = host;
     }
-    return parts.join(" > ");
+    if (current.length) {
+      segments.unshift(current.join(" > "));
+    }
+    return segments.join(" >>> ");
   }
 
   function skeletonOf(el) {
@@ -719,7 +1008,7 @@
     let node = el;
     while (node && nodeType(node) === 1 && node !== document.body && node !== document.documentElement) {
       chain.unshift(node);
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     const parts = [];
     if (document.body) {
@@ -745,6 +1034,249 @@
     return null;
   }
 
+  function renderedBox(el) {
+    if (!el) {
+      return false;
+    }
+    if (hasAttribute(el, "hidden") || closest(el, "[hidden]") !== null) {
+      return false;
+    }
+    let style;
+    try {
+      style = getComputedStyle(el);
+    } catch (error) {
+      return false;
+    }
+    if (style.display === "none" || style.visibility === "hidden") {
+      return false;
+    }
+    const rect = boundingRect(el);
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function optionPopup(el) {
+    if (tagName(el) === "SELECT" || getAttribute(el, "role") === "listbox") {
+      return el;
+    }
+    const controls = getAttribute(el, "aria-controls");
+    const id = controls ? controls.split(/\s+/).find(Boolean) : "";
+    const target = id ? elementById(id, el) : null;
+    if (target && (getAttribute(target, "role") === "listbox" || query(target, "[role='option']"))) {
+      return target;
+    }
+    return null;
+  }
+
+  function popupRendered(el) {
+    if (tagName(el) === "SELECT") {
+      return true;
+    }
+    return renderedBox(optionPopup(el));
+  }
+
+  function controlType(el) {
+    const tag = tagName(el);
+    if (tag === "INPUT") {
+      return (getAttribute(el, "type") || "text").toLowerCase();
+    }
+    if (tag === "BUTTON") {
+      return (getAttribute(el, "type") || "submit").toLowerCase();
+    }
+    return null;
+  }
+
+  function topmostModal(modals) {
+    if (!modals.length) {
+      return null;
+    }
+    // Hit-test each dialog at its visible center. The dialog that contains
+    // that hit is painted there. Never sample (1, 1). z-index is the fallback
+    // when that test cannot pick a single dialog.
+    const hits = [];
+    for (let index = 0; index < modals.length; index += 1) {
+      const modal = modals[index];
+      const point = modalPoint(modal);
+      if (!point) {
+        continue;
+      }
+      const target = hitTarget(point.x, point.y);
+      if (target && nodeInside(modal, target)) {
+        hits.push(modal);
+      }
+    }
+    if (hits.length === 1) {
+      return hits[0];
+    }
+    return highestModal(hits.length ? hits : modals);
+  }
+
+  function modalPoint(modal) {
+    const center = clippedPoint(boundingRect(modal));
+    if (center) {
+      return center;
+    }
+    let control = null;
+    try {
+      control = query(modal, "button, a[href], input, select, textarea, [role='button']");
+    } catch (error) {
+      control = null;
+    }
+    if (!control) {
+      return null;
+    }
+    return clippedPoint(boundingRect(control));
+  }
+
+  function nodeInside(modal, node) {
+    let current = node;
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      if (current === modal) {
+        return true;
+      }
+      seen.add(current);
+      current = parentNodeAcross(current);
+    }
+    return false;
+  }
+
+  function highestModal(modals) {
+    let best = modals[0];
+    let bestChain = modalChain(best);
+    let bestIndex = 0;
+    for (let index = 1; index < modals.length; index += 1) {
+      const chain = modalChain(modals[index]);
+      if (chainOutranks(chain, index, bestChain, bestIndex)) {
+        best = modals[index];
+        bestChain = chain;
+        bestIndex = index;
+      }
+    }
+    return best;
+  }
+
+  // A transformed, filtered, or opacity ancestor traps the dialog's own
+  // z-index. Compare those contexts from the root. A top-layer dialog is
+  // above the page, and its ancestors do not count.
+  function modalChain(modal) {
+    let topLayer = false;
+    try {
+      topLayer = elementMatches(modal, ":modal");
+    } catch (error) {
+      topLayer = false;
+    }
+    if (topLayer) {
+      return { top: true, contexts: [{ node: modal, z: usedZ(modal) }] };
+    }
+    const contexts = [];
+    let node = modal;
+    const seen = new Set();
+    let own = true;
+    while (node && nodeType(node) === 1 && !seen.has(node)) {
+      seen.add(node);
+      let style = null;
+      try {
+        style = getComputedStyle(node);
+      } catch (error) {
+        break;
+      }
+      if (own) {
+        contexts.push({ node, z: usedZ(modal, style) });
+        own = false;
+      } else {
+        const level = contextLevel(style);
+        if (level !== null) {
+          contexts.push({ node, z: level });
+        }
+      }
+      node = parentNodeAcross(node);
+    }
+    contexts.reverse();
+    return { top: false, contexts };
+  }
+
+  function usedZ(modal, style) {
+    let read = style;
+    if (!read) {
+      try {
+        read = getComputedStyle(modal);
+      } catch (error) {
+        return 0;
+      }
+    }
+    const value = Number(read.zIndex);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function contextLevel(style) {
+    const z = Number(style.zIndex);
+    const finite = Number.isFinite(z) ? z : 0;
+    const positioned =
+      style.position === "relative" ||
+      style.position === "absolute" ||
+      style.position === "fixed" ||
+      style.position === "sticky";
+    if (positioned && style.zIndex !== "auto") {
+      return finite;
+    }
+    const will = style.willChange || "";
+    const traps =
+      style.position === "fixed" ||
+      style.position === "sticky" ||
+      style.opacity !== "1" ||
+      (style.transform && style.transform !== "none") ||
+      (style.filter && style.filter !== "none") ||
+      (style.perspective && style.perspective !== "none") ||
+      style.isolation === "isolate" ||
+      (style.mixBlendMode && style.mixBlendMode !== "normal") ||
+      (style.backdropFilter && style.backdropFilter !== "none") ||
+      (style.webkitBackdropFilter && style.webkitBackdropFilter !== "none") ||
+      /transform|opacity|filter/.test(will);
+    return traps ? finite : null;
+  }
+
+  function chainOutranks(chain, index, best, bestIndex) {
+    if (chain.top !== best.top) {
+      return chain.top;
+    }
+    const left = chain.contexts;
+    const right = best.contexts;
+    const length = Math.min(left.length, right.length);
+    for (let level = 0; level < length; level += 1) {
+      const a = left[level];
+      const b = right[level];
+      if (a.node === b.node) {
+        continue;
+      }
+      // Different contexts. A nested z-index does not escape its ancestor.
+      if (a.z !== b.z) {
+        return a.z > b.z;
+      }
+      return index >= bestIndex;
+    }
+    if (left.length !== right.length) {
+      return left.length > right.length;
+    }
+    // Later DOM order wins a tie.
+    return index >= bestIndex;
+  }
+
+  function inTopModal(el) {
+    if (!topModalEl) {
+      return false;
+    }
+    let node = el;
+    const seen = new Set();
+    while (node && !seen.has(node)) {
+      if (node === topModalEl) {
+        return true;
+      }
+      seen.add(node);
+      node = parentNodeAcross(node);
+    }
+    return false;
+  }
+
   function optionsOf(el) {
     if (tagName(el) === "SELECT") {
       return Array.from(el.options, (opt) => ({
@@ -757,7 +1289,7 @@
     if (!box) {
       const controls = getAttribute(el, "aria-controls");
       const id = controls ? controls.split(/\s+/).find(Boolean) : "";
-      const target = id ? document.getElementById(id) : null;
+      const target = id ? elementById(id, el) : null;
       if (target && (getAttribute(target, "role") === "listbox" || query(target, "[role='option']"))) {
         box = target;
       }
@@ -802,7 +1334,7 @@
       if (value !== null && value !== "") {
         return asciiLower(value) !== "false";
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return false;
   }
@@ -816,7 +1348,7 @@
       if (value !== null && asciiLower(value.trim()) === "true") {
         return true;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return false;
   }
@@ -825,9 +1357,9 @@
   // One closest() per condition so an inner inert node does not hide an outer
   // hidden ancestor. visibility:hidden still has a box, so it is a second check.
   function applyRowFlags(el) {
-    const hidden = closest(el, "[hidden]") !== null;
+    const hidden = closestAcross(el, "[hidden]") !== null;
     const ariaHidden = ariaHiddenState(el);
-    const inert = closest(el, "[inert]") !== null;
+    const inert = closestAcross(el, "[inert]") !== null;
     const ariaDisabled = ariaDisabledState(el);
     let displayHidden = hidden;
     let visibilityIsHidden = false;
@@ -899,12 +1431,106 @@
     return { x: (left + right) / 2, y: (top + bottom) / 2 };
   }
 
-  // One elementFromPoint on a long inline line walks every fragment. The cap
-  // bounds that loop. A call is counted after it returns, so one slow hit can
-  // pass the cap and still keep its real result. Every queued sample the loop
-  // does not reach is covered, and the walk is truncated. Nothing here writes
-  // the page.
+  // One elementFromPoint walks every inline box, so a long line is quadratic.
+  // A call is counted after it returns. Samples the loop does not reach are
+  // covered, and the walk is truncated. Nothing here writes the page.
   const hitCapMs = 300;
+  const longRunCount = 40;
+  const longRunHits = 12;
+  const longRunMs = 40;
+  const slowHitMs = 80;
+
+  const phrasingSelector = [
+    "a",
+    "abbr",
+    "b",
+    "bdi",
+    "bdo",
+    "br",
+    "cite",
+    "code",
+    "data",
+    "dfn",
+    "em",
+    "i",
+    "kbd",
+    "mark",
+    "q",
+    "s",
+    "samp",
+    "small",
+    "span",
+    "strong",
+    "sub",
+    "sup",
+    "time",
+    "u",
+    "var",
+    "wbr",
+  ].join(",");
+
+  function phrasingCount() {
+    let count = 0;
+    try {
+      count = document.querySelectorAll(phrasingSelector).length;
+    } catch (error) {
+      return 12001;
+    }
+    if (count > 12000 || !canPierceShadows()) {
+      return count;
+    }
+    const stack = [];
+    const seen = new Set();
+    let hosts;
+    try {
+      hosts = readDocQueryAll.call(document, "*");
+    } catch (error) {
+      return count;
+    }
+    for (let index = 0; index < hosts.length; index += 1) {
+      const shadow = openShadow(hosts[index]);
+      if (shadow) {
+        stack.push(shadow);
+      }
+    }
+    while (stack.length && count <= 12000) {
+      const root = stack.pop();
+      if (seen.has(root)) {
+        continue;
+      }
+      seen.add(root);
+      try {
+        count += readShadowQueryAll.call(root, phrasingSelector).length;
+        const inner = readShadowQueryAll.call(root, "*");
+        for (let index = 0; index < inner.length && count <= 12000; index += 1) {
+          const shadow = openShadow(inner[index]);
+          if (shadow) {
+            stack.push(shadow);
+          }
+        }
+      } catch (error) {
+        // Unreadable root: stop counting it. The hit test stays fail-closed.
+      }
+    }
+    return count;
+  }
+
+  function hugeHitTarget() {
+    // One elementFromPoint walks every inline box. Phrasing runs, including
+    // ones inside open shadow roots, skip the call. A 4000-row table stays
+    // under both ceilings.
+    if (document.getElementsByTagName("*").length > 60000) {
+      return true;
+    }
+    return phrasingCount() > 12000;
+  }
+
+  function failClosedHits(flags, points, from) {
+    truncated = true;
+    for (let index = from; index < points.length; index += 1) {
+      flags[points[index].index] = true;
+    }
+  }
 
   function coverageOf(els, rects) {
     const flags = [];
@@ -921,24 +1547,68 @@
       }
       viewport.push({ index, x: point.x, y: point.y });
     }
-    const hitStarted = performance.now();
-    let seen = 0;
-    for (; seen < viewport.length; seen += 1) {
-      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
-        break;
+    if (hugeHitTarget()) {
+      failClosedHits(flags, viewport, 0);
+      return flags;
+    }
+    const normal = [];
+    const longRuns = [];
+    let run = [];
+    function flushRun() {
+      if (run.length >= longRunCount) {
+        longRuns.push(run);
+      } else {
+        for (const point of run) {
+          normal.push(point);
+        }
       }
-      const point = viewport[seen];
-      flags[point.index] = coveredBy(els[point.index], elementFromPoint(point.x, point.y));
-      if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
-        seen += 1;
-        break;
+      run = [];
+    }
+    for (const point of viewport) {
+      if (run.length && Math.abs(point.y - run[0].y) > 2) {
+        flushRun();
+      }
+      run.push(point);
+    }
+    flushRun();
+    const hitStarted = performance.now();
+    function sample(list, maxCount, maxMs) {
+      let seen = 0;
+      const started = performance.now();
+      for (; seen < list.length; seen += 1) {
+        if (seen >= maxCount) {
+          break;
+        }
+        if (pastBudget() || performance.now() - hitStarted > hitCapMs) {
+          break;
+        }
+        if (performance.now() - started > maxMs) {
+          break;
+        }
+        const used = performance.now() - walkStarted;
+        if (
+          typeof WALK_BUDGET_MS === "number" &&
+          WALK_BUDGET_MS > 0 &&
+          WALK_BUDGET_MS - used < 250
+        ) {
+          break;
+        }
+        const point = list[seen];
+        const callStarted = performance.now();
+        flags[point.index] = coveredBy(els[point.index], hitTarget(point.x, point.y));
+        if (performance.now() - callStarted > slowHitMs) {
+          seen += 1;
+          break;
+        }
+      }
+      if (seen < list.length) {
+        failClosedHits(flags, list, seen);
       }
     }
-    if (seen < viewport.length) {
-      truncated = true;
-      for (; seen < viewport.length; seen += 1) {
-        flags[viewport[seen].index] = true;
-      }
+    // Short targets first, so a long line cannot fail-close the rest of the page.
+    sample(normal, Infinity, hitCapMs);
+    for (const line of longRuns) {
+      sample(line, longRunHits, longRunMs);
     }
     return flags;
   }
@@ -991,7 +1661,7 @@
     const tag = tagName(el);
     const type = (getAttribute(el, "type") || "").toLowerCase();
     const submit =
-      (tag === "BUTTON" && (type === "" || type === "submit")) ||
+      (tag === "BUTTON" && type !== "button" && type !== "reset") ||
       (tag === "INPUT" && (type === "submit" || type === "image"));
     if (!submit) {
       return { form_method: null, form_action: null };
@@ -1044,7 +1714,7 @@
     visibilityHidden = new Map();
     idsFinished = false;
     namesFinished = false;
-    const ids = document.querySelectorAll("[id]");
+    const ids = collectMatching("[id]");
     for (let index = 0; index < ids.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1056,7 +1726,7 @@
       idCounts.set(id, (idCounts.get(id) || 0) + 1);
     }
     idsFinished = true;
-    const named = document.querySelectorAll("[name]");
+    const named = collectMatching("[name]");
     for (let index = 0; index < named.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1069,7 +1739,7 @@
       nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
     }
     namesFinished = true;
-    const labels = document.querySelectorAll("label[for]");
+    const labels = collectMatching("label[for]");
     for (let index = 0; index < labels.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1079,7 +1749,18 @@
         labelsByFor.set(id, labels[index]);
       }
     }
-    const forms = document.forms;
+    const forms = [];
+    for (let index = 0; index < document.forms.length; index += 1) {
+      forms.push(document.forms[index]);
+    }
+    if (canPierceShadows()) {
+      for (const form of collectMatching("form")) {
+        if (!forms.includes(form)) {
+          forms.push(form);
+        }
+      }
+    }
+    indexedForms = forms;
     for (let index = 0; index < forms.length; index += 1) {
       if (!withinBudget()) {
         return;
@@ -1114,6 +1795,18 @@
       const seen = (counts.get(tagName(child)) || 0) + 1;
       counts.set(tagName(child), seen);
       nthOfType.set(child, seen);
+      if (!walkTree(child)) {
+        return false;
+      }
+    }
+    const shadowCounts = new Map();
+    for (const child of shadowChildren(el)) {
+      if (!withinBudget()) {
+        return false;
+      }
+      const seenCount = (shadowCounts.get(tagName(child)) || 0) + 1;
+      shadowCounts.set(tagName(child), seenCount);
+      nthOfType.set(child, seenCount);
       if (!walkTree(child)) {
         return false;
       }
@@ -1167,7 +1860,7 @@
       if (!recordNth(node)) {
         return false;
       }
-      node = parentElement(node);
+      node = parentNodeAcross(node);
     }
     return true;
   }
@@ -1176,6 +1869,24 @@
   // has only seen the first duplicate, so the row keeps the positional path.
   function selectorWithoutNth(el) {
     return idShortcut(el) !== "" || nameShortcut(el) !== "";
+  }
+
+  function textAlternatives(el) {
+    const parts = [
+      clean(textContent(el)),
+      clean(getAttribute(el, "value")),
+      clean(getAttribute(el, "alt")),
+      clean(getAttribute(el, "title")),
+      associatedLabel(el),
+    ];
+    const tag = tagName(el);
+    if (tag === "BUTTON" || tag === "A" || tag === "SUMMARY") {
+      const images = queryAll(el, "img[alt]");
+      for (let index = 0; index < images.length; index += 1) {
+        parts.push(clean(getAttribute(images[index], "alt")));
+      }
+    }
+    return parts.filter(Boolean);
   }
 
   function elementRow(el, rect, coveredFlag) {
@@ -1188,12 +1899,14 @@
       fallbackName(el),
       elementId(el) || null,
       getAttribute(el, "name"),
-      tagName(el) === "INPUT" ? (getAttribute(el, "type") || "text").toLowerCase() : null,
+      controlType(el),
       tagName(el) === "A" && hasAttribute(el, "href") ? el.href : null,
       formIndex(el),
       binding.form_method,
       binding.form_action,
-      role === "option" ? optionDisabled(el) : elementMatches(el, ":disabled"),
+      role === "option"
+        ? optionDisabled(el)
+        : elementMatches(el, ":disabled") || fieldsetDisables(el),
       el.readOnly === true,
       flagAriaDisabled.get(el) === true,
       flagInert.get(el) === true,
@@ -1224,6 +1937,12 @@
       labelText(el),
       groupKey(el),
       constraintsOf(el),
+      inTopModal(el),
+      popupRendered(el),
+      clean(getAttribute(el, "placeholder")),
+      clean(getAttribute(el, "title")),
+      describedByText(el),
+      textAlternatives(el),
     ];
   }
 
@@ -1246,7 +1965,7 @@
   }
 
   if (typeof WALK_BUDGET_MS === "number" && WALK_BUDGET_MS <= 0) {
-    if (document.querySelectorAll(SELECTOR).length > 0) {
+    if (collectMatching(SELECTOR).length > 0) {
       return deadlinePayload();
     }
   }
@@ -1254,7 +1973,7 @@
   // Selection and the index each stop on a share of the walk budget. Flags
   // then take half of the time still left before read-back, and emission
   // keeps the rest, so a throttled table still ships a prefix.
-  const matched = document.querySelectorAll(SELECTOR);
+  const matched = collectMatching(SELECTOR);
   phaseLimitMs = shareLimit(0.3);
   const chosen = [];
   const rects = [];
@@ -1349,42 +2068,208 @@
     "label_text",
     "group_key",
     "constraints",
+    "in_dialog",
+    "popup_open",
+    "placeholder",
+    "title",
+    "described_by",
+    "text_alternatives",
   ];
   const covered = coverageOf(kept, keptRects);
-  const forms = Array.from(document.forms).map((form, index) => ({
-    index,
-    method: (getAttribute(form, "method") || "get").toLowerCase(),
-    action: readFormAction.call(form),
-    // :invalid does not fire invalid listeners. form.checkValidity is skipped
-    // because a control named checkValidity replaces the method.
-    valid: !elementMatches(form, ":invalid"),
-    html_id: elementId(form) || null,
-  }));
+  const keptAt = new Map();
+  for (let index = 0; index < kept.length; index += 1) {
+    keptAt.set(kept[index], index);
+  }
+  function isSubmitControl(control) {
+    const tag = tagName(control);
+    const type = (getAttribute(control, "type") || "").toLowerCase();
+    return (
+      (tag === "BUTTON" && type !== "button" && type !== "reset") ||
+      (tag === "INPUT" && (type === "submit" || type === "image"))
+    );
+  }
+
+  function isFillable(control) {
+    const tag = tagName(control);
+    const type = (getAttribute(control, "type") || "").toLowerCase();
+    if (tag === "INPUT") {
+      return (
+        type !== "hidden" &&
+        type !== "submit" &&
+        type !== "image" &&
+        type !== "reset" &&
+        type !== "button"
+      );
+    }
+    return tag === "SELECT" || tag === "TEXTAREA";
+  }
+
+  function firstLegendChild(fieldset) {
+    try {
+      for (const child of children(fieldset)) {
+        if (tagName(child) === "LEGEND") {
+          return child;
+        }
+      }
+    } catch (error) {
+      return null;
+    }
+    return null;
+  }
+
+  function inFirstLegend(el, fieldset) {
+    const legend = firstLegendChild(fieldset);
+    if (!legend) {
+      return false;
+    }
+    if (legend === el) {
+      return true;
+    }
+    try {
+      return contains(legend, el);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // :disabled is false for the first legend of that fieldset. An outer
+  // disabled fieldset still counts. A submit outside does not turn the
+  // other controls back on.
+  function fieldsetDisables(control) {
+    let node = control;
+    const seen = new Set();
+    while (node) {
+      const fieldset = closestAcross(node, "fieldset[disabled]");
+      if (!fieldset || seen.has(fieldset)) {
+        return false;
+      }
+      seen.add(fieldset);
+      if (!inFirstLegend(control, fieldset)) {
+        return true;
+      }
+      node = parentNodeAcross(fieldset);
+    }
+    return false;
+  }
+
+  function formControls(form) {
+    // form.elements includes controls associated with form=, not only descendants.
+    const listed = readFormElements.call(form);
+    const controls = [];
+    for (let index = 0; index < listed.length; index += 1) {
+      controls.push(listed[index]);
+    }
+    return controls;
+  }
+
+  function fieldsetDisabled(form) {
+    let controls;
+    try {
+      controls = formControls(form);
+    } catch (error) {
+      return true;
+    }
+    // Any fillable control in a disabled fieldset disables the form. An enabled
+    // control earlier in the list must not hide that. A first-legend control
+    // still keeps the form available.
+    let blocked = false;
+    let legendAvailable = false;
+    for (let index = 0; index < controls.length; index += 1) {
+      const control = controls[index];
+      if (isSubmitControl(control)) {
+        const fieldset = closestAcross(control, "fieldset[disabled]");
+        if (fieldset && inFirstLegend(control, fieldset)) {
+          legendAvailable = true;
+        }
+        continue;
+      }
+      if (!isFillable(control)) {
+        continue;
+      }
+      if (fieldsetDisables(control)) {
+        blocked = true;
+        continue;
+      }
+      try {
+        const fieldset = closestAcross(control, "fieldset[disabled]");
+        if (
+          fieldset &&
+          inFirstLegend(control, fieldset) &&
+          !elementMatches(control, ":disabled")
+        ) {
+          legendAvailable = true;
+        }
+      } catch (error) {
+        return true;
+      }
+    }
+    if (legendAvailable) {
+      return false;
+    }
+    if (blocked) {
+      return true;
+    }
+    const fieldset = closestAcross(form, "fieldset[disabled]");
+    return fieldset !== null && !inFirstLegend(form, fieldset);
+  }
+  const forms = (indexedForms.length ? indexedForms : Array.from(document.forms)).map(
+    (form, index) => {
+      const at = keptAt.get(form);
+      if (!styleHidden.has(form)) {
+        try {
+          applyRowFlags(form);
+        } catch (error) {
+          flagInert.set(form, true);
+        }
+      }
+      const rect = at === undefined ? boundingRect(form) : keptRects[at];
+      const visible = styleHidden.has(form) ? isVisible(form, rect) : false;
+      return {
+        index,
+        method: (getAttribute(form, "method") || "get").toLowerCase(),
+        action: readFormAction.call(form),
+        // :invalid does not fire invalid listeners. form.checkValidity is skipped
+        // because a control named checkValidity replaces the method.
+        valid: !elementMatches(form, ":invalid"),
+        html_id: elementId(form) || null,
+        visible,
+        hidden: flagHidden.get(form) === true || !visible,
+        inert: flagInert.get(form) === true,
+        covered: at !== undefined && covered[at] === true,
+        disabled: fieldsetDisabled(form),
+      };
+    },
+  );
 
   const modals = [];
   const seen = new Set();
+  const modalRoles = new Map();
   function pushModal(el, role) {
     if (seen.has(el) || !isVisible(el, boundingRect(el))) {
       return;
     }
     seen.add(el);
-    modals.push({
-      html_id: elementId(el) || null,
-      role,
-      name: accName(el),
-      open: true,
-    });
+    modals.push(el);
+    modalRoles.set(el, role);
   }
-  for (const dialog of document.querySelectorAll("dialog[open]")) {
+  for (const dialog of collectMatching("dialog[open]")) {
     if (elementMatches(dialog, ":modal")) {
       pushModal(dialog, "dialog");
     }
   }
-  for (const dialog of document.querySelectorAll(
+  for (const dialog of collectMatching(
     "[role='dialog'][aria-modal='true'], [role='alertdialog'][aria-modal='true']",
   )) {
     pushModal(dialog, clean(getAttribute(dialog, "role")).split(" ")[0] || "dialog");
   }
+  topModalEl = topmostModal(modals);
+  const modalRecords = modals.map((el) => ({
+    html_id: elementId(el) || null,
+    role: modalRoles.get(el) || "dialog",
+    name: accName(el),
+    open: true,
+    top: el === topModalEl,
+  }));
 
   // Stringify in slices so a late clock keeps the rows already copied.
   // Each piece is one JSON array. Python reads them one at a time and stops
@@ -1392,10 +2277,59 @@
   const chunks = [];
   let batch = [];
   const chunkRows = 800;
-  // Object ids are one CDP call, then one accessibility read each until the
-  // overlay budget runs out. The head of the document covers the on-screen
-  // widgets; a longer list spends that whole budget on a table.
+  // Object ids feed the accessibility overlay. The cap stays, but the slots
+  // go to on-screen widgets first so a long link list cannot crowd them out.
   const nodeCap = 160;
+  const widgetTags = new Set(["button", "input", "select", "textarea", "summary", "option"]);
+  const widgetRoles = new Set([
+    "button",
+    "checkbox",
+    "combobox",
+    "gridcell",
+    "listbox",
+    "menu",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "switch",
+    "tab",
+    "textbox",
+    "treeitem",
+  ]);
+  const ranked = [];
+  for (let index = 0; index < kept.length; index += 1) {
+    const el = kept[index];
+    const tag = localName(el);
+    const role = elementRole(el);
+    const widget = widgetTags.has(tag) || widgetRoles.has(role);
+    const link = tag === "a" || role === "link";
+    if (!widget && !link) {
+      continue;
+    }
+    const visible = isVisible(el, keptRects[index]);
+    let rank = 3;
+    if (widget && visible && inViewport(keptRects[index])) {
+      rank = 0;
+    } else if (widget) {
+      rank = 1;
+    } else if (visible) {
+      rank = 2;
+    }
+    ranked.push({ index, rank });
+  }
+  ranked.sort((left, right) => left.rank - right.rank || left.index - right.index);
+  const nodeIndexes = [];
+  for (let index = 0; index < ranked.length && nodeIndexes.length < nodeCap; index += 1) {
+    const at = ranked[index].index;
+    nodeIndexes.push(at);
+    nodes.push(kept[at]);
+  }
+  const axCapped = ranked.length > nodeCap;
   for (let index = 0; index < kept.length; index += 1) {
     if (index > 0 && pastReadback()) {
       truncated = true;
@@ -1404,9 +2338,6 @@
     if (!cssOf(kept[index])) {
       truncated = true;
       break;
-    }
-    if (nodes.length < nodeCap) {
-      nodes.push(kept[index]);
     }
     batch.push(elementRow(kept[index], keptRects[index], covered[index]));
     if (batch.length === chunkRows) {
@@ -1431,7 +2362,7 @@
     meta: JSON.stringify({
       fields,
       forms,
-      modals,
+      modals: modalRecords,
       url: pageUrl,
       title: pageTitle,
       truncated,
@@ -1439,6 +2370,8 @@
       chunks: chunks.length,
       controls: matched.length,
       indexed: indexFinished,
+      node_indexes: nodeIndexes,
+      ax_capped: axCapped,
     }),
     chunks,
     nodes,

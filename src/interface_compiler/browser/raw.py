@@ -10,5 +10,9 @@ _RAW_TIMEOUT_MS = 30_000
 
 
 def raw_snapshot(page: Page) -> str:
-    """Return the YAML aria snapshot of the page body."""
+    """Return the YAML aria snapshot of the page body.
+
+    Chromium's accessibility tree includes open shadow roots, so those
+    controls appear here. Closed roots are not readable and are omitted.
+    """
     return page.locator("body").aria_snapshot(timeout=_RAW_TIMEOUT_MS)
