@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
@@ -218,18 +219,26 @@ class Lexicon:
         return False
 
 
+def _folds_to_l(char: str) -> bool:
+    """True when the character, or a piece of its NFKD form, folds to l."""
+    if char in L_FOLDS:
+        return True
+    return any(piece in L_FOLDS for piece in unicodedata.normalize("NFKD", char))
+
+
 def _fold_readings(text: str) -> tuple[str, ...]:
     """Skeleton, plus an i reading when a confusable folded to l.
 
-    Greek iota and Cyrillic I land on l in the UTS #39 table. Publish, submit,
+    Greek iota and Cyrillic I land on l in the UTS #39 table, including a
+    precomposed capital whose NFKD base is one of those. Publish, submit,
     and sign-in are written with i, so that reading is tried as well.
     """
     folded = skeleton(text)
     readings: list[str] = []
     if folded != text:
         readings.append(folded)
-    if any(char in L_FOLDS for char in text):
-        rewritten = "".join("i" if char in L_FOLDS else char for char in text)
+    rewritten = "".join("i" if _folds_to_l(char) else char for char in text)
+    if rewritten != text:
         iread = skeleton(rewritten)
         if iread not in {text, *readings}:
             readings.append(iread)

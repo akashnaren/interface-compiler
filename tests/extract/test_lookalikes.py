@@ -27,6 +27,13 @@ def test_skeleton_folds_confusable_bases(label: str, verb: str | None) -> None:
         ("PUBL\u0399SH", "send", False),
         ("SUBM\u0406T REVIEW", "send", False),
         ("S\u0406GN \u0406N TO VOTE", None, True),
+        ("PUBL\u038aSH", "send", False),
+        ("SUBM\u038aT REVIEW", "send", False),
+        ("S\u038aGN \u038aN TO VOTE", None, True),
+        ("log\u038an required", None, True),
+        ("PUBL\u03aaSH", "send", False),
+        ("PUBL\u0407SH", "send", False),
+        ("PUBL\u1f38SH", "send", False),
     ],
 )
 def test_capital_i_lookalikes_read_as_i(label: str, verb: str | None, login: bool) -> None:

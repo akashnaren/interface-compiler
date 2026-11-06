@@ -24,6 +24,7 @@ _HARD_TYPES = {
     "PayAction": "pay",
     "DeleteAction": "delete",
     "SendAction": "send",
+    "PublishAction": "send",
     "CommunicateAction": "send",
     "TipAction": "tip",
     "DonateAction": "donate",
@@ -32,6 +33,7 @@ _HARD_TYPES = {
     "CommentAction": "comment",
     "AskAction": "ask",
 }
+_HARD_FOLDED = {name.casefold(): verb for name, verb in _HARD_TYPES.items()}
 
 
 def jsonld_nodes(html: str) -> list[dict[str, object]]:
@@ -76,8 +78,9 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
     hard = None
     for part in parts:
         for tail in _type_tokens(part):
-            if tail in _HARD_TYPES:
-                hard = _HARD_TYPES[tail]
+            blocked = _HARD_FOLDED.get(tail.casefold())
+            if blocked is not None:
+                hard = blocked
                 break
         if hard:
             break
@@ -151,23 +154,23 @@ def product_from_jsonld(node: dict[str, object]) -> MapResult:
 
 
 def _type_tokens(value: object) -> tuple[str, ...]:
+    """Every path segment and every fragment segment, in order."""
     text = str(value).strip()
     path, separator, fragment = text.partition("#")
     pieces = (path, fragment) if separator else (path,)
     tokens: list[str] = []
     for piece in pieces:
-        token = _last_segment(piece)
-        if token and token not in tokens:
-            tokens.append(token)
+        for token in _segments(piece):
+            if token not in tokens:
+                tokens.append(token)
     return tuple(tokens)
 
 
-def _last_segment(text: str) -> str:
-    text = text.strip().rstrip("/").strip()
-    cut = max(text.rfind("/"), text.rfind(":"))
-    if cut >= 0:
-        text = text[cut + 1 :]
-    return text.strip()
+def _segments(text: str) -> tuple[str, ...]:
+    text = text.strip().strip("/")
+    if not text:
+        return ()
+    return tuple(part.strip() for part in re.split(r"[:/]+", text) if part.strip())
 
 
 def _price(value: object) -> int | float | None:
