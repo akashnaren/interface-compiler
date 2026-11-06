@@ -75,9 +75,11 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
     enabled, reason = True, None
     hard = None
     for part in parts:
-        tail = _type_token(part)
-        if tail in _HARD_TYPES:
-            hard = _HARD_TYPES[tail]
+        for tail in _type_tokens(part):
+            if tail in _HARD_TYPES:
+                hard = _HARD_TYPES[tail]
+                break
+        if hard:
             break
     if hard:
         enabled, reason = False, f"hard-blocked in v1: {hard}"
@@ -148,9 +150,20 @@ def product_from_jsonld(node: dict[str, object]) -> MapResult:
     )
 
 
-def _type_token(value: object) -> str:
-    """Strip space, drop a fragment and trailing slash, then take the last segment."""
-    text = str(value).strip().split("#", 1)[0].rstrip("/").strip()
+def _type_tokens(value: object) -> tuple[str, ...]:
+    text = str(value).strip()
+    path, separator, fragment = text.partition("#")
+    pieces = (path, fragment) if separator else (path,)
+    tokens: list[str] = []
+    for piece in pieces:
+        token = _last_segment(piece)
+        if token and token not in tokens:
+            tokens.append(token)
+    return tuple(tokens)
+
+
+def _last_segment(text: str) -> str:
+    text = text.strip().rstrip("/").strip()
     cut = max(text.rfind("/"), text.rfind(":"))
     if cut >= 0:
         text = text[cut + 1 :]

@@ -86,6 +86,10 @@ def render(found: dict[str, str]) -> str:
                 "FOLDS: dict[str, str] = {char: target "
                 "for target, chars in _GROUPS.items() for char in chars}"
             ),
+            (
+                "L_FOLDS: frozenset[str] = frozenset("
+                'char for char, target in FOLDS.items() if target == "l")'
+            ),
             "",
         ]
     )

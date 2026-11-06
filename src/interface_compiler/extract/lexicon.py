@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
+from interface_compiler.extract.confusables import L_FOLDS
 from interface_compiler.extract.naming import match_keys, normalize_label, skeleton
 
 # Hard-block verbs are matched before mutating verbs, then safe verbs.
@@ -84,13 +85,13 @@ _HARD_SPACED: tuple[tuple[str, str], ...] = (
     ("checkout_submit", r"checkout submit|submit checkout"),
     ("send", r"reply to(?: \w+)*"),
 )
-# Hard verbs match anywhere on a word boundary ("Yes, delete"). The flat
-# pattern also catches a verb split by a space ("De lete").
 _HARD_COMPILED = tuple(
     (verb, re.compile(rf"(?:^|\s)(?:{pattern})(?:\s|$)"))
     for verb, pattern in (*_HARD_LABELS, *_HARD_SPACED)
 )
-_HARD_FLAT = tuple((verb, re.compile(pattern.replace(" ", ""))) for verb, pattern in _HARD_LABELS)
+_HARD_FLAT = tuple(
+    (verb, re.compile(rf"\b(?:{pattern.replace(' ', '')})\b")) for verb, pattern in _HARD_LABELS
+)
 _COMPILED = tuple((verb, re.compile(rf"^(?:{pattern})$")) for verb, pattern in _VERBS)
 _AMOUNT = re.compile(r"\d+")
 _REDIRECT = frozenset({"next", "return", "return_to", "returnto", "returnurl", "redirect", "goto"})
@@ -139,14 +140,12 @@ class Lexicon:
 
     def verb(self, label: str) -> str | None:
         found = _match_verb(label)
-        folded = skeleton(label)
-        if folded == label:
-            return found
-        hidden = _match_verb(folded)
-        if hidden is None:
-            return found
-        if found is None or (hidden in _HARD and found not in _HARD):
-            return hidden
+        for reading in _fold_readings(label):
+            hidden = _match_verb(reading)
+            if hidden is None:
+                continue
+            if found is None or (hidden in _HARD and found not in _HARD):
+                found = hidden
         return found
 
     def tag(self, verb: str | None, *, method: str | None = None) -> str:
@@ -178,15 +177,15 @@ class Lexicon:
     def login_label(self, label: str) -> bool:
         if _LOGIN_LABEL.search(normalize_label(label)):
             return True
-        folded = skeleton(label)
-        return folded != label and _LOGIN_LABEL.search(normalize_label(folded)) is not None
+        return any(
+            _LOGIN_LABEL.search(normalize_label(reading)) for reading in _fold_readings(label)
+        )
 
     def login_hint(self, text: str) -> bool:
         """Sign-in hint for title and aria-describedby text."""
         if _LOGIN_HINT.search(normalize_label(text)):
             return True
-        folded = skeleton(text)
-        return folded != text and _LOGIN_HINT.search(normalize_label(folded)) is not None
+        return any(_LOGIN_HINT.search(normalize_label(reading)) for reading in _fold_readings(text))
 
     def account_action(self, *, label: str = "", url: str = "") -> bool:
         """True when the label, or the last path segment, is an account verb.
@@ -217,6 +216,24 @@ class Lexicon:
             if account_action and _points_back(parsed, target):
                 return True
         return False
+
+
+def _fold_readings(text: str) -> tuple[str, ...]:
+    """Skeleton, plus an i reading when a confusable folded to l.
+
+    Greek iota and Cyrillic I land on l in the UTS #39 table. Publish, submit,
+    and sign-in are written with i, so that reading is tried as well.
+    """
+    folded = skeleton(text)
+    readings: list[str] = []
+    if folded != text:
+        readings.append(folded)
+    if any(char in L_FOLDS for char in text):
+        rewritten = "".join("i" if char in L_FOLDS else char for char in text)
+        iread = skeleton(rewritten)
+        if iread not in {text, *readings}:
+            readings.append(iread)
+    return tuple(readings)
 
 
 def _match_verb(label: str) -> str | None:

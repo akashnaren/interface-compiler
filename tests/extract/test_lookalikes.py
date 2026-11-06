@@ -1,4 +1,4 @@
-"""Lookalike folds. One table per M3.1 hole."""
+"""Lookalike folds."""
 
 import pytest
 

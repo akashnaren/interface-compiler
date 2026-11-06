@@ -103,15 +103,27 @@ def match_key(text: str) -> str:
 
 
 def skeleton(text: str) -> str:
-    """UTS #39 skeleton: NFKC, drop Cf, fold confusable letters to ASCII."""
+    """Fold confusable letters to ASCII.
+
+    Raw table entries win. Other characters are NFKD'd, marks are dropped,
+    and the rest is folded. NFKC would turn U+FF5C into ``|`` and recompose
+    an accent onto a base that is not in the table.
+    """
     if text.isascii():
         return text
-    chars: list[str] = []
-    for char in unicodedata.normalize("NFKC", text):
-        if unicodedata.category(char) == "Cf":
+    return "".join(_fold_char(char) for char in text)
+
+
+def _fold_char(char: str) -> str:
+    folded = FOLDS.get(char)
+    if folded is not None:
+        return folded
+    kept: list[str] = []
+    for piece in unicodedata.normalize("NFKD", char):
+        if piece in _IGNORABLE or unicodedata.category(piece) in {"Mn", "Me", "Cf"}:
             continue
-        chars.append(FOLDS.get(char, char))
-    return "".join(chars)
+        kept.append(FOLDS.get(piece, piece))
+    return "".join(kept)
 
 
 def split_words(text: str) -> str:
