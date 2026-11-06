@@ -946,6 +946,8 @@ def test_hard_fail_open(case, html, reason, context, facts_page) -> None:
         ("slash", {"@type": "https://schema.org/OrderAction/"}, None, "order"),
         ("space", {"@type": "  OrderAction  "}, None, "order"),
         ("hash", {"@type": "http://schema.org/OrderAction#OrderAction"}, None, "order"),
+        ("fragment", {"@type": "https://schema.org/#OrderAction"}, None, "order"),
+        ("fragment-bare", {"@type": "http#ReplyAction"}, None, "reply"),
         ("checkout-submit", None, "checkoutSubmit", "checkout_submit"),
         ("submit-checkout", None, "submitCheckout", "checkout_submit"),
         ("reply-thread", None, "replyToThread", "send"),
