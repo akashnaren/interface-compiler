@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from interface_compiler.contract.models import Locator
-from interface_compiler.extract.naming import slug
+from interface_compiler.extract.naming import slug, split_words
 from interface_compiler.mapping.types import (
     MapContext,
     MapResult,
@@ -33,13 +33,13 @@ _KEEP = frozenset(
 
 
 def map_webmcp_tool(tool: dict[str, Any], ctx: MapContext) -> MapResult:
-    name = slug(str(tool.get("name") or "tool")) or "tool"
+    raw_name = str(tool.get("name") or "tool")
+    name = slug(raw_name) or "tool"
     annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else {}
     read_only = annotations.get("readOnlyHint") is True
     properties, required = _properties(tool.get("inputSchema"))
-    enabled, reason = apply_hard_block(
-        True, None, name if ctx.lexicon.hard_block(name) else None, ctx.lexicon
-    )
+    verb = ctx.lexicon.verb(split_words(raw_name))
+    enabled, reason = apply_hard_block(True, None, verb, ctx.lexicon)
     tag = "safe" if read_only and reason is None else "mutating"
     locator = Locator.model_validate(
         {"kind": "webmcp", "tool": str(tool.get("name") or name), "named_by": "declared"}

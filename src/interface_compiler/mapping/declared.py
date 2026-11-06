@@ -25,6 +25,12 @@ _HARD_TYPES = {
     "DeleteAction": "delete",
     "SendAction": "send",
     "CommunicateAction": "send",
+    "TipAction": "tip",
+    "DonateAction": "donate",
+    "PreOrderAction": "preorder",
+    "ReplyAction": "reply",
+    "CommentAction": "comment",
+    "AskAction": "ask",
 }
 
 
@@ -69,7 +75,7 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
     enabled, reason = True, None
     hard = None
     for part in parts:
-        tail = str(part).rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+        tail = _type_token(part)
         if tail in _HARD_TYPES:
             hard = _HARD_TYPES[tail]
             break
@@ -140,6 +146,15 @@ def product_from_jsonld(node: dict[str, object]) -> MapResult:
     return MapResult(
         entities={"product": record}, entities_from={"product": "jsonld"}, view="product"
     )
+
+
+def _type_token(value: object) -> str:
+    """Strip space, drop a fragment and trailing slash, then take the last segment."""
+    text = str(value).strip().split("#", 1)[0].rstrip("/").strip()
+    cut = max(text.rfind("/"), text.rfind(":"))
+    if cut >= 0:
+        text = text[cut + 1 :]
+    return text.strip()
 
 
 def _price(value: object) -> int | float | None:

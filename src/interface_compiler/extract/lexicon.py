@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
-from interface_compiler.extract.naming import match_keys, normalize_label
+from interface_compiler.extract.naming import match_keys, normalize_label, skeleton
 
 # Hard-block verbs are matched before mutating verbs, then safe verbs.
 _HARD = frozenset({"pay", "place_order", "checkout_submit", "delete", "send", "upload"})
@@ -78,10 +78,17 @@ _HARD_LABELS: tuple[tuple[str, str], ...] = (
     ("send", r"send(?: message)?|post(?: comment| reply)?|publish|tweet|submit (?:review|comment)"),
     ("upload", r"upload"),
 )
+# Spaced phrases only. The flat matcher strips spaces, so "reply to" would
+# also match "reply token".
+_HARD_SPACED: tuple[tuple[str, str], ...] = (
+    ("checkout_submit", r"checkout submit|submit checkout"),
+    ("send", r"reply to(?: \w+)*"),
+)
 # Hard verbs match anywhere on a word boundary ("Yes, delete"). The flat
 # pattern also catches a verb split by a space ("De lete").
 _HARD_COMPILED = tuple(
-    (verb, re.compile(rf"(?:^|\s)(?:{pattern})(?:\s|$)")) for verb, pattern in _HARD_LABELS
+    (verb, re.compile(rf"(?:^|\s)(?:{pattern})(?:\s|$)"))
+    for verb, pattern in (*_HARD_LABELS, *_HARD_SPACED)
 )
 _HARD_FLAT = tuple((verb, re.compile(pattern.replace(" ", ""))) for verb, pattern in _HARD_LABELS)
 _COMPILED = tuple((verb, re.compile(rf"^(?:{pattern})$")) for verb, pattern in _VERBS)
@@ -131,22 +138,16 @@ class Lexicon:
     """The fixed verb and route tables. Models may rename; they do not add verbs."""
 
     def verb(self, label: str) -> str | None:
-        spaced, flat = match_keys(label)
-        spaced = _strip_amounts(spaced)
-        flat = _strip_amounts(flat).replace(" ", "")
-        if not spaced and not flat:
-            return None
-        for name, pattern in _HARD_COMPILED:
-            if spaced and pattern.search(spaced):
-                return name
-        if " " in spaced:
-            for name, pattern in _HARD_FLAT:
-                if flat and pattern.search(flat):
-                    return name
-        for name, pattern in _COMPILED:
-            if pattern.fullmatch(spaced):
-                return name
-        return None
+        found = _match_verb(label)
+        folded = skeleton(label)
+        if folded == label:
+            return found
+        hidden = _match_verb(folded)
+        if hidden is None:
+            return found
+        if found is None or (hidden in _HARD and found not in _HARD):
+            return hidden
+        return found
 
     def tag(self, verb: str | None, *, method: str | None = None) -> str:
         if verb in _HARD or verb in _MUTATING:
@@ -175,11 +176,17 @@ class Lexicon:
         return None
 
     def login_label(self, label: str) -> bool:
-        return _LOGIN_LABEL.search(normalize_label(label)) is not None
+        if _LOGIN_LABEL.search(normalize_label(label)):
+            return True
+        folded = skeleton(label)
+        return folded != label and _LOGIN_LABEL.search(normalize_label(folded)) is not None
 
     def login_hint(self, text: str) -> bool:
         """Sign-in hint for title and aria-describedby text."""
-        return _LOGIN_HINT.search(normalize_label(text)) is not None
+        if _LOGIN_HINT.search(normalize_label(text)):
+            return True
+        folded = skeleton(text)
+        return folded != text and _LOGIN_HINT.search(normalize_label(folded)) is not None
 
     def account_action(self, *, label: str = "", url: str = "") -> bool:
         """True when the label, or the last path segment, is an account verb.
@@ -210,6 +217,25 @@ class Lexicon:
             if account_action and _points_back(parsed, target):
                 return True
         return False
+
+
+def _match_verb(label: str) -> str | None:
+    spaced, flat = match_keys(label)
+    spaced = _strip_amounts(spaced)
+    flat = _strip_amounts(flat).replace(" ", "")
+    if not spaced and not flat:
+        return None
+    for name, pattern in _HARD_COMPILED:
+        if spaced and pattern.search(spaced):
+            return name
+    if " " in spaced:
+        for name, pattern in _HARD_FLAT:
+            if flat and pattern.search(flat):
+                return name
+    for name, pattern in _COMPILED:
+        if pattern.fullmatch(spaced):
+            return name
+    return None
 
 
 def _strip_amounts(text: str) -> str:

@@ -6,6 +6,7 @@ import re
 import unicodedata
 
 from interface_compiler.browser.facts import ElementFact
+from interface_compiler.extract.confusables import FOLDS
 
 # Blank letters and format marks that are not caught by Mn/Me/Cf alone.
 _IGNORABLE = frozenset(
@@ -22,6 +23,7 @@ _UUID = re.compile(
     re.IGNORECASE,
 )
 _HASH = re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE)
+_CAMEL_BOUNDARY = re.compile(r"([a-z0-9])([A-Z])")
 
 
 def slug(text: str, *, limit: int = 32) -> str:
@@ -100,35 +102,21 @@ def match_key(text: str) -> str:
     return match_keys(text)[0]
 
 
-def suspect_label(text: str) -> bool:
-    """Latin mixed with another script, or a confusable extended letter.
+def skeleton(text: str) -> str:
+    """UTS #39 skeleton: NFKC, drop Cf, fold confusable letters to ASCII."""
+    if text.isascii():
+        return text
+    chars: list[str] = []
+    for char in unicodedata.normalize("NFKC", text):
+        if unicodedata.category(char) == "Cf":
+            continue
+        chars.append(FOLDS.get(char, char))
+    return "".join(chars)
 
-    IPA, small capitals, Lisu, and Armenian are suspect on their own.
-    A fully Cyrillic or Greek label is not.
-    """
-    latin = other = False
-    for char in unicodedata.normalize("NFKD", text):
-        if char in _IGNORABLE or unicodedata.category(char) in {"Mn", "Me", "Cf"}:
-            continue
-        if not char.isalpha():
-            latin = other = False
-            continue
-        code = ord(char)
-        if (
-            0x0250 <= code <= 0x02AF
-            or 0x1D00 <= code <= 0x1D2B
-            or 0xA730 <= code <= 0xA7FF
-            or 0xA4D0 <= code <= 0xA4FF
-            or 0x0530 <= code <= 0x058F
-        ):
-            return True
-        if char.isascii() or 0x00C0 <= code <= 0x024F or 0x1E00 <= code <= 0x1EFF:
-            latin = True
-        else:
-            other = True
-        if latin and other:
-            return True
-    return False
+
+def split_words(text: str) -> str:
+    """Split camelCase and snake_case into words for the lexicon."""
+    return _CAMEL_BOUNDARY.sub(r"\1 \2", text).replace("_", " ").replace("-", " ")
 
 
 def normalize_label(text: str) -> str:

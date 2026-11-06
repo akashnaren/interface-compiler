@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from interface_compiler.browser.facts import ElementFact, FormFact
 from interface_compiler.contract.models import Locator
 from interface_compiler.extract.lexicon import Lexicon
@@ -21,6 +23,7 @@ from interface_compiler.mapping.types import (
     ax_locator,
     input_schema,
     merge_results,
+    note_sources,
     stable_signature,
 )
 
@@ -29,18 +32,30 @@ _FREE = frozenset(
 )
 
 
+class _Submit(NamedTuple):
+    element: ElementFact
+    verb: str | None
+    method: str
+    action: str
+
+
 def map_form(form: FormFact, fields: list[ElementFact], ctx: MapContext) -> MapResult:
     controls = [element for element in fields if _is_control(element)]
-    submits = [element for element in fields if _is_submit(element)]
-    submit = submits[0] if submits else None
-    verb = ctx.lexicon.verb(submit.name) if submit else None
+    submits = [_submit_choice(element, form, ctx) for element in fields if _is_submit(element)]
+    if submits and all(item.verb for item in submits) and _field_grain(controls, submits[0].verb):
+        return _field_grain_result(form, controls, submits, ctx)
+    return _form_grain_result(form, controls, submits, ctx)
+
+
+def _submit_choice(submit: ElementFact, form: FormFact, ctx: MapContext) -> _Submit:
+    """One submitter: its formmethod and formaction, else the form's own."""
+    method = (submit.form_method or form.method or "get").lower()
+    action = submit.form_action or form.action
+    verb = ctx.lexicon.verb(submit.name) if submit.name else None
     view = ctx.view_hint or ctx.lexicon.view_for_href(ctx.page_url)
-    method = submit.form_method if submit is not None and submit.form_method else form.method
     if view == "checkout" and method != "get" and not ctx.lexicon.hard_block(verb):
         verb = "checkout_submit"
-    if _field_grain(controls, verb):
-        return _field_grain_result(form, controls, submit, verb, ctx)
-    return _form_grain_result(form, controls, submit, verb, ctx)
+    return _Submit(submit, verb, method, action)
 
 
 def fill_missing(
@@ -118,8 +133,7 @@ def gate_submit(
 def _field_grain_result(
     form: FormFact,
     controls: list[ElementFact],
-    submit: ElementFact | None,
-    verb: str | None,
+    submits: list[_Submit],
     ctx: MapContext,
 ) -> MapResult:
     parts: list[MapResult] = []
@@ -136,29 +150,35 @@ def _field_grain_result(
             parts.append(map_checkbox(element, ctx))
     for group in radios.values():
         parts.append(map_choice_group(group, ctx))
-    if submit is not None and verb:
-        enabled, reason = element_enabled(submit)
+    upload = any(element.input_type == "file" for element in controls)
+    for item in submits:
+        if not item.verb:
+            continue
+        enabled, reason = element_enabled(item.element)
         enabled, reason = gate_submit(
             enabled,
             reason,
-            verb=verb,
+            verb=item.verb,
             lexicon=ctx.lexicon,
             form_disabled=form.disabled,
             missing=tuple(missing),
-            upload=any(element.input_type == "file" for element in controls),
+            upload=upload,
         )
+        locator = ax_locator(item.element, kind="form", method=item.method)
+        if item.action and item.action != form.action:
+            note_sources(locator, urls=(item.action,))
         parts.append(
             MapResult(
                 affordances=[
                     affordance(
-                        verb,
+                        item.verb,
                         enabled=enabled,
-                        label=submit.name,
-                        locator=ax_locator(submit, kind="form", method=form.method),
+                        label=item.element.name,
+                        locator=locator,
                         grain="field",
-                        tag=ctx.lexicon.tag(verb, method=form.method),
+                        tag=ctx.lexicon.tag(item.verb, method=item.method),
                         reason=reason,
-                        signature=stable_signature("form-field", verb, submit.landmark),
+                        signature=stable_signature("form-field", item.verb, item.element.landmark),
                     )
                 ]
             )
@@ -173,8 +193,7 @@ def _field_grain_result(
 def _form_grain_result(
     form: FormFact,
     controls: list[ElementFact],
-    submit: ElementFact | None,
-    verb: str | None,
+    submits: list[_Submit],
     ctx: MapContext,
 ) -> MapResult:
     properties: dict[str, dict[str, object]] = {}
@@ -195,46 +214,55 @@ def _form_grain_result(
         if element.constraints.required:
             required.append(name)
     search = _is_search(form, controls, properties)
-    if search and not ctx.lexicon.hard_block(verb):
-        affordance_id = "search"
-        verb = "search"
-    elif verb:
-        affordance_id = verb
-    else:
-        affordance_id = "submit_" + (_form_slug(form, controls) or "form")
-    label = submit.name if submit else affordance_id
     upload = any(element.input_type == "file" for element in controls)
-    if submit is not None:
-        enabled, reason = element_enabled(submit)
-    else:
-        enabled, reason = _form_enabled(form, controls, login_gated=False)
-    enabled, reason = gate_submit(
-        enabled,
-        reason,
-        verb=verb,
-        lexicon=ctx.lexicon,
-        form_disabled=form.disabled,
-        upload=upload,
-    )
-    if upload:
-        verb = "upload"
-    # A POST search still mutates. Only a GET search is safe.
-    if search and form.method == "get":
-        tag = "safe"
-    else:
-        tag = ctx.lexicon.tag(verb, method=form.method)
-    locator = (
-        ax_locator(
-            submit or controls[0],
-            kind="form",
-            method=form.method,
-            fields={name: name for name in properties},
+    entries: list[_Submit | None] = list(submits) or [None]
+    single = len(entries) == 1
+    affordances = []
+    for item in entries:
+        verb = item.verb if item else None
+        method = item.method if item else form.method
+        action = item.action if item else form.action
+        submit = item.element if item else None
+        if single and search and not ctx.lexicon.hard_block(verb):
+            affordance_id = "search"
+            verb = "search"
+        elif verb:
+            affordance_id = verb
+        else:
+            affordance_id = "submit_" + (_form_slug(form, controls) or "form")
+        label = submit.name if submit else affordance_id
+        if submit is not None:
+            enabled, reason = element_enabled(submit)
+        else:
+            enabled, reason = _form_enabled(form, controls)
+        enabled, reason = gate_submit(
+            enabled,
+            reason,
+            verb=verb,
+            lexicon=ctx.lexicon,
+            form_disabled=form.disabled,
+            upload=upload,
         )
-        if submit or controls
-        else ax_locator_fallback(form)
-    )
-    return MapResult(
-        affordances=[
+        if upload:
+            verb = "upload"
+        # A POST search still mutates. Only a GET search is safe.
+        if search and method == "get":
+            tag = "safe"
+        else:
+            tag = ctx.lexicon.tag(verb, method=method)
+        locator = (
+            ax_locator(
+                submit or controls[0],
+                kind="form",
+                method=method,
+                fields={name: name for name in properties},
+            )
+            if submit or controls
+            else ax_locator_fallback(form)
+        )
+        if action and action != form.action:
+            note_sources(locator, urls=(action,))
+        affordances.append(
             affordance(
                 affordance_id,
                 enabled=enabled,
@@ -246,10 +274,8 @@ def _form_grain_result(
                 reason=reason,
                 signature=stable_signature("form", affordance_id, form.action),
             )
-        ],
-        state=state,
-        state_from=state_from,
-    )
+        )
+    return MapResult(affordances=affordances, state=state, state_from=state_from)
 
 
 def ax_locator_fallback(form: FormFact) -> Locator:
@@ -304,9 +330,7 @@ def _is_control(element: ElementFact) -> bool:
     }
 
 
-def _form_enabled(
-    form: FormFact, controls: list[ElementFact], *, login_gated: bool
-) -> tuple[bool, str | None]:
+def _form_enabled(form: FormFact, controls: list[ElementFact]) -> tuple[bool, str | None]:
     """No real submitter: the form, or every field, has to be usable."""
     if form.hidden or not form.visible:
         return False, "not visible"
@@ -317,8 +341,6 @@ def _form_enabled(
         return False, "covered"
     if form.disabled:
         return False, "disabled"
-    if login_gated:
-        return False, "requires sign-in"
     blocked = _unusable_fields(fields)
     if blocked:
         return False, blocked

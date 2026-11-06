@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from interface_compiler.browser.facts import ElementFact
 from interface_compiler.contract.models import Affordance, AffordanceX, InputSchema, Locator
 from interface_compiler.extract.lexicon import Lexicon
-from interface_compiler.extract.naming import match_key, normalize_label, slug, suspect_label
+from interface_compiler.extract.naming import match_key, normalize_label, slug
 
 _DIGIT = re.compile(r"\d")
 _CAMEL = re.compile(r"([a-z0-9])([A-Z])")
@@ -262,8 +262,11 @@ def _needs_login(
         return True
     if any(login_gated(element, ctx, affordance_id) for element in elements):
         return True
+    # The affordance label is the submitter on a form.
+    label = texts[0] if texts else ""
     return any(
-        lexicon.login_target(url, account_action=lexicon.account_action(url=url)) for url in urls
+        lexicon.login_target(url, account_action=lexicon.account_action(label=label, url=url))
+        for url in urls
     )
 
 
@@ -298,16 +301,12 @@ def seal_hard_blocks(result: MapResult, ctx: MapContext) -> MapResult:
         if verb is None and any(element.input_type == "file" for element in elements):
             verb = "upload"
         login = _needs_login(ctx, action.id, texts, elements, urls)
-        mixed = verb is None and any(text and suspect_label(text) for text in texts)
-        if verb is None and not login and not mixed:
+        if verb is None and not login:
             updated.append(action)
             continue
         tag = extra.tag
         if login and reason not in _BEFORE_HARD:
             reason = "requires sign-in"
-        elif mixed and reason not in _BEFORE_HARD:
-            reason = "hard-blocked in v1: mixed-script label"
-            tag = "mutating"
         elif verb is not None and reason not in _BEFORE_HARD:
             blocked = ctx.lexicon.hard_block(verb)
             if blocked:

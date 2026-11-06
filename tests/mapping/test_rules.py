@@ -579,7 +579,7 @@ def _blocked(verb: str) -> str:
 _DELETE = _blocked("delete")
 _PAY = _blocked("pay")
 _ORDER = _blocked("place_order")
-_MIXED = _blocked("mixed-script label")
+_ON = {"enabled": True}
 _A6 = "".join(
     f"<article><h2><a href='/item/{index}'>Item {index}</a></h2>"
     f"<a href='/item/{index}/del'>{label}</a></article>"
@@ -594,17 +594,60 @@ _A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
         ("a1-yes", "<button>Yes, delete</button>", _DELETE, None),
         ("a1-permanently", "<button>Permanently delete account</button>", _DELETE, None),
         ("a2-marks", "<button>De\u00a0le\u0301\u034f\u3164\ufe0fte</button>", _DELETE, None),
-        ("a3-cyrillic", "<button>D\u0435lete account</button>", _MIXED, None),
-        ("a3-greek", "<button>\u03a1\u03b1y</button>", _MIXED, None),
-        ("r9-alpha", "<button>P\u0251y</button>", _MIXED, None),
-        ("r9-smallcaps", "<button>\ua731\u1d07\u0274\u1d05</button>", _MIXED, None),
-        ("r9-lisu", "<button>\ua4d3elete</button>", _MIXED, None),
-        ("r9-armenian", "<button>Se\u0578d</button>", _MIXED, None),
-        ("r9-cyr-t", "<button>pos\u0442</button>", _MIXED, None),
-        ("r9-cyr-m", "<button>re\u043cove account</button>", _MIXED, None),
-        ("r9-upsilon", "<button>\u03c5pload</button>", _MIXED, None),
-        ("r9-nu-send", "<button>se\u03bdd</button>", _MIXED, None),
-        ("r9-nu-login", "<button>log i\u03bd</button>", _MIXED, None),
+        ("a3-cyrillic", "<button>D\u0435lete account</button>", _DELETE, None),
+        ("a3-lookalike", "<button>\u0420\u0430\u0443</button>", _PAY, None),
+        ("a3-greek", "<button>\u03a1\u03b1y</button>", _PAY, None),
+        ("r10-pay-lower", "<button>\u0440\u0430\u0443</button>", _PAY, None),
+        ("r10-pay-spaced", "<button>P \u0430 y</button>", _PAY, None),
+        ("r10-delete-spaced", "<button>d \u0435 l \u0435 t \u0435</button>", _DELETE, None),
+        ("r10-pay-mixed", "<button>P\u0430y</button>", _PAY, None),
+        ("r9-alpha", "<button>P\u0251y</button>", _PAY, None),
+        ("r9-lisu", "<button>\ua4d3elete</button>", _DELETE, None),
+        ("r9-armenian", "<button>Se\u0578d</button>", _blocked("send"), None),
+        ("r9-upsilon", "<button>\u03c5pload</button>", _blocked("upload"), None),
+        ("r9-smallcaps", "<button>\ua731\u1d07\u0274\u1d05</button>", None, _ON),
+        ("r9-cyr-t", "<button>pos\u0442</button>", None, _ON),
+        ("r9-cyr-m", "<button>re\u043cove account</button>", None, _ON),
+        ("r9-nu-send", "<button>se\u03bdd</button>", None, _ON),
+        ("r9-nu-login", "<button>log i\u03bd</button>", None, _ON),
+        ("r10-shirt", "<button>T\u30b7\u30e3\u30c4</button>", None, _ON),
+        ("r10-case", "<button>iPhone\u30b1\u30fc\u30b9</button>", None, _ON),
+        ("r10-app", "<button>\u4e0b\u8f7dApp</button>", None, _ON),
+        (
+            "r10-continue",
+            "<button>\u0547\u0561\u0580\u0578\u0582\u0576\u0561\u056f\u0565\u056c</button>",
+            None,
+            _ON,
+        ),
+        ("r10-product", "<button>M\u0259hsul</button>", None, _ON),
+        ("r10-hello", "<button>\u029c\u1d07\u029f\u029f\u1d0f</button>", None, _ON),
+        ("r10-micro", "<button>\u00b5m</button>", None, _ON),
+        ("r10-ohm", "<button>k\u2126</button>", None, _ON),
+        ("r10-cafe", "<button>Caf\u00e9</button>", None, _ON),
+        (
+            "r10-save-ru",
+            "<button>\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c</button>",
+            None,
+            _ON,
+        ),
+        (
+            "r10-mutq",
+            "<a href=/login>\u0544\u0578\u0582\u057f\u0584</a>",
+            None,
+            {"enabled": "go_sign_in"},
+        ),
+        (
+            "r10-option",
+            "<label>Size<select><option>S</option><option>T\u30b7\u30e3\u30c4</option></select></label>",
+            None,
+            _ON,
+        ),
+        (
+            "r10-option-pay",
+            "<label>Size<select><option>S</option><option>\u0420\u0430\u0443</option></select></label>",
+            _PAY,
+            None,
+        ),
         (
             "a4-aria",
             "<div role=button tabindex=0 aria-label=Go>Delete account</div>",
@@ -709,6 +752,33 @@ _A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
             "<form method=get action=/checkout><button formmethod=post>Continue</button></form>",
             _blocked("checkout_submit"),
             {"page_url": "http://example/checkout"},
+        ),
+        (
+            "r10-submitters",
+            (
+                "<form method=get action=/checkout><button>Back</button>"
+                "<button formmethod=post>Continue</button></form>"
+            ),
+            _blocked("checkout_submit"),
+            {"page_url": "http://example/checkout", "also": "go_back"},
+        ),
+        (
+            "r10-vote",
+            (
+                "<base href='http://example/'><form method=post action='/item?next=/home'>"
+                "<button>Vote</button></form>"
+            ),
+            "requires sign-in",
+            None,
+        ),
+        (
+            "r10-save",
+            (
+                "<base href='http://example/'><form method=post action='/edit?return_to=/home'>"
+                "<button>Save</button></form>"
+            ),
+            "requires sign-in",
+            None,
         ),
         (
             "r9-chips",
@@ -827,6 +897,8 @@ _A7 = "".join(f"<a href='/item/{index}/like'>Delete</a>" for index in (1, 2, 3))
 )
 def test_hard_fail_open(case, html, reason, context, facts_page) -> None:
     ctx = dict(context or {})
+    keep = ctx.pop("enabled", None)
+    also = ctx.pop("also", None)
     if "schema" in ctx:
         result = map_schema_org_action(ctx["schema"], MapContext(page_url="http://example/"))
     elif "tool" in ctx:
@@ -836,6 +908,21 @@ def test_hard_fail_open(case, html, reason, context, facts_page) -> None:
         result, _facts = _html(facts_page, html, **ctx)
         if absent:
             assert not any(item.enabled and item.id == absent for item in result.affordances)
+    if keep:
+        if keep is True:
+            disabled = [
+                (item.id, None if item.x is None else item.x.reason)
+                for item in result.affordances
+                if not item.enabled
+            ]
+            assert result.affordances and not disabled, (case, disabled)
+        else:
+            item = one(result, keep)
+            assert item.enabled is True, (case, item.x.reason if item.x else None)
+        return
+    if also:
+        kept = one(result, also)
+        assert kept.enabled is True, (case, kept.x.reason if kept.x else None)
     blocked = [item for item in result.affordances if item.x and item.x.reason == reason]
     found = [
         (item.id, item.enabled, None if item.x is None else item.x.reason)
@@ -845,3 +932,44 @@ def test_hard_fail_open(case, html, reason, context, facts_page) -> None:
     assert all(item.enabled is False for item in blocked)
     if reason.startswith("hard-blocked"):
         assert all(item.x is not None and item.x.tag == "mutating" for item in blocked)
+
+
+@pytest.mark.parametrize(
+    ("case", "schema", "tool", "verb"),
+    [
+        ("tip", {"@type": "TipAction"}, None, "tip"),
+        ("donate", {"@type": "DonateAction"}, None, "donate"),
+        ("preorder", {"@type": "PreOrderAction"}, None, "preorder"),
+        ("reply", {"@type": "ReplyAction"}, None, "reply"),
+        ("comment", {"@type": "CommentAction"}, None, "comment"),
+        ("ask", {"@type": "AskAction"}, None, "ask"),
+        ("slash", {"@type": "https://schema.org/OrderAction/"}, None, "order"),
+        ("space", {"@type": "  OrderAction  "}, None, "order"),
+        ("hash", {"@type": "http://schema.org/OrderAction#OrderAction"}, None, "order"),
+        ("checkout-submit", None, "checkoutSubmit", "checkout_submit"),
+        ("submit-checkout", None, "submitCheckout", "checkout_submit"),
+        ("reply-thread", None, "replyToThread", "send"),
+        ("submit-snake", None, "submit_checkout", "checkout_submit"),
+        ("reply-snake", None, "reply_to_thread", "send"),
+    ],
+)
+def test_declared_tokens(
+    case: str, schema: dict[str, object] | None, tool: str | None, verb: str
+) -> None:
+    ctx = MapContext(page_url="http://example/")
+    if tool is not None:
+        result = map_webmcp_tool({"name": tool}, ctx)
+    else:
+        assert schema is not None
+        result = map_schema_org_action(schema, ctx)
+    reason = _blocked(verb)
+    blocked = [item for item in result.affordances if item.x and item.x.reason == reason]
+    found = [
+        (item.id, item.enabled, None if item.x is None else item.x.reason)
+        for item in result.affordances
+    ]
+    assert blocked, (case, found)
+    assert all(
+        item.enabled is False and item.x is not None and item.x.tag == "mutating"
+        for item in blocked
+    )

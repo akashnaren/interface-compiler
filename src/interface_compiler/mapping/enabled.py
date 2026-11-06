@@ -8,7 +8,6 @@ from interface_compiler.browser.facts import ElementFact
 def element_enabled(
     element: ElementFact,
     *,
-    login_gated: bool = False,
     missing: tuple[str, ...] = (),
     no_options: bool = False,
     readonly: bool = False,
@@ -26,8 +25,6 @@ def element_enabled(
     # that control is already not covered. Every other hit stays covered.
     if element.covered:
         return False, "covered"
-    if login_gated:
-        return False, "requires sign-in"
     if missing:
         return False, "missing: " + ", ".join(missing)
     if no_options:
