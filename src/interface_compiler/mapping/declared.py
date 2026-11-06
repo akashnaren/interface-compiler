@@ -24,6 +24,7 @@ _HARD_TYPES = {
     "PayAction": "pay",
     "DeleteAction": "delete",
     "SendAction": "send",
+    "PublishAction": "send",
     "CommunicateAction": "send",
     "TipAction": "tip",
     "DonateAction": "donate",
@@ -32,6 +33,7 @@ _HARD_TYPES = {
     "CommentAction": "comment",
     "AskAction": "ask",
 }
+_HARD_FOLDED = {name.casefold(): verb for name, verb in _HARD_TYPES.items()}
 
 
 def jsonld_nodes(html: str) -> list[dict[str, object]]:
@@ -75,9 +77,12 @@ def map_schema_org_action(action: dict[str, object], ctx: MapContext) -> MapResu
     enabled, reason = True, None
     hard = None
     for part in parts:
-        tail = _type_token(part)
-        if tail in _HARD_TYPES:
-            hard = _HARD_TYPES[tail]
+        for tail in _type_tokens(part):
+            blocked = _HARD_FOLDED.get(tail.casefold())
+            if blocked is not None:
+                hard = blocked
+                break
+        if hard:
             break
     if hard:
         enabled, reason = False, f"hard-blocked in v1: {hard}"
@@ -148,13 +153,24 @@ def product_from_jsonld(node: dict[str, object]) -> MapResult:
     )
 
 
-def _type_token(value: object) -> str:
-    """Strip space, drop a fragment and trailing slash, then take the last segment."""
-    text = str(value).strip().split("#", 1)[0].rstrip("/").strip()
-    cut = max(text.rfind("/"), text.rfind(":"))
-    if cut >= 0:
-        text = text[cut + 1 :]
-    return text.strip()
+def _type_tokens(value: object) -> tuple[str, ...]:
+    """Every path segment and every fragment segment, in order."""
+    text = str(value).strip()
+    path, separator, fragment = text.partition("#")
+    pieces = (path, fragment) if separator else (path,)
+    tokens: list[str] = []
+    for piece in pieces:
+        for token in _segments(piece):
+            if token not in tokens:
+                tokens.append(token)
+    return tuple(tokens)
+
+
+def _segments(text: str) -> tuple[str, ...]:
+    text = text.strip().strip("/")
+    if not text:
+        return ()
+    return tuple(part.strip() for part in re.split(r"[:/]+", text) if part.strip())
 
 
 def _price(value: object) -> int | float | None:

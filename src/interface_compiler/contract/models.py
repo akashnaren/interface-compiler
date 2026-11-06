@@ -217,6 +217,13 @@ class AffordanceX(BaseModel):
         self._verified_locked = True
         return self
 
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        _refuse_unscoped_probe(values.get("tag"), values.get("verified"))
+        built = super().model_construct(_fields_set, **values)
+        built._verified_locked = True
+        return built
+
     def __setattr__(self, name: str, value: object) -> None:
         if name in {"verified", "tag"} and getattr(self, "_verified_locked", False):
             self._assign_guarded(name, value)
@@ -229,6 +236,12 @@ class AffordanceX(BaseModel):
             verified = update.get("verified", self.verified)
             _refuse_unscoped_probe(tag, verified)
         copied = super().model_copy(update=update, deep=deep)
+        if getattr(copied, "_page_bound", False):
+            _refuse_probe(
+                copied.tag,
+                copied.verified,
+                page_url=getattr(copied, "_bound_page_url", None),
+            )
         copied._verified_locked = True
         return copied
 
@@ -298,12 +311,33 @@ class Affordance(BaseModel):
     _page_bound: bool = PrivateAttr(default=False)
     _bound_page_url: object = PrivateAttr(default=None)
 
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> Self:
+        built = super().model_construct(_fields_set, **values)
+        built._refuse_stored_x()
+        return built
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        copied = super().model_copy(update=update, deep=deep)
+        copied._refuse_stored_x()
+        return copied
+
     def __setattr__(self, name: str, value: object) -> None:
         # Replacing x used to drop the document binding, so set_verified would
         # trust a loopback page_url on a public document.
         if name == "x" and isinstance(value, AffordanceX):
             self._copy_probe_binding(value)
         super().__setattr__(name, value)
+
+    def _refuse_stored_x(self) -> None:
+        extra = self.x
+        if not isinstance(extra, AffordanceX):
+            return
+        if getattr(self, "_page_bound", False):
+            page_url = getattr(self, "_bound_page_url", None)
+        else:
+            page_url = _affordance_page_url.get()
+        _refuse_probe(extra.tag, extra.verified, page_url=page_url)
 
     def _copy_probe_binding(self, value: AffordanceX) -> None:
         previous = self.__dict__.get("x")
@@ -315,11 +349,10 @@ class Affordance(BaseModel):
         elif isinstance(previous, AffordanceX) and previous is not value:
             bound = bool(getattr(previous, "_page_bound", False))
             bound_url = getattr(previous, "_bound_page_url", None)
+        page_url = bound_url if bound else _affordance_page_url.get()
+        _refuse_probe(value.tag, value.verified, page_url=page_url)
         if not bound:
             return
-        message = probed_ok_refusal(value.tag, value.verified, page_url=bound_url)
-        if message is not None:
-            raise ContractError(message, errors=[message])
         value._page_bound = True
         value._bound_page_url = bound_url
 
@@ -756,10 +789,14 @@ def _raw_page_url(value: object) -> object:
     return extra.get("url")
 
 
-def _refuse_unscoped_probe(tag: object, verified: object) -> None:
-    message = probed_ok_refusal(tag, verified, page_url=_affordance_page_url.get())
+def _refuse_probe(tag: object, verified: object, *, page_url: object) -> None:
+    message = probed_ok_refusal(tag, verified, page_url=page_url)
     if message is not None:
         raise ContractError(message, errors=[message])
+
+
+def _refuse_unscoped_probe(tag: object, verified: object) -> None:
+    _refuse_probe(tag, verified, page_url=_affordance_page_url.get())
 
 
 def _reject_explicit_null(value: object, key: str) -> None:

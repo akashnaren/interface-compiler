@@ -261,6 +261,40 @@ def test_checker_mutating_probed_ok_cannot_be_built(path: str) -> None:
     raise AssertionError(path)
 
 
+@pytest.mark.parametrize("path", ["model_construct", "copy", "setattr"])
+def test_public_probe_cannot_stick(path: str) -> None:
+    doc = ViewDoc.model_validate(
+        _with_probe("https://example.com/p", tag="mutating", verified="unverified")
+    )
+    owned = doc.affordances[2]
+    row = owned.x
+    assert row is not None and row.verified == "unverified"
+    smuggled = AffordanceX(tag="mutating", verified="unverified")
+    object.__setattr__(smuggled, "verified", "probed_ok")
+    if path == "model_construct":
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            AffordanceX.model_construct(tag="mutating", verified="probed_ok")
+        fresh = AffordanceX.model_construct(tag="mutating", verified="unverified")
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            fresh.verified = "probed_ok"
+        assert fresh.verified == "unverified"
+        return
+    if path == "copy":
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            owned.model_copy(update={"x": smuggled})
+        assert owned.x is row and row.verified == "unverified"
+        return
+    if path == "setattr":
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            owned.x = smuggled
+        assert owned.x is row and row.verified == "unverified"
+        with pytest.raises(ContractError, match="mutating affordance cannot be probed_ok"):
+            row.verified = "probed_ok"
+        assert row.verified == "unverified"
+        return
+    raise AssertionError(path)
+
+
 @pytest.mark.parametrize("path", ["setter", "assign", "copy"])
 def test_checker_document_probe_follows_the_document_url(path: str) -> None:
     if path == "setter":
