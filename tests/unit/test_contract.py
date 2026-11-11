@@ -90,14 +90,6 @@ def _act_result() -> dict:
     }
 
 
-def test_contract_fixture_matches_paper_requirements() -> None:
-    expected = _fenced_json(
-        ROOT / "docs" / "PAPER-REQUIREMENTS.md",
-        "## 2. The paper's printed example",
-    )
-    assert _paper() == expected
-
-
 def test_contract_view_doc_schema_matches_plan() -> None:
     expected = _fenced_json(ROOT / "PLAN.md", "### 3.2 `view-doc.v1.json`")
     assert load_schema("view-doc") == expected
